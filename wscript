@@ -369,20 +369,21 @@ def build_v8(bld):
                     + bld.path.ant_glob('v8/src/*'),
     target        = target,
     rule          = v8_cmd(bld, "default"),
-    before        = "cxx",
+    before        = ["cxx", "copy"],
     install_path  = None)
 
   v8.uselib = "EXECINFO"
   bld.env["CPPPATH_V8"] = "deps/v8/include"
 
   if bld.env["USE_SHARED_NODE_V8"]:
+
     copytarget = bld.env["shlib_PATTERN"] % bld.env["USE_SHARED_NODE_V8"]
     copyv8 = bld.new_task_gen(
       "copy",
       source        = v8.target,
       target        = copytarget,
       install_path  = '${PREFIX}/lib',
-      uselib        = "hello")
+      before        = 'cxx')
 
     t = '-L' + bld.srcnode.abspath(bld.env_of_name("default"))
     bld.env_of_name('default').append_value("LINKFLAGS_V8", t)
