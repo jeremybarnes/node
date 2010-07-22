@@ -130,6 +130,20 @@ struct DwVfpRegister {
   // Supporting d0 to d15, can be later extended to d31.
   bool is_valid() const  { return 0 <= code_ && code_ < 16; }
   bool is(DwVfpRegister reg) const  { return code_ == reg.code_; }
+  SwVfpRegister low() const  {
+    SwVfpRegister reg;
+    reg.code_ = code_ * 2;
+
+    ASSERT(reg.is_valid());
+    return reg;
+  }
+  SwVfpRegister high() const  {
+    SwVfpRegister reg;
+    reg.code_ = (code_ * 2) + 1;
+
+    ASSERT(reg.is_valid());
+    return reg;
+  }
   int code() const  {
     ASSERT(is_valid());
     return code_;
@@ -431,6 +445,8 @@ class Operand BASE_EMBEDDED {
   }
 
   Register rm() const { return rm_; }
+  Register rs() const { return rs_; }
+  ShiftOp shift_op() const { return shift_op_; }
 
  private:
   Register rm_;
@@ -820,6 +836,25 @@ class Assembler : public Malloced {
 
   void clz(Register dst, Register src, Condition cond = al);  // v5 and above
 
+  // Saturating instructions. v6 and above.
+
+  // Unsigned saturate.
+  //
+  // Saturate an optionally shifted signed value to an unsigned range.
+  //
+  //   usat dst, #satpos, src
+  //   usat dst, #satpos, src, lsl #sh
+  //   usat dst, #satpos, src, asr #sh
+  //
+  // Register dst will contain:
+  //
+  //   0,                 if s < 0
+  //   (1 << satpos) - 1, if s > ((1 << satpos) - 1)
+  //   s,                 otherwise
+  //
+  // where s is the contents of src after shifting (if used.)
+  void usat(Register dst, int satpos, const Operand& src, Condition cond = al);
+
   // Bitfield manipulation instructions. v7 and above.
 
   void ubfx(Register dst, Register src, int lsb, int width,
@@ -931,6 +966,12 @@ class Assembler : public Malloced {
             int offset,  // Offset must be a multiple of 4.
             const Condition cond = al);
 
+  void vmov(const DwVfpRegister dst,
+            double imm,
+            const Condition cond = al);
+  void vmov(const SwVfpRegister dst,
+            const SwVfpRegister src,
+            const Condition cond = al);
   void vmov(const DwVfpRegister dst,
             const DwVfpRegister src,
             const Condition cond = al);

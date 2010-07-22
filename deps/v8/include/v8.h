@@ -137,6 +137,9 @@ class Top;
 /**
  * A weak reference callback function.
  *
+ * This callback should either explicitly invoke Dispose on |object| if
+ * V8 wrapper is not needed anymore, or 'revive' it by invocation of MakeWeak.
+ *
  * \param object the weak global object to be reclaimed by the garbage collector
  * \param parameter the value passed in when making the weak global object
  */
@@ -146,9 +149,9 @@ typedef void (*WeakReferenceCallback)(Persistent<Value> object,
 
 // --- H a n d l e s ---
 
-#define TYPE_CHECK(T, S)                              \
-  while (false) {                                     \
-    *(static_cast<T**>(0)) = static_cast<S*>(0);      \
+#define TYPE_CHECK(T, S)                                       \
+  while (false) {                                              \
+    *(static_cast<T* volatile*>(0)) = static_cast<S*>(0);      \
   }
 
 /**
@@ -692,6 +695,13 @@ class V8EXPORT Message {
    * the error originates.
    */
   Handle<Value> GetScriptData() const;
+
+  /**
+   * Exception stack trace. By default stack traces are not captured for
+   * uncaught exceptions. SetCaptureStackTraceForUncaughtExceptions allows
+   * to change this option.
+   */
+  Handle<StackTrace> GetStackTrace() const;
 
   /**
    * Returns the number, 1-based, of the line where the error occurred.
@@ -2457,6 +2467,15 @@ class V8EXPORT V8 {
    * Remove all message listeners from the specified callback function.
    */
   static void RemoveMessageListeners(MessageCallback that);
+
+  /**
+   * Tells V8 to capture current stack trace when uncaught exception occurs
+   * and report it to the message listeners. The option is off by default.
+   */
+  static void SetCaptureStackTraceForUncaughtExceptions(
+      bool capture,
+      int frame_limit = 10,
+      StackTrace::StackTraceOptions options = StackTrace::kOverview);
 
   /**
    * Sets V8 flags from a string.

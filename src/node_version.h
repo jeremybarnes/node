@@ -6,7 +6,7 @@
 
 #define NODE_MAJOR_VERSION 0
 #define NODE_MINOR_VERSION 1
-#define NODE_PATCH_VERSION 100
+#define NODE_PATCH_VERSION 101
 
 #ifndef NODE_STRINGIFY
 #define NODE_STRINGIFY(n) NODE_STRINGIFY_HELPER(n)
@@ -21,8 +21,8 @@
 
 
 #define NODE_VERSION_AT_LEAST(major, minor, patch) \
-                              ((   (major) < NODE_MAJOR_VERSION \
-                                || ((major) == NODE_MAJOR_VERSION && (minor) < NODE_MINOR_VERSION) \
-                                || ((major) == NODE_MAJOR_VERSION && (minor) == NODE_MINOR_VERSION && (patch) <= NODE_PATCH_VERSION))
+  (( (major) < NODE_MAJOR_VERSION) \
+  || ((major) == NODE_MAJOR_VERSION && (minor) < NODE_MINOR_VERSION) \
+  || ((major) == NODE_MAJOR_VERSION && (minor) == NODE_MINOR_VERSION && (patch) <= NODE_PATCH_VERSION))
 
 #endif /* NODE_VERSION_H */

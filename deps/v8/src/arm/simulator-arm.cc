@@ -2047,11 +2047,41 @@ void Simulator::DecodeType3(Instr* instr) {
     case 0: {
       ASSERT(!instr->HasW());
       Format(instr, "'memop'cond'b 'rd, ['rn], -'shift_rm");
+      UNIMPLEMENTED();
       break;
     }
     case 1: {
-      ASSERT(!instr->HasW());
-      Format(instr, "'memop'cond'b 'rd, ['rn], +'shift_rm");
+      if (instr->HasW()) {
+        ASSERT(instr->Bits(5, 4) == 0x1);
+
+        if (instr->Bit(22) == 0x1) {  // USAT.
+          int32_t sat_pos = instr->Bits(20, 16);
+          int32_t sat_val = (1 << sat_pos) - 1;
+          int32_t shift = instr->Bits(11, 7);
+          int32_t shift_type = instr->Bit(6);
+          int32_t rm_val = get_register(instr->RmField());
+          if (shift_type == 0) {  // LSL
+            rm_val <<= shift;
+          } else {  // ASR
+            rm_val >>= shift;
+          }
+          // If saturation occurs, the Q flag should be set in the CPSR.
+          // There is no Q flag yet, and no instruction (MRS) to read the
+          // CPSR directly.
+          if (rm_val > sat_val) {
+            rm_val = sat_val;
+          } else if (rm_val < 0) {
+            rm_val = 0;
+          }
+          set_register(rd, rm_val);
+        } else {  // SSAT.
+          UNIMPLEMENTED();
+        }
+        return;
+      } else {
+        Format(instr, "'memop'cond'b 'rd, ['rn], +'shift_rm");
+        UNIMPLEMENTED();
+      }
       break;
     }
     case 2: {
@@ -2281,7 +2311,7 @@ void Simulator::DecodeTypeVFP(Instr* instr) {
         if (instr->SzField() == 0x1) {
           set_d_register_from_double(vd, get_double_from_d_register(vm));
         } else {
-          UNREACHABLE();  // Not used by V8.
+          set_s_register_from_float(vd, get_float_from_s_register(vm));
         }
       } else if ((instr->Opc2Field() == 0x7) && (instr->Opc3Field() == 0x3)) {
         DecodeVCVTBetweenDoubleAndSingle(instr);
@@ -2298,6 +2328,13 @@ void Simulator::DecodeTypeVFP(Instr* instr) {
         double dm_value = get_double_from_d_register(vm);
         double dd_value = sqrt(dm_value);
         set_d_register_from_double(vd, dd_value);
+      } else if (instr->Opc3Field() == 0x0) {
+        // vmov immediate.
+        if (instr->SzField() == 0x1) {
+          set_d_register_from_double(vd, instr->DoubleImmedVmov());
+        } else {
+          UNREACHABLE();  // Not used by v8.
+        }
       } else {
         UNREACHABLE();  // Not used by V8.
       }

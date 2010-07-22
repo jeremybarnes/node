@@ -59,20 +59,6 @@ static Persistent<String> errno_symbol;
 static Persistent<String> syscall_symbol;
 static Persistent<String> errpath_symbol;
 
-static Persistent<String> dev_symbol;
-static Persistent<String> ino_symbol;
-static Persistent<String> mode_symbol;
-static Persistent<String> nlink_symbol;
-static Persistent<String> uid_symbol;
-static Persistent<String> gid_symbol;
-static Persistent<String> rdev_symbol;
-static Persistent<String> size_symbol;
-static Persistent<String> blksize_symbol;
-static Persistent<String> blocks_symbol;
-static Persistent<String> atime_symbol;
-static Persistent<String> mtime_symbol;
-static Persistent<String> ctime_symbol;
-
 static Persistent<String> rss_symbol;
 static Persistent<String> vsize_symbol;
 static Persistent<String> heap_total_symbol;
@@ -907,73 +893,6 @@ ssize_t DecodeWrite(char *buf,
   return buflen;
 }
 
-static Persistent<FunctionTemplate> stats_constructor_template;
-
-Local<Object> BuildStatsObject(struct stat * s) {
-  HandleScope scope;
-
-  if (dev_symbol.IsEmpty()) {
-    dev_symbol = NODE_PSYMBOL("dev");
-    ino_symbol = NODE_PSYMBOL("ino");
-    mode_symbol = NODE_PSYMBOL("mode");
-    nlink_symbol = NODE_PSYMBOL("nlink");
-    uid_symbol = NODE_PSYMBOL("uid");
-    gid_symbol = NODE_PSYMBOL("gid");
-    rdev_symbol = NODE_PSYMBOL("rdev");
-    size_symbol = NODE_PSYMBOL("size");
-    blksize_symbol = NODE_PSYMBOL("blksize");
-    blocks_symbol = NODE_PSYMBOL("blocks");
-    atime_symbol = NODE_PSYMBOL("atime");
-    mtime_symbol = NODE_PSYMBOL("mtime");
-    ctime_symbol = NODE_PSYMBOL("ctime");
-  }
-
-  Local<Object> stats =
-    stats_constructor_template->GetFunction()->NewInstance();
-
-  /* ID of device containing file */
-  stats->Set(dev_symbol, Integer::New(s->st_dev));
-
-  /* inode number */
-  stats->Set(ino_symbol, Integer::New(s->st_ino));
-
-  /* protection */
-  stats->Set(mode_symbol, Integer::New(s->st_mode));
-
-  /* number of hard links */
-  stats->Set(nlink_symbol, Integer::New(s->st_nlink));
-
-  /* user ID of owner */
-  stats->Set(uid_symbol, Integer::New(s->st_uid));
-
-  /* group ID of owner */
-  stats->Set(gid_symbol, Integer::New(s->st_gid));
-
-  /* device ID (if special file) */
-  stats->Set(rdev_symbol, Integer::New(s->st_rdev));
-
-  /* total size, in bytes */
-  stats->Set(size_symbol, Number::New(s->st_size));
-
-  /* blocksize for filesystem I/O */
-  stats->Set(blksize_symbol, Integer::New(s->st_blksize));
-
-  /* number of blocks allocated */
-  stats->Set(blocks_symbol, Integer::New(s->st_blocks));
-
-  /* time of last access */
-  stats->Set(atime_symbol, NODE_UNIXTIME_V8(s->st_atime));
-
-  /* time of last modification */
-  stats->Set(mtime_symbol, NODE_UNIXTIME_V8(s->st_mtime));
-
-  /* time of last status change */
-  stats->Set(ctime_symbol, NODE_UNIXTIME_V8(s->st_ctime));
-
-  return scope.Close(stats);
-}
-
-
 // Extracts a C str from a V8 Utf8Value.
 const char* ToCString(const v8::String::Utf8Value& value) {
   return *value ? *value : "<str conversion failed>";
@@ -1571,6 +1490,7 @@ static Handle<Value> Binding(const Arguments& args) {
 
   Local<String> module = args[0]->ToString();
   String::Utf8Value module_v(module);
+  node_module_struct* modp;
 
   if (binding_cache.IsEmpty()) {
     binding_cache = Persistent<Object>::New(Object::New());
@@ -1578,139 +1498,41 @@ static Handle<Value> Binding(const Arguments& args) {
 
   Local<Object> exports;
 
-  // TODO DRY THIS UP!
-
-  if (!strcmp(*module_v, "stdio")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      Stdio::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "cares")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      Cares::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "fs")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-
-      // Initialize the stats object
-      Local<FunctionTemplate> stat_templ = FunctionTemplate::New();
-      stats_constructor_template = Persistent<FunctionTemplate>::New(stat_templ);
-      exports->Set(String::NewSymbol("Stats"),
-                   stats_constructor_template->GetFunction());
-      StatWatcher::Initialize(exports);
-      File::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "signal_watcher")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      SignalWatcher::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "net")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      InitNet(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "http_parser")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      InitHttpParser(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "child_process")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      ChildProcess::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
-  } else if (!strcmp(*module_v, "buffer")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      Buffer::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-  #ifdef HAVE_OPENSSL
-  } else if (!strcmp(*module_v, "crypto")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      InitCrypto(exports);
-      binding_cache->Set(module, exports);
-    }
-  #endif
-  } else if (!strcmp(*module_v, "evals")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      node::Context::Initialize(exports);
-      node::Script::Initialize(exports);
-      binding_cache->Set(module, exports);
-    }
-
+  if (binding_cache->Has(module)) {
+    exports = binding_cache->Get(module)->ToObject();
+  }
+  else if ((modp = get_builtin_module(*module_v)) != NULL) {
+    exports = Object::New();
+    modp->register_func(exports);
+    binding_cache->Set(module, exports);
   } else if (!strcmp(*module_v, "natives")) {
-    if (binding_cache->Has(module)) {
-      exports = binding_cache->Get(module)->ToObject();
-    } else {
-      exports = Object::New();
-      // Explicitly define native sources.
-      // TODO DRY/automate this?
-      exports->Set(String::New("assert"),       String::New(native_assert));
-      exports->Set(String::New("buffer"),       String::New(native_buffer));
-      exports->Set(String::New("child_process"),String::New(native_child_process));
-      exports->Set(String::New("dgram"),        String::New(native_dgram));
-      exports->Set(String::New("dns"),          String::New(native_dns));
-      exports->Set(String::New("events"),       String::New(native_events));
-      exports->Set(String::New("file"),         String::New(native_file));
-      exports->Set(String::New("freelist"),     String::New(native_freelist));
-      exports->Set(String::New("fs"),           String::New(native_fs));
-      exports->Set(String::New("http"),         String::New(native_http));
-      exports->Set(String::New("crypto"),       String::New(native_crypto));
-      exports->Set(String::New("net"),          String::New(native_net));
-      exports->Set(String::New("posix"),        String::New(native_posix));
-      exports->Set(String::New("querystring"),  String::New(native_querystring));
-      exports->Set(String::New("repl"),         String::New(native_repl));
-      exports->Set(String::New("readline"),     String::New(native_readline));
-      exports->Set(String::New("sys"),          String::New(native_sys));
-      exports->Set(String::New("tcp"),          String::New(native_tcp));
-      exports->Set(String::New("url"),          String::New(native_url));
-      exports->Set(String::New("utils"),        String::New(native_utils));
-      exports->Set(String::New("path"),         String::New(native_path));
-      exports->Set(String::New("module"),       String::New(native_module));
-      exports->Set(String::New("string_decoder"), String::New(native_string_decoder));
-      binding_cache->Set(module, exports);
-    }
-
+    exports = Object::New();
+    // Explicitly define native sources.
+    // TODO DRY/automate this?
+    exports->Set(String::New("assert"),       String::New(native_assert));
+    exports->Set(String::New("buffer"),       String::New(native_buffer));
+    exports->Set(String::New("child_process"),String::New(native_child_process));
+    exports->Set(String::New("dgram"),        String::New(native_dgram));
+    exports->Set(String::New("dns"),          String::New(native_dns));
+    exports->Set(String::New("events"),       String::New(native_events));
+    exports->Set(String::New("file"),         String::New(native_file));
+    exports->Set(String::New("freelist"),     String::New(native_freelist));
+    exports->Set(String::New("fs"),           String::New(native_fs));
+    exports->Set(String::New("http"),         String::New(native_http));
+    exports->Set(String::New("crypto"),       String::New(native_crypto));
+    exports->Set(String::New("net"),          String::New(native_net));
+    exports->Set(String::New("posix"),        String::New(native_posix));
+    exports->Set(String::New("querystring"),  String::New(native_querystring));
+    exports->Set(String::New("repl"),         String::New(native_repl));
+    exports->Set(String::New("readline"),     String::New(native_readline));
+    exports->Set(String::New("sys"),          String::New(native_sys));
+    exports->Set(String::New("tcp"),          String::New(native_tcp));
+    exports->Set(String::New("url"),          String::New(native_url));
+    exports->Set(String::New("utils"),        String::New(native_utils));
+    exports->Set(String::New("path"),         String::New(native_path));
+    exports->Set(String::New("module"),       String::New(native_module));
+    exports->Set(String::New("string_decoder"), String::New(native_string_decoder));
+    binding_cache->Set(module, exports);
   } else {
     return ThrowException(Exception::Error(String::New("No such module")));
   }
@@ -1899,6 +1721,8 @@ static void PrintHelp() {
          "                     prefixed to the module search path,\n"
          "                     require.paths.\n"
          "NODE_DEBUG           Print additional debugging output.\n"
+         "NODE_MODULE_CONTEXTS Set to 1 to load modules in their own\n"
+         "                     global contexts.\n"
          "\n"
          "Documentation can be found at http://nodejs.org/api.html"
          " or with 'man node'\n");

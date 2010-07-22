@@ -70,7 +70,6 @@ TEST(0) {
   CodeDesc desc;
   assm.GetCode(&desc);
   Object* code = Heap::CreateCode(desc,
-                                  NULL,
                                   Code::ComputeFlags(Code::STUB),
                                   Handle<Object>(Heap::undefined_value()));
   CHECK(code->IsCode());
@@ -107,7 +106,6 @@ TEST(1) {
   CodeDesc desc;
   assm.GetCode(&desc);
   Object* code = Heap::CreateCode(desc,
-                                  NULL,
                                   Code::ComputeFlags(Code::STUB),
                                   Handle<Object>(Heap::undefined_value()));
   CHECK(code->IsCode());
@@ -153,7 +151,6 @@ TEST(2) {
   CodeDesc desc;
   assm.GetCode(&desc);
   Object* code = Heap::CreateCode(desc,
-                                  NULL,
                                   Code::ComputeFlags(Code::STUB),
                                   Handle<Object>(Heap::undefined_value()));
   CHECK(code->IsCode());
@@ -201,7 +198,6 @@ TEST(3) {
   CodeDesc desc;
   assm.GetCode(&desc);
   Object* code = Heap::CreateCode(desc,
-                                  NULL,
                                   Code::ComputeFlags(Code::STUB),
                                   Handle<Object>(Heap::undefined_value()));
   CHECK(code->IsCode());
@@ -261,7 +257,6 @@ TEST(4) {
     CodeDesc desc;
     assm.GetCode(&desc);
     Object* code = Heap::CreateCode(desc,
-                                    NULL,
                                     Code::ComputeFlags(Code::STUB),
                                     Handle<Object>(Heap::undefined_value()));
     CHECK(code->IsCode());
@@ -301,7 +296,6 @@ TEST(5) {
     CodeDesc desc;
     assm.GetCode(&desc);
     Object* code = Heap::CreateCode(desc,
-                                    NULL,
                                     Code::ComputeFlags(Code::STUB),
                                     Handle<Object>(Heap::undefined_value()));
     CHECK(code->IsCode());
@@ -313,6 +307,40 @@ TEST(5) {
                 CALL_GENERATED_CODE(f, 0xAAAAAAAA, 0, 0, 0, 0));
     ::printf("f() = %d\n", res);
     CHECK_EQ(-7, res);
+  }
+}
+
+
+TEST(6) {
+  // Test saturating instructions.
+  InitializeVM();
+  v8::HandleScope scope;
+
+  Assembler assm(NULL, 0);
+
+  if (CpuFeatures::IsSupported(ARMv7)) {
+    CpuFeatures::Scope scope(ARMv7);
+    __ usat(r1, 8, Operand(r0));           // Sat 0xFFFF to 0-255 = 0xFF.
+    __ usat(r2, 12, Operand(r0, ASR, 9));  // Sat (0xFFFF>>9) to 0-4095 = 0x7F.
+    __ usat(r3, 1, Operand(r0, LSL, 16));  // Sat (0xFFFF<<16) to 0-1 = 0x0.
+    __ add(r0, r1, Operand(r2));
+    __ add(r0, r0, Operand(r3));
+    __ mov(pc, Operand(lr));
+
+    CodeDesc desc;
+    assm.GetCode(&desc);
+    Object* code = Heap::CreateCode(desc,
+                                    Code::ComputeFlags(Code::STUB),
+                                    Handle<Object>(Heap::undefined_value()));
+    CHECK(code->IsCode());
+#ifdef DEBUG
+    Code::cast(code)->Print();
+#endif
+    F1 f = FUNCTION_CAST<F1>(Code::cast(code)->entry());
+    int res = reinterpret_cast<int>(
+                CALL_GENERATED_CODE(f, 0xFFFF, 0, 0, 0, 0));
+    ::printf("f() = %d\n", res);
+    CHECK_EQ(382, res);
   }
 }
 

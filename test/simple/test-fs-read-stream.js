@@ -1,4 +1,5 @@
-require('../common');
+common = require("../common");
+assert = common.assert
 
 // TODO Improved this test. test_ca.pem is too small. A proper test would
 // great a large utf8 (with multibyte chars) file and stream it in,
@@ -7,7 +8,8 @@ require('../common');
 Buffer = require('buffer').Buffer;
 path = require('path');
 fs = require('fs');
-fn = path.join(fixturesDir, 'elipses.txt');
+fn = path.join(common.fixturesDir, 'elipses.txt');
+rangeFile = path.join(common.fixturesDir, 'x.txt');
 
 callbacks = { open: 0, end: 0, close: 0, destroy: 0 };
 
@@ -84,4 +86,13 @@ process.addListener('exit', function() {
 
   assert.equal(30000, file.length);
   assert.equal(10000, file3.length);
+});
+
+var file4 = fs.createReadStream(rangeFile, {start: 1, end: 2});
+var contentRead = '';
+file4.addListener('data', function(data) {
+	contentRead += data.toString('utf-8');
+});
+file4.addListener('end', function(data) {
+	assert.equal(contentRead, 'yz');
 });

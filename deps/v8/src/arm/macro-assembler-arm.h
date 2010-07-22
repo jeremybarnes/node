@@ -112,6 +112,8 @@ class MacroAssembler: public Assembler {
   void Sbfx(Register dst, Register src, int lsb, int width,
             Condition cond = al);
   void Bfc(Register dst, int lsb, int width, Condition cond = al);
+  void Usat(Register dst, int satpos, const Operand& src,
+            Condition cond = al);
 
   void Call(Label* target);
   void Move(Register dst, Handle<Object> value);
@@ -315,24 +317,6 @@ class MacroAssembler: public Assembler {
 
   // ---------------------------------------------------------------------------
   // Inline caching support
-
-  // Generates code that verifies that the maps of objects in the
-  // prototype chain of object hasn't changed since the code was
-  // generated and branches to the miss label if any map has. If
-  // necessary the function also generates code for security check
-  // in case of global object holders. The scratch and holder
-  // registers are always clobbered, but the object register is only
-  // clobbered if it the same as the holder register. The function
-  // returns a register containing the holder - either object_reg or
-  // holder_reg.
-  // The function can optionally (when save_at_depth !=
-  // kInvalidProtoDepth) save the object at the given depth by moving
-  // it to [sp].
-  Register CheckMaps(JSObject* object, Register object_reg,
-                     JSObject* holder, Register holder_reg,
-                     Register scratch,
-                     int save_at_depth,
-                     Label* miss);
 
   // Generate code for checking access rights - used for security checks
   // on access to global objects across environments. The holder register

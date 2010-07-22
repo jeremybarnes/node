@@ -281,6 +281,37 @@ void MacroAssembler::Bfc(Register dst, int lsb, int width, Condition cond) {
 }
 
 
+void MacroAssembler::Usat(Register dst, int satpos, const Operand& src,
+                          Condition cond) {
+  if (!CpuFeatures::IsSupported(ARMv7)) {
+    ASSERT(!dst.is(pc) && !src.rm().is(pc));
+    ASSERT((satpos >= 0) && (satpos <= 31));
+
+    // These asserts are required to ensure compatibility with the ARMv7
+    // implementation.
+    ASSERT((src.shift_op() == ASR) || (src.shift_op() == LSL));
+    ASSERT(src.rs().is(no_reg));
+
+    Label done;
+    int satval = (1 << satpos) - 1;
+
+    if (cond != al) {
+      b(NegateCondition(cond), &done);  // Skip saturate if !condition.
+    }
+    if (!(src.is_reg() && dst.is(src.rm()))) {
+      mov(dst, src);
+    }
+    tst(dst, Operand(~satval));
+    b(eq, &done);
+    mov(dst, Operand(0), LeaveCC, mi);  // 0 if negative.
+    mov(dst, Operand(satval), LeaveCC, pl);  // satval if positive.
+    bind(&done);
+  } else {
+    usat(dst, satpos, src, cond);
+  }
+}
+
+
 void MacroAssembler::SmiJumpTable(Register index, Vector<Label*> targets) {
   // Empty the const pool.
   CheckConstPool(true, true);
@@ -870,88 +901,6 @@ void MacroAssembler::PopTryHandler() {
   mov(ip, Operand(ExternalReference(Top::k_handler_address)));
   add(sp, sp, Operand(StackHandlerConstants::kSize - kPointerSize));
   str(r1, MemOperand(ip));
-}
-
-
-Register MacroAssembler::CheckMaps(JSObject* object, Register object_reg,
-                                   JSObject* holder, Register holder_reg,
-                                   Register scratch,
-                                   int save_at_depth,
-                                   Label* miss) {
-  // Make sure there's no overlap between scratch and the other
-  // registers.
-  ASSERT(!scratch.is(object_reg) && !scratch.is(holder_reg));
-
-  // Keep track of the current object in register reg.
-  Register reg = object_reg;
-  int depth = 0;
-
-  if (save_at_depth == depth) {
-    str(reg, MemOperand(sp));
-  }
-
-  // Check the maps in the prototype chain.
-  // Traverse the prototype chain from the object and do map checks.
-  while (object != holder) {
-    depth++;
-
-    // Only global objects and objects that do not require access
-    // checks are allowed in stubs.
-    ASSERT(object->IsJSGlobalProxy() || !object->IsAccessCheckNeeded());
-
-    // Get the map of the current object.
-    ldr(scratch, FieldMemOperand(reg, HeapObject::kMapOffset));
-    cmp(scratch, Operand(Handle<Map>(object->map())));
-
-    // Branch on the result of the map check.
-    b(ne, miss);
-
-    // Check access rights to the global object.  This has to happen
-    // after the map check so that we know that the object is
-    // actually a global object.
-    if (object->IsJSGlobalProxy()) {
-      CheckAccessGlobalProxy(reg, scratch, miss);
-      // Restore scratch register to be the map of the object.  In the
-      // new space case below, we load the prototype from the map in
-      // the scratch register.
-      ldr(scratch, FieldMemOperand(reg, HeapObject::kMapOffset));
-    }
-
-    reg = holder_reg;  // from now the object is in holder_reg
-    JSObject* prototype = JSObject::cast(object->GetPrototype());
-    if (Heap::InNewSpace(prototype)) {
-      // The prototype is in new space; we cannot store a reference
-      // to it in the code. Load it from the map.
-      ldr(reg, FieldMemOperand(scratch, Map::kPrototypeOffset));
-    } else {
-      // The prototype is in old space; load it directly.
-      mov(reg, Operand(Handle<JSObject>(prototype)));
-    }
-
-    if (save_at_depth == depth) {
-      str(reg, MemOperand(sp));
-    }
-
-    // Go to the next object in the prototype chain.
-    object = prototype;
-  }
-
-  // Check the holder map.
-  ldr(scratch, FieldMemOperand(reg, HeapObject::kMapOffset));
-  cmp(scratch, Operand(Handle<Map>(object->map())));
-  b(ne, miss);
-
-  // Log the check depth.
-  LOG(IntEvent("check-maps-depth", depth + 1));
-
-  // Perform security check for access to the global object and return
-  // the holder register.
-  ASSERT(object == holder);
-  ASSERT(object->IsJSGlobalProxy() || !object->IsAccessCheckNeeded());
-  if (object->IsJSGlobalProxy()) {
-    CheckAccessGlobalProxy(reg, scratch, miss);
-  }
-  return reg;
 }
 
 

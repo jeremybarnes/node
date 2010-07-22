@@ -294,7 +294,7 @@ are readable, writable, or both. All streams are instances of `EventEmitter`.
 
 ## Readable Stream
 
-A **readable stream** has the following methods, members, and events.
+A `Readable Stream` has the following methods, members, and events.
 
 ### Event: 'data'
 
@@ -357,7 +357,7 @@ Closes the underlying file descriptor. Stream will not emit any more events.
 
 ## Writable Stream
 
-A **writable stream** has the following methods, members, and events.
+A `Writable Stream` has the following methods, members, and events.
 
 ### Event: 'drain'
 
@@ -546,7 +546,7 @@ programs.
 
 ### process.stdout
 
-A writable stream to `stdout`.
+A `Writable Stream` to `stdout`.
 
 Example: the definition of `console.log`
 
@@ -678,7 +678,7 @@ Gets the group identity of the process. (See getgid(2).)  This is the numerical 
 
 ### process.setgid(id)
 
-Sets the group identity of the process. (See setgid(2).)  This is the numerical group id, not the group name.
+Sets the group identity of the process. (See setgid(2).)  This accepts either a numerical ID or a groupname string.  If a groupname is specified, this method blocks while resolving it to a numerical ID.
 
     console.log('Current gid: ' + process.getgid());
     try {
@@ -699,7 +699,7 @@ Gets the user identity of the process. (See getuid(2).)  This is the numerical u
 
 ### process.setuid(id)
 
-Sets the user identity of the process. (See setuid(2).)  This is the numerical userid, not the username.
+Sets the user identity of the process. (See setuid(2).)  This accepts either a numerical ID or a username string.  If a username is specified, this method blocks while resolving it to a numerical ID.
 
     console.log('Current uid: ' + process.getuid());
     try {
@@ -919,7 +919,7 @@ See `waitpid(2)`.
 
 ### child.stdin
 
-A `writable stream` that represents the child process's `stdin`.
+A `Writable Stream` that represents the child process's `stdin`.
 Closing this stream via `end()` often causes the child process to terminate.
 
 ### child.stdout
@@ -1048,6 +1048,7 @@ There is a second optional argument to specify several options. The default opti
     , timeout: 0
     , maxBuffer: 200*1024
     , killSignal: 'SIGKILL'
+    , env: null
     }
 
 If `timeout` is greater than 0, then it will kill the child process
@@ -1568,7 +1569,7 @@ Objects returned from `fs.stat()` and `fs.lstat()` are of this type.
 
 ## fs.ReadStream
 
-`ReadStream` is a readable stream.
+`ReadStream` is a `Readable Stream`.
 
 ### fs.createReadStream(path, [options])
 
@@ -1582,10 +1583,18 @@ Returns a new ReadStream object (See `Readable Stream`).
     , 'bufferSize': 4 * 1024
     }
 
+`options` can include `start` and `end` values to read a range of bytes from
+the file instead of the entire file.  Both `start` and `end` are inclusive and
+start at 0.  When used, both the limits must be specified always.
+
+An example to read the last 10 bytes of a file which is 100 bytes long:
+
+    fs.createReadStream('sample.txt', {start: 90, end: 99});
+
 
 ## fs.WriteStream
 
-`WriteStream` is a writable stream.
+`WriteStream` is a `Writable Stream`.
 
 ### fs.createWriteStream(path, [options])
 
@@ -1821,15 +1830,17 @@ Resumes a paused request.
 
 The `net.Stream` object associated with the connection.
 
+
 With HTTPS support, use request.connection.verifyPeer() and
 request.connection.getPeerCertificate() to obtain the client's
 authentication details.
 
 
+
 ## http.ServerResponse
 
 This object is created internally by a HTTP server--not by the user. It is
-passed as the second parameter to the `'request'` event. It is a writable stream.
+passed as the second parameter to the `'request'` event. It is a `Writable Stream`.
 
 
 ### response.writeHead(statusCode, [reasonPhrase], [headers])
@@ -2033,7 +2044,7 @@ followed by `request.end()`.
 This object is created when making a request with `http.Client`. It is
 passed to the `'response'` event of the request object.
 
-The response implements the **readable stream** interface.
+The response implements the `Readable Stream` interface.
 
 ### Event: 'data'
 
@@ -2198,7 +2209,7 @@ Emitted when a stream connection successfully establishes a HTTPS handshake with
 
 Emitted when data is received.  The argument `data` will be a `Buffer` or
 `String`.  Encoding of data is set by `stream.setEncoding()`.
-(See the section on Readable Streams for more information.)
+(See the section on `Readable Stream` for more information.)
 
 ### Event: 'end'
 
@@ -2348,97 +2359,6 @@ Set `initialDelay` (in milliseconds) to set the delay between the last
 data packet received and the first keepalive probe. Setting 0 for
 initialDelay will leave the value unchanged from the default
 (or previous) setting.
-
-
-
-## dgram
-
-This class is used to create datagram sockets, for sending and receiving UDP
-and UNIX daemon sockets.
-
-An server listening for UDP packets on port 8125:
-
-    var dgram = require('dgram');
-    var server = dgram.createSocket(function (msg, rinfo) {
-      console.log("connection from " + rinfo.address + ":"+ rinfo.port);
-      console.log("server got: " + msg);
-    });
-    server.bind(8125, 'localhost');
-
-To listen on the socket `'/tmp/echo.sock'`, change the last line:
-
-    server.bind('/tmp/echo.sock');
-
-A client which sends UDP packets to port 8125:
-
-    var dgram = require("dgram");
-
-    var Buffer = require('buffer').Buffer;
-    var buf = new Buffer('hello');
-
-    var client = dgram.createSocket();
-    client.send(8125, 'localhost', buf, 0, buf.length);
-
-Note the use of a `Buffer` rather than a string object.
-
-
-### Event: 'listening'
-
-`function () {}`
-
-Emitted when a server has finished its bind and is ready to receive data.
-
-### Event: 'message'
-
-`function (msg, rinfo) {}`
-
-Emitted when a socket receives data.  msg is a `Buffer`, not a string.  rinfo.port and rinfo.address contains the sender's port and IP.
-
-### Event: 'error'
-
-`function (exception) { }`
-
-An error on the socket will emit this event.
-
-### Event: 'close'
-
-`function () {}`
-
-Emitted when the socket closes.
-
-
-### dgram.createSocket(messageListener)
-
-Creates a new dgram socket. The `messageListener` argument is
-automatically set as a listener for the `'message'` event.
-
-
-### socket.bind(port, host=null)
-
-Begin accepting connections on the specified `port` and `host`.  If the
-`host` is omitted, the server will accept connections directed to any
-IPv4 address (`INADDR_ANY`).
-
-
-### socket.bind(path)
-
-Start a UNIX socket server listening for connections on the given `path`.
-
-
-### socket.send(port, addr, buffer, offset, length)
-
-Send a packet over the socket to a port and host or IP.  `port` and `addr` define the destination, `buffer` should be a `Buffer` object, and offset and length give the start bytes and total bytes to send in this packet.
-
-
-### socket.send(path, _, buffer, offset, length)
-
-Send a packet over the socket to a UNIX daemon socket.  `path` defines the destination, and the second argument is unused.  `buffer` should be a `Buffer` object, and offset and length give the start bytes and total bytes to send in this packet.
-
-
-### socket.close()
-
-Close the socket. This function is asynchronous, the server is finally closed
-when the server emits a `'close'` event.
 
 
 
@@ -2646,6 +2566,177 @@ Each DNS query can return an error code.
 - `dns.NODATA`: domain exists but no data of reqd type.
 - `dns.NOMEM`: out of memory while processing.
 - `dns.BADQUERY`: the query is malformed.
+
+
+## dgram
+
+Datagram sockets are available through `require('dgram')`.  Datagrams are most commonly 
+handled as IP/UDP messages, but they can also be used over Unix domain sockets.
+
+### Event: 'message'
+
+`function (msg, rinfo) { }`
+
+Emitted when a new datagram is available on a socket.  `msg` is a `Buffer` and `rinfo` is
+an object with the sender's address information and the number of bytes in the datagram.
+
+### Event: 'listening'
+
+`function () { }`
+
+Emitted when a socket starts listening for datagrams.  This happens as soon as UDP sockets
+are created.  Unix domain sockets do not start listening until calling `bind()` on them.
+
+### Event: 'close'
+
+`function () { }`
+
+Emitted when a socket is closed with `close()`.  No new `message` events will be emitted
+on this socket.
+
+### dgram.createSocket(type, [callback])
+
+Creates a datagram socket of the specified types.  Valid types are:
+`udp4`, `udp6`, and `unix_dgram`.  
+
+Takes an optional callback which is added as a listener for `message` events.
+
+### dgram.send(buf, offset, length, path, [callback])
+
+For Unix domain datagram sockets, the destination address is a pathname in the filesystem.
+An optional callback may be supplied that is invoked after the `sendto` call is completed
+by the OS.  It is not safe to re-use `buf` until the callback is invoked.  Note that 
+unless the socket is bound to a pathname with `bind()` there is no way to receive messages
+on this socket.
+
+Example of sending a message to syslogd on OSX via Unix domain socket `/var/run/syslog`:
+
+    var dgram = require('dgram'),
+      Buffer = require('buffer').Buffer,
+      client, message;
+
+    message = new Buffer("A message to log.");
+    client = dgram.createSocket("unix_dgram");
+    client.send(message, 0, message.length, "/var/run/syslog", 
+      function (err, bytes) {
+        if (err) {
+          throw err;
+        }
+        console.log("Wrote " + bytes + " bytes to socket.");
+    });
+
+### dgram.send(buf, offset, length, port, address, [callback])
+
+For UDP sockets, the destination port and IP address must be specified.  A string
+may be supplied for the `address` parameter, and it will be resolved with DNS.  An 
+optional callback may be specified to detect any DNS errors and when `buf` may be
+re-used.  Note that DNS lookups will delay the time that a send takes place, at
+least until the next tick.  The only way to know for sure that a send has taken place
+is to use the callback.
+
+Example of sending a UDP packet to a random port on `localhost`;
+
+    var dgram = require('dgram'),
+      Buffer = require('buffer').Buffer,
+      client, message;
+
+    message = new Buffer("Some bytes");
+    client = dgram.createSocket("udp4");
+    client.send(message, 0, message.length, 41234, "localhost"); 
+    client.close();
+
+### dgram.bind(path)
+
+For Unix domain datagram sockets, start listening for incoming datagrams on a
+socket specified by `path`. Note that clients may `send()` without `bind()`,
+but no datagrams will be received without a `bind()`.
+
+Example of a Unix domain datagram server that echoes back all messages it receives:
+
+    var Buffer = require("buffer").Buffer,
+        dgram = require("dgram"), server
+        server_path = "/tmp/dgram_server_sock";
+
+    server = dgram.createSocket("unix_dgram");
+    server.on("message", function (msg, rinfo) {
+      console.log("got: " + msg + " from " + rinfo.address);
+      server.send(msg, 0, msg.length, rinfo.address);
+    });
+    server.on("listening", function () {
+      console.log("server listening " + server.address().address);
+    })
+    server.bind(server_path);
+
+Example of a Unix domain datagram client that talks to this server:
+
+    var Buffer = require("buffer").Buffer,
+        dgram = require("dgram"),
+        server_path = "/tmp/dgram_server_sock",
+        client_path = "/tmp/dgram_client_sock", client, message;
+
+    message = new Buffer("A message at " + (new Date()));
+
+    client = dgram.createSocket("unix_dgram");
+    client.on("message", function (msg, rinfo) {
+      console.log("got: " + msg + " from " + rinfo.address);
+    });
+    client.on("listening", function () {
+      console.log("client listening " + client.address().address);
+      client.send(message, 0, message.length, server_path);
+    });
+    client.bind(client_path);
+
+### dgram.bind(port, [address])
+
+For UDP sockets, listen for datagrams on a named `port` and optional `address`.  If
+`address` is not specified, the OS will try to listen on all addresses.
+
+Example of a UDP server listening on port 41234:
+
+    var Buffer = require("buffer").Buffer,
+        dgram = require("dgram"), server,
+        message_to_send = new Buffer("A message to send");
+
+    server = dgram.createSocket("udp4");
+    server.on("message", function (msg, rinfo) {
+      console.log("server got: " + msg + " from " +
+        rinfo.address + ":" + rinfo.port);
+    });
+    server.on("listening", function () {
+      var address = server.address();
+      console.log("server listening " + 
+        address.address + ":" + address.port);
+    });
+    server.bind(41234);
+    // server listening 0.0.0.0:41234
+
+
+### dgram.close()
+
+Close the underlying socket and stop listening for data on it.  UDP sockets 
+automatically listen for messages, even if they did not call `bind()`.
+
+### dgram.address()
+
+Returns an object containing the address information for a socket.  For UDP sockets, 
+this object will contain `address` and `port`.  For Unix domain sockets, it will contain
+only `address`.
+
+### dgram.setBroadcast(flag)
+
+Sets or clears the `SO_BROADCAST` socket option.  When this option is set, UDP packets
+may be sent to a local interface's broadcast address.
+
+### dgram.setTTL(ttl)
+
+Sets the `IP_TTL` socket option.  TTL stands for "Time to Live," but in this context it
+specifies the number of IP hops that a packet is allowed to go through.  Each router or 
+gateway that forwards a packet decrements the TTL.  If the TTL is decremented to 0 by a
+router, it will not be forwarded.  Changing TTL values is typically done for network 
+probes or when multicasting.
+
+The argument to `setTTL()` is a number of hops between 1 and 255.  The default on most
+systems is 64.
 
 
 ## Assert
@@ -2884,7 +2975,7 @@ If you wish to disable the array mungeing (e.g. when generating parameters for a
 can set the `munge` argument to `false`.
 Example:
 
-    querystring.stringify({foo: 'bar', foo: 'baz', foo: 'boz'}, '&', '=', false)
+    querystring.stringify({foo: ['bar', 'baz', 'boz']}, '&', '=', false)
     // returns
     'foo=bar&foo=baz&foo=boz'
 
