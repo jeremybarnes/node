@@ -399,18 +399,11 @@ def build_v8(bld):
     else:
       target_debug = bld.env["staticlib_PATTERN"] % "v8_g"
 
-    v8_debug = bld.new_task_gen(
-      source        = 'deps/v8/SConstruct '
-                    + bld.path.ant_glob('v8/include/*')
-                    + bld.path.ant_glob('v8/src/*'),
-      target        = target_debug,
-      rule          = v8_cmd(bld, "debug"),
-      before        = "cxx",
-      install_path  = None,
-      uselib        = "EXECINFO")
+    v8_debug = v8.clone("debug")
+    v8_debug.target        = target_debug
+    v8_debug.rule          = v8_cmd(bld, "debug")
 
     print "v8_debug.rule=", v8_debug.rule
-
     print "v8_debug.target =", v8_debug.target
     bld.env["CPPPATH_V8_G"] = "deps/v8/include"
 
@@ -450,23 +443,20 @@ def build_v8(bld):
     bld.env_of_name('default').append_value("LINKFLAGS_V8", t3)
     bld.env_of_name('default').append_value("LIB_V8", bld.env["USE_SHARED_NODE_V8_NAME"])
     
-  if bld.env["USE_DEBUG"]:
-    bld.add_group("copylibs_debug")
+    if bld.env["USE_DEBUG"]:
+      bld.add_group("copylibs_debug")
 
-    # Same for debug version
-    copytarget_debug = bld.env["shlib_PATTERN"] \
-                     % (bld.env["USE_SHARED_NODE_V8_NAME"] + "_g")
+      # Same for debug version
+      copytarget_debug = bld.env["shlib_PATTERN"] \
+          % (bld.env["USE_SHARED_NODE_V8_NAME"] + "_g")
 
-    copyv8_debug = bld.new_task_gen(
-      "copy",
-      source        = v8_debug.target,
-      target        = copytarget_debug,
-      install_path  = '${PREFIX}/lib',
-      before        = 'cxx')
+      copyv8_debug = copyv8.clone("debug")
+      copyv8_debug.source        = v8_debug.target
+      copyv8_debug.target        = copytarget_debug
     
-    t4 = '-L' + bld.srcnode.abspath(bld.env_of_name("debug"))
-    bld.env_of_name('debug').append_value("LINKFLAGS_V8_G", t4)
-    bld.env_of_name('debug').append_value("LIB_V8_G", bld.env["USE_SHARED_NODE_V8_NAME" + "_g"])
+      t4 = '-L' + bld.srcnode.abspath(bld.env_of_name("debug"))
+      bld.env_of_name('debug').append_value("LINKFLAGS_V8_G", t4)
+      bld.env_of_name('debug').append_value("LIB_V8_G", bld.env["USE_SHARED_NODE_V8_NAME"] + "_g")
 
   bld.install_files('${PREFIX}/include/node/', 'deps/v8/include/*.h')
 
