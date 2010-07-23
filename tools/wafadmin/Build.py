@@ -707,10 +707,6 @@ class BuildContext(Utils.Context):
 			for i in xrange(len(self.task_manager.groups)):
 				g = self.task_manager.groups[i]
 				self.task_manager.current_group = i
-                                print "self.task_manager.groups_names =", self.task_manager.groups_names
-                                print "i=", i
-                                print "g=", g
-
 				if Logs.verbose:
 					Logs.debug('group: group %s' % ([x for x in self.task_manager.groups_names if id(self.task_manager.groups_names[x]) == id(g)][0]))
 				for tg in g.tasks_gen:
