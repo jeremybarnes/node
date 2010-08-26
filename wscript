@@ -360,8 +360,6 @@ def v8_cmd(bld, variant):
   if bld.env["USE_SHARED_NODE_V8"]:
     libtype = "shared"
 
-  cmd_R = 'python "%s" -j %d -C "%s" -Y "%s" visibility=default mode=%s %s library=%s snapshot=on'
-
   if bld.env["SNAPSHOT_V8"]:
     snapshot = "snapshot=on"
   else:
@@ -378,6 +376,9 @@ def v8_cmd(bld, variant):
                 , libtype
                 , snapshot
                 )
+  
+  return ("echo '%s' && " % cmd) + cmd
+
 
 def build_v8(bld):
   if bld.env["USE_SHARED_NODE_V8"]:
