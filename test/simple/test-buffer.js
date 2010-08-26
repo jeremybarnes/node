@@ -25,7 +25,7 @@ var copied = b.copy(c, 0, 0, 512);
 console.log("copied " + copied + " bytes from b into c");
 assert.strictEqual(512, copied);
 for (var i = 0; i < c.length; i++) {
-  print('.');
+  common.print('.');
   assert.equal(i % 256, c[i]);
 }
 console.log("");
@@ -137,6 +137,18 @@ assert.equal(new Buffer('abc').toString('ascii', 0, 0), '');
 assert.equal(new Buffer('abc').toString('ascii', -100, -100), '');
 assert.equal(new Buffer('abc').toString('ascii', 100, 100), '');
 
+// try toString() with a object as a encoding
+assert.equal(new Buffer('abc').toString({toString: function () {return 'ascii';}}), 'abc');
+
+// testing for smart defaults and ability to pass string values as offset
+var writeTest = new Buffer('abcdes');
+writeTest.write('n', 'ascii');
+writeTest.write('o', 'ascii', '1');
+writeTest.write('d', '2', 'ascii');
+writeTest.write('e', 3, 'ascii');
+writeTest.write('j', 'ascii', 4);
+assert.equal(writeTest.toString(), 'nodejs');
+
 var asciiString = "hello world";
 var offset = 100;
 for (var j = 0; j < 500; j++) {
@@ -229,3 +241,76 @@ assert.deepEqual(e, new Buffer([195, 188, 98, 101, 114]));
 
 var f = new Buffer('über', 'ascii');
 assert.deepEqual(f, new Buffer([252, 98, 101, 114]));
+
+
+//
+// Test toString('base64')
+//
+assert.equal('TWFu', (new Buffer('Man')).toString('base64'));
+// big example
+quote = "Man is distinguished, not only by his reason, but by this singular passion from other animals, which is a lust of the mind, that by a perseverance of delight in the continued and indefatigable generation of knowledge, exceeds the short vehemence of any carnal pleasure.";
+expected = "TWFuIGlzIGRpc3Rpbmd1aXNoZWQsIG5vdCBvbmx5IGJ5IGhpcyByZWFzb24sIGJ1dCBieSB0aGlzIHNpbmd1bGFyIHBhc3Npb24gZnJvbSBvdGhlciBhbmltYWxzLCB3aGljaCBpcyBhIGx1c3Qgb2YgdGhlIG1pbmQsIHRoYXQgYnkgYSBwZXJzZXZlcmFuY2Ugb2YgZGVsaWdodCBpbiB0aGUgY29udGludWVkIGFuZCBpbmRlZmF0aWdhYmxlIGdlbmVyYXRpb24gb2Yga25vd2xlZGdlLCBleGNlZWRzIHRoZSBzaG9ydCB2ZWhlbWVuY2Ugb2YgYW55IGNhcm5hbCBwbGVhc3VyZS4=";
+assert.equal(expected, (new Buffer(quote)).toString('base64'));
+
+
+b = new Buffer(1024);
+bytesWritten = b.write(expected, 0, 'base64');
+assert.equal(quote, b.toString('ascii', 0, quote.length));
+assert.equal(quote.length, bytesWritten);
+
+assert.equal(new Buffer('', 'base64').toString(), '');
+assert.equal(new Buffer('K', 'base64').toString(), '');
+
+// multiple-of-4 with padding
+assert.equal(new Buffer('Kg==', 'base64').toString(), '*');
+assert.equal(new Buffer('Kio=', 'base64').toString(), '**');
+assert.equal(new Buffer('Kioq', 'base64').toString(), '***');
+assert.equal(new Buffer('KioqKg==', 'base64').toString(), '****');
+assert.equal(new Buffer('KioqKio=', 'base64').toString(), '*****');
+assert.equal(new Buffer('KioqKioq', 'base64').toString(), '******');
+assert.equal(new Buffer('KioqKioqKg==', 'base64').toString(), '*******');
+assert.equal(new Buffer('KioqKioqKio=', 'base64').toString(), '********');
+assert.equal(new Buffer('KioqKioqKioq', 'base64').toString(), '*********');
+assert.equal(new Buffer('KioqKioqKioqKg==', 'base64').toString(), '**********');
+assert.equal(new Buffer('KioqKioqKioqKio=', 'base64').toString(), '***********');
+assert.equal(new Buffer('KioqKioqKioqKioq', 'base64').toString(), '************');
+assert.equal(new Buffer('KioqKioqKioqKioqKg==', 'base64').toString(), '*************');
+assert.equal(new Buffer('KioqKioqKioqKioqKio=', 'base64').toString(), '**************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioq', 'base64').toString(), '***************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKg==', 'base64').toString(), '****************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKio=', 'base64').toString(), '*****************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKioq', 'base64').toString(), '******************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKioqKg==', 'base64').toString(), '*******************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKioqKio=', 'base64').toString(), '********************');
+
+// no padding, not a multiple of 4
+assert.equal(new Buffer('Kg', 'base64').toString(), '*');
+assert.equal(new Buffer('Kio', 'base64').toString(), '**');
+assert.equal(new Buffer('KioqKg', 'base64').toString(), '****');
+assert.equal(new Buffer('KioqKio', 'base64').toString(), '*****');
+assert.equal(new Buffer('KioqKioqKg', 'base64').toString(), '*******');
+assert.equal(new Buffer('KioqKioqKio', 'base64').toString(), '********');
+assert.equal(new Buffer('KioqKioqKioqKg', 'base64').toString(), '**********');
+assert.equal(new Buffer('KioqKioqKioqKio', 'base64').toString(), '***********');
+assert.equal(new Buffer('KioqKioqKioqKioqKg', 'base64').toString(), '*************');
+assert.equal(new Buffer('KioqKioqKioqKioqKio', 'base64').toString(), '**************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKg', 'base64').toString(), '****************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKio', 'base64').toString(), '*****************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKioqKg', 'base64').toString(), '*******************');
+assert.equal(new Buffer('KioqKioqKioqKioqKioqKioqKio', 'base64').toString(), '********************');
+
+// handle padding graciously, multiple-of-4 or not
+assert.equal(new Buffer('72INjkR5fchcxk9+VgdGPFJDxUBFR5/rMFsghgxADiw==', 'base64').length, 32);
+assert.equal(new Buffer('72INjkR5fchcxk9+VgdGPFJDxUBFR5/rMFsghgxADiw=',  'base64').length, 32);
+assert.equal(new Buffer('72INjkR5fchcxk9+VgdGPFJDxUBFR5/rMFsghgxADiw',   'base64').length, 32);
+assert.equal(new Buffer('w69jACy6BgZmaFvv96HG6MYksWytuZu3T1FvGnulPg==',  'base64').length, 31);
+assert.equal(new Buffer('w69jACy6BgZmaFvv96HG6MYksWytuZu3T1FvGnulPg=',   'base64').length, 31);
+assert.equal(new Buffer('w69jACy6BgZmaFvv96HG6MYksWytuZu3T1FvGnulPg',    'base64').length, 31);
+
+// This string encodes single '.' character in UTF-16
+dot = new Buffer('//4uAA==', 'base64');
+assert.equal(dot[0], 0xff);
+assert.equal(dot[1], 0xfe);
+assert.equal(dot[2], 0x2e);
+assert.equal(dot[3], 0x00);
+assert.equal(dot.toString('base64'), '//4uAA==');

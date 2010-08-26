@@ -49,19 +49,23 @@ consuming octet streams.
 Raw data is stored in instances of the `Buffer` class. A `Buffer` is similar
 to an array of integers but corresponds to a raw memory allocation outside
 the V8 heap. A `Buffer` cannot be resized.
-Access the class with `require('buffer').Buffer`.
+
+The `Buffer` object is global.
 
 Converting between Buffers and JavaScript string objects requires an explicit encoding
-method.  Node supports 3 string encodings: UTF-8 (`'utf8'`), ASCII (`'ascii'`), and
-Binary (`'binary'`).
+method.  Here are the different string encodings;
 
 * `'ascii'` - for 7 bit ASCII data only.  This encoding method is very fast, and will
 strip the high bit if set.
 
 * `'utf8'` - Unicode characters.  Many web pages and other document formats use UTF-8.
 
-* `'binary'` - A legacy encoding. Used to store raw binary data in a string
-by only using the first 8 bits of every character. Don't use this.
+* `'base64'` - Base64 string encoding.
+
+* `'binary'` - A way of encoding raw binary data into strings by using only
+the first 8 bits of each character. This encoding method is depreciated and
+should be avoided in favor of `Buffer` objects where possible. This encoding
+will be removed in future versions of Node.
 
 
 ### new Buffer(size)
@@ -85,7 +89,6 @@ of `'utf8'` encoding, the method will not write partial characters.
 
 Example: write a utf8 string into a buffer, then print it
 
-    Buffer = require('buffer').Buffer;
     buf = new Buffer(256);
     len = buf.write('\u00bd + \u00bc = \u00be', 0);
     console.log(len + " bytes: " + buf.toString('utf8', 0, len));
@@ -108,12 +111,10 @@ so the legal range is between `0x00` and `0xFF` hex or `0` and `255`.
 
 Example: copy an ASCII string into a buffer, one byte at a time:
 
-    var Buffer = require('buffer').Buffer,
-      str = "node.js",
-      buf = new Buffer(str.length),
-      i;
+    str = "node.js";
+    buf = new Buffer(str.length);
 
-    for (i = 0; i < str.length ; i += 1) {
+    for (var i = 0; i < str.length ; i++) {
       buf[i] = str.charCodeAt(i);
     }
 
@@ -130,8 +131,7 @@ string.
 
 Example:
 
-    var Buffer = require('buffer').Buffer,
-      str = '\u00bd + \u00bc = \u00be';
+    str = '\u00bd + \u00bc = \u00be';
 
     console.log(str + ": " + str.length + " characters, " +
       Buffer.byteLength(str, 'utf8') + " bytes");
@@ -145,8 +145,7 @@ The size of the buffer in bytes.  Note that this is not necessarily the size
 of the contents. `length` refers to the amount of memory allocated for the 
 buffer object.  It does not change when the contents of the buffer are changed.
 
-    var Buffer = require('buffer').Buffer,
-      buf = new Buffer(1234);
+    buf = new Buffer(1234);
 
     console.log(buf.length);
     buf.write("some string", "ascii", 0);
@@ -162,12 +161,10 @@ Does a memcpy() between buffers.
 Example: build two Buffers, then copy `buf1` from byte 16 through byte 19
 into `buf2`, starting at the 8th byte in `buf2`.
 
-    var Buffer = require('buffer').Buffer,
-      buf1 = new Buffer(26),
-      buf2 = new Buffer(26),
-      i;
+    buf1 = new Buffer(26);
+    buf2 = new Buffer(26);
   
-    for (i = 0 ; i < 26 ; i += 1) {
+    for (var i = 0 ; i < 26 ; i++) {
       buf1[i] = i + 97; // 97 is ASCII a
       buf2[i] = 33; // ASCII !
     }
@@ -189,15 +186,13 @@ indexes.
 Example: build a Buffer with the ASCII alphabet, take a slice, then modify one byte
 from the original Buffer.
 
-    var Buffer = require('buffer').Buffer,
-      buf1 = new Buffer(26), buf2,
-      i;
-  
-    for (i = 0 ; i < 26 ; i += 1) {
+    var buf1 = new Buffer(26);
+
+    for (var i = 0 ; i < 26 ; i++) {
       buf1[i] = i + 97; // 97 is ASCII a
     }
 
-    buf2 = buf1.slice(0, 3);
+    var buf2 = buf1.slice(0, 3);
     console.log(buf2.toString('ascii', 0, buf2.length));
     buf1[0] = 33;
     console.log(buf2.toString('ascii', 0, buf2.length));
@@ -223,7 +218,7 @@ is emitted. These functions are called _listeners_.
 All EventEmitters emit the event `'newListener'` when new listeners are
 added.
 
-When an EventEmitter experiences an error, the typical action is to emit an
+When an `EventEmitter` experiences an error, the typical action is to emit an
 `'error'` event.  Error events are special--if there is no handler for them
 they will print a stack trace and exit the program.
 
@@ -339,7 +334,7 @@ occured, the stream came to an `'end'`, or `destroy()` was called.
 
 ### stream.setEncoding(encoding)
 Makes the data event emit a string instead of a `Buffer`. `encoding` can be
-`'utf8'`, `'ascii'`, or `'binary'`.
+`'utf8'`, `'ascii'`, or `'base64'`.
 
 ### stream.pause()
 
@@ -755,6 +750,10 @@ The PID of the process.
 
     console.log('This process is pid ' + process.pid);
 
+### process.title
+
+Getter/setter to set what is displayed in 'ps'.
+
 
 ### process.platform
 
@@ -901,7 +900,7 @@ To create a child process use `require('child_process').spawn()`.
 Child processes always have three streams associated with them. `child.stdin`,
 `child.stdout`, and `child.stderr`.
 
-`ChildProcess` is an EventEmitter.
+`ChildProcess` is an `EventEmitter`.
 
 ### Event:  'exit'
 
@@ -943,11 +942,22 @@ Example:
     grep.stdin.end();
 
 
-### child_process.spawn(command, args=[], env=process.env)
+### child_process.spawn(command, args=[], [options])
 
-Launches a new process with the given `command`, command line arguments, and
-environment variables.  If omitted, `args` defaults to an empty Array, and `env`
-defaults to `process.env`.
+Launches a new process with the given `command`, with  command line arguments in `args`.
+If omitted, `args` defaults to an empty Array.
+
+The third argument is used to specify additional options, which defaults to:
+
+    { cwd: undefined
+    , env: process.env,
+    , customFds: [-1, -1, -1]
+    }
+
+`cwd` allows you to specify the working directory from which the process is spawned.
+Use `env` to specify environment variables that will be visible to the new process.
+With `customFds` it is possible to hook up the new process' [stdin, stout, stderr] to
+existing streams; `-1` means that a new stream should be created.
 
 Example of running `ls -lh /usr`, capturing `stdout`, `stderr`, and the exit code:
 
@@ -1048,6 +1058,7 @@ There is a second optional argument to specify several options. The default opti
     , timeout: 0
     , maxBuffer: 200*1024
     , killSignal: 'SIGKILL'
+    , cwd: null
     , env: null
     }
 
@@ -1578,7 +1589,7 @@ Returns a new ReadStream object (See `Readable Stream`).
 `options` is an object with the following defaults:
 
     { 'flags': 'r'
-    , 'encoding': 'binary'
+    , 'encoding': null
     , 'mode': 0666
     , 'bufferSize': 4 * 1024
     }
@@ -1596,6 +1607,12 @@ An example to read the last 10 bytes of a file which is 100 bytes long:
 
 `WriteStream` is a `Writable Stream`.
 
+### Event: 'open'
+
+`function (fd) { }`
+
+ `fd` is the file descriptor used by the WriteStream.
+
 ### fs.createWriteStream(path, [options])
 
 Returns a new WriteStream object (See `Writable Stream`).
@@ -1603,7 +1620,7 @@ Returns a new WriteStream object (See `Writable Stream`).
 `options` is an object with the following defaults:
 
     { 'flags': 'w'
-    , 'encoding': 'binary'
+    , 'encoding': null
     , 'mode': 0666
     }
 
@@ -1637,7 +1654,7 @@ HTTPS is supported if OpenSSL is available on the underlying platform.
 
 ## http.Server
 
-This is an EventEmitter with the following events:
+This is an `EventEmitter` with the following events:
 
 ### Event: 'request'
 
@@ -1689,13 +1706,9 @@ sent to the server on that socket.
 
 If a client connection emits an 'error' event - it will forwarded here.
 
-### http.createServer(requestListener, [options])
+### http.createServer(requestListener)
 
 Returns a new web server object.
-
-The `options` argument is optional. The
-`options` argument accepts the same values as the
-options argument for `net.Server`.
 
 The `requestListener` is a function which is automatically
 added to the `'request'` event.
@@ -1736,7 +1749,7 @@ Stops the server from accepting new connections.
 This object is created internally by a HTTP server--not by
 the user--and passed as the first argument to a `'request'` listener.
 
-This is an EventEmitter with the following events:
+This is an `EventEmitter` with the following events:
 
 ### Event: 'data'
 
@@ -1811,10 +1824,10 @@ Also `request.httpVersionMajor` is the first integer and
 `request.httpVersionMinor` is the second.
 
 
-### request.setEncoding(encoding='binary')
+### request.setEncoding(encoding=null)
 
 Set the encoding for the request body. Either `'utf8'` or `'binary'`. Defaults
-to `'binary'`.
+to `null`, which means that the `'data'` event will emit a `Buffer` object..
 
 
 ### request.pause()
@@ -1861,7 +1874,7 @@ Example:
 This method must only be called once on a message and it must
 be called before `response.end()` is called.
 
-### response.write(chunk, encoding='ascii')
+### response.write(chunk, encoding='utf8')
 
 This method must be called after `writeHead` was
 called. It sends a chunk of the response body. This method may
@@ -1869,7 +1882,7 @@ be called multiple times to provide successive parts of the body.
 
 `chunk` can be a string or a buffer. If `chunk` is a string,
 the second parameter specifies how to encode it into a byte stream.
-By default the `encoding` is `'ascii'`.
+By default the `encoding` is `'utf8'`.
 
 **Note**: This is the raw HTTP body and has nothing to do with
 higher-level multi-part body encodings that may be used.
@@ -1915,6 +1928,16 @@ Example of connecting to `google.com`:
         console.log('BODY: ' + chunk);
       });
     });
+
+There are a few special headers that should be noted.
+
+* The 'Host' header is not added by Node, and is usually required by
+  website.
+
+* Sending a 'Connection: keep-alive' will notify Node that the connection to
+  the server should be persisted until the next request.
+
+* Sending a 'Content-length' header will disable the default chunked encoding.
 
 
 ### Event: 'upgrade'
@@ -2012,7 +2035,7 @@ Emitted when a response is received to this request. This event is emitted only 
 `response` argument will be an instance of `http.ClientResponse`.
 
 
-### request.write(chunk, encoding='ascii')
+### request.write(chunk, encoding='utf8')
 
 Sends a chunk of the body.  By calling this method
 many times, the user can stream a request body to a
@@ -2024,10 +2047,8 @@ The `chunk` argument should be an array of integers
 or a string.
 
 The `encoding` argument is optional and only
-applies when `chunk` is a string. The encoding
-argument should be either `'utf8'` or
-`'ascii'`. By default the body uses ASCII encoding,
-as it is faster.
+applies when `chunk` is a string.
+
 
 ### request.end([data], [encoding])
 
@@ -2079,9 +2100,10 @@ Also `response.httpVersionMajor` is the first integer and
 
 The response headers object.
 
-### response.setEncoding(encoding='utf8')
+### response.setEncoding(encoding=null)
 
-Set the encoding for the response body. Either `'utf8'` or `'binary'`.
+Set the encoding for the response body. Either `'utf8'`, `'ascii'`, or `'base64'`.
+Defaults to `null`, which means that the `'data'` event will emit a `Buffer` object..
 
 ### response.pause()
 
@@ -2125,7 +2147,7 @@ changed to
 
     server.listen('/tmp/echo.sock');
 
-This is an EventEmitter with the following events:
+This is an `EventEmitter` with the following events:
 
 ### Event: 'connection'
 
@@ -2143,7 +2165,7 @@ Emitted when the server closes.
 
 ### net.createServer(connectionListener)
 
-Creates a new TCP server. The `connection_listener` argument is
+Creates a new TCP server. The `connectionListener` argument is
 automatically set as a listener for the `'connection'` event.
 
 
@@ -2178,6 +2200,15 @@ Stops the server from accepting new connections. This function is
 asynchronous, the server is finally closed when the server emits a `'close'`
 event.
 
+### server.maxConnections
+
+Set this property to reject connections when the server's connection count gets high.
+
+### server.connections
+
+The number of concurrent connections on the server.
+
+
 
 ## net.Stream
 
@@ -2186,7 +2217,7 @@ instance implement a duplex stream interface.  They can be created by the
 user and used as a client (with `connect()`) or they can be created by Node
 and passed to the user through the `'connection'` event of a server.
 
-`net.Stream` instances are an EventEmitters with the following events:
+`net.Stream` instances are EventEmitters with the following events:
 
 ### Event: 'connect'
 
@@ -2200,7 +2231,7 @@ See `connect()`.
 
 `function () { }`
 
-Emitted when a stream connection successfully establishes a HTTPS handshake with its peer.
+Emitted when a stream connection successfully establishes an SSL handshake with its peer.
 
 
 ### Event: 'data'
@@ -2282,16 +2313,16 @@ This member is only present in server-side connections.
 
 Either `'closed'`, `'open'`, `'opening'`, `'readOnly'`, or `'writeOnly'`.
 
-### stream.setEncoding(encoding='utf8')
+### stream.setEncoding(encoding=null)
 
-Sets the encoding (either `'ascii'`, `'utf8'`, or `'binary'`) for data that is
+Sets the encoding (either `'ascii'`, `'utf8'`, or `'base64'`) for data that is
 received.
 
 ### stream.setSecure([credentials])
 
-Enables HTTPS support for the stream, with the crypto module credentials specifying the private key and certificate of the stream, and optionally the CA certificates for use in peer authentication.
+Enables SSL support for the stream, with the crypto module credentials specifying the private key and certificate of the stream, and optionally the CA certificates for use in peer authentication.
 
-If the credentials hold one ore more CA certificates, then the stream will request for the peer to submit a client certificate as part of the HTTPS connection handshake. The validity and content of this can be accessed via verifyPeer() and getPeerCertificate().
+If the credentials hold one ore more CA certificates, then the stream will request for the peer to submit a client certificate as part of the SSL connection handshake. The validity and content of this can be accessed via verifyPeer() and getPeerCertificate().
 
 ### stream.verifyPeer()
 
@@ -2488,8 +2519,7 @@ resolves the IP addresses which are returned.
 
       console.log('addresses: ' + JSON.stringify(addresses));
 
-      for (var i = 0; i < addresses.length; i++) {
-        var a = addresses[i];
+      addresses.forEach(function (a) {
         dns.reverse(a, function (err, domains) {
           if (err) {
             console.log('reverse for ' + a + ' failed: ' +
@@ -2499,8 +2529,19 @@ resolves the IP addresses which are returned.
               JSON.stringify(domains));
           }
         });
-      }
+      });
     });
+
+### dns.lookup(domain, family=null, callback)
+
+Resolves a domain (e.g. `'google.com'`) into the first found A (IPv4) or
+AAAA (IPv6) record.
+
+The callback has arguments `(err, address, family)`.  The `address` argument
+is a string representation of a IP v4 or v6 address. The `family` argument
+is either the integer 4 or 6 and denotes the family of `address` (not
+neccessarily the value initially passed to `lookup`).
+
 
 ### dns.resolve(domain, rrtype='A', callback)
 
@@ -2611,13 +2652,10 @@ on this socket.
 
 Example of sending a message to syslogd on OSX via Unix domain socket `/var/run/syslog`:
 
-    var dgram = require('dgram'),
-      Buffer = require('buffer').Buffer,
-      client, message;
-
-    message = new Buffer("A message to log.");
-    client = dgram.createSocket("unix_dgram");
-    client.send(message, 0, message.length, "/var/run/syslog", 
+    var dgram = require('dgram');
+    var message = new Buffer("A message to log.");
+    var client = dgram.createSocket("unix_dgram");
+    client.send(message, 0, message.length, "/var/run/syslog",
       function (err, bytes) {
         if (err) {
           throw err;
@@ -2636,14 +2674,12 @@ is to use the callback.
 
 Example of sending a UDP packet to a random port on `localhost`;
 
-    var dgram = require('dgram'),
-      Buffer = require('buffer').Buffer,
-      client, message;
-
-    message = new Buffer("Some bytes");
-    client = dgram.createSocket("udp4");
-    client.send(message, 0, message.length, 41234, "localhost"); 
+    var dgram = require('dgram');
+    var message = new Buffer("Some bytes");
+    var client = dgram.createSocket("udp4");
+    client.send(message, 0, message.length, 41234, "localhost");
     client.close();
+
 
 ### dgram.bind(path)
 
@@ -2653,38 +2689,41 @@ but no datagrams will be received without a `bind()`.
 
 Example of a Unix domain datagram server that echoes back all messages it receives:
 
-    var Buffer = require("buffer").Buffer,
-        dgram = require("dgram"), server
-        server_path = "/tmp/dgram_server_sock";
+    var dgram = require("dgram");
+    var serverPath = "/tmp/dgram_server_sock";
+    var server = dgram.createSocket("unix_dgram");
 
-    server = dgram.createSocket("unix_dgram");
     server.on("message", function (msg, rinfo) {
       console.log("got: " + msg + " from " + rinfo.address);
       server.send(msg, 0, msg.length, rinfo.address);
     });
+
     server.on("listening", function () {
       console.log("server listening " + server.address().address);
     })
-    server.bind(server_path);
+
+    server.bind(serverPath);
 
 Example of a Unix domain datagram client that talks to this server:
 
-    var Buffer = require("buffer").Buffer,
-        dgram = require("dgram"),
-        server_path = "/tmp/dgram_server_sock",
-        client_path = "/tmp/dgram_client_sock", client, message;
+    var dgram = require("dgram");
+    var serverPath = "/tmp/dgram_server_sock";
+    var clientPath = "/tmp/dgram_client_sock";
 
-    message = new Buffer("A message at " + (new Date()));
+    var message = new Buffer("A message at " + (new Date()));
 
-    client = dgram.createSocket("unix_dgram");
+    var client = dgram.createSocket("unix_dgram");
+
     client.on("message", function (msg, rinfo) {
       console.log("got: " + msg + " from " + rinfo.address);
     });
+
     client.on("listening", function () {
       console.log("client listening " + client.address().address);
-      client.send(message, 0, message.length, server_path);
+      client.send(message, 0, message.length, serverPath);
     });
-    client.bind(client_path);
+
+    client.bind(clientPath);
 
 ### dgram.bind(port, [address])
 
@@ -2693,20 +2732,22 @@ For UDP sockets, listen for datagrams on a named `port` and optional `address`. 
 
 Example of a UDP server listening on port 41234:
 
-    var Buffer = require("buffer").Buffer,
-        dgram = require("dgram"), server,
-        message_to_send = new Buffer("A message to send");
+    var dgram = require("dgram");
 
-    server = dgram.createSocket("udp4");
+    var server = dgram.createSocket("udp4");
+    var messageToSend = new Buffer("A message to send");
+
     server.on("message", function (msg, rinfo) {
       console.log("server got: " + msg + " from " +
         rinfo.address + ":" + rinfo.port);
     });
+
     server.on("listening", function () {
       var address = server.address();
-      console.log("server listening " + 
-        address.address + ":" + address.port);
+      console.log("server listening " +
+          address.address + ":" + address.port);
     });
+
     server.bind(41234);
     // server listening 0.0.0.0:41234
 
@@ -2959,7 +3000,7 @@ Example:
     // returns
     'foo:bar;baz:bob'
 
-By default, this function will perform PHP/Rails-style parameter mungeing for arrays and objects used as
+By default, this function will perform PHP/Rails-style parameter munging for arrays and objects used as
 values within `obj`.
 Example:
 
@@ -2971,7 +3012,7 @@ Example:
     // returns
     'foo%5Bbar%5D=baz'
 
-If you wish to disable the array mungeing (e.g. when generating parameters for a Java servlet), you
+If you wish to disable the array munging (e.g. when generating parameters for a Java servlet), you
 can set the `munge` argument to `false`.
 Example:
 
@@ -3082,16 +3123,16 @@ The special variable `_` (underscore) contains the result of the last expression
     4
 
 The REPL provides access to any variables in the global scope. You can expose a variable 
-to the REPL explicitly by assigning it to the `scope` object associated with each
+to the REPL explicitly by assigning it to the `context` object associated with each
 `REPLServer`.  For example:
 
     // repl_test.js
     var repl = require("repl"),
         msg = "message";
 
-    repl.start().scope.m = msg;
+    repl.start().context.m = msg;
 
-Things in the `scope` object appear as local within the REPL:
+Things in the `context` object appear as local within the REPL:
 
     mjr:~$ node repl_test.js 
     node> m
@@ -3102,7 +3143,7 @@ There are a few special REPL commands:
   - `.break` - While inputting a multi-line expression, sometimes you get lost or just don't care 
   about completing it.  `.break` will start over.
   
-  - `.clear` - Resets the `scope` object to an empty object and clears any multi-line expression.
+  - `.clear` - Resets the `context` object to an empty object and clears any multi-line expression.
   
   - `.exit` - Close the I/O stream, which will cause the REPL to exit.
 
@@ -3249,3 +3290,49 @@ All Node addons must export a function called `init` with this signature:
 
 For the moment, that is all the documentation on addons. Please see
 <http://github.com/ry/node_postgres> for a real example.
+
+
+## Appendix - Third Party Modules
+
+There are many third party modules for Node. At the time of writing, August
+2010, the master repository of modules is
+http://github.com/ry/node/wiki/modules[the wiki page].
+
+This appendix is intended as a SMALL guide to new-comers to help them
+quickly find what are considered to be quality modules. It is not intended
+to be a complete list.  There may be better more complete modules found
+elsewhere.
+
+- Module Installer: [npm](http://github.com/isaacs/npm)
+
+- HTTP Middleware: [Connect](http://github.com/senchalabs/connect)
+
+- Web Framework: [Express](http://github.com/visionmedia/express)
+
+- Web Sockets: [Socket.IO](http://github.com/LearnBoost/Socket.IO-node)
+
+- HTML Parsing: [HTML5](http://github.com/aredridel/html5)
+
+- [mDNS/Zeroconf/Bonjour](http://github.com/agnat/node_mdns)
+
+- [RabbitMQ, AMQP](http://github.com/ry/node-amqp)
+
+- [mysql](http://github.com/felixge/node-mysql)
+
+- Serialization: [msgpack](http://github.com/pgriess/node-msgpack)
+
+- Scraping: [Apricot](http://github.com/silentrob/Apricot)
+
+- Debugger: [ndb](http://github.com/smtlaissezfaire/ndb) is a CLI debugger
+  [inspector](http://github.com/dannycoates/node-inspector) is a web based
+  tool.
+
+- [pcap binding](http://github.com/mranney/node_pcap)
+
+- [ncurses](http://github.com/mscdex/node-ncurses)
+
+- Testing/TDD/BDD: [vows](http://vowsjs.org/),
+  [expresso](http://github.com/visionmedia/expresso),
+  [mjsunit.runner](http://github.com/tmpvar/mjsunit.runner)
+
+Patches to this list are welcome.

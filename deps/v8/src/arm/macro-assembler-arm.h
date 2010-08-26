@@ -393,6 +393,8 @@ class MacroAssembler: public Assembler {
                                    Register heap_number_map,
                                    Label* gc_required);
 
+  // Copies a fixed number of fields of heap objects from src to dst.
+  void CopyFields(Register dst, Register src, RegList temps, int field_count);
 
   // ---------------------------------------------------------------------------
   // Support functions.
@@ -615,6 +617,9 @@ class MacroAssembler: public Assembler {
   void JumpIfNotBothSmi(Register reg1, Register reg2, Label* on_not_both_smi);
   // Jump if either of the registers contain a smi.
   void JumpIfEitherSmi(Register reg1, Register reg2, Label* on_either_smi);
+
+  // Abort execution if argument is a smi. Used in debug code.
+  void AbortIfSmi(Register object);
 
   // ---------------------------------------------------------------------------
   // String utilities

@@ -7,6 +7,28 @@
 #include <limits.h> /* PATH_MAX */
 
 namespace node {
+static char *process_title;
+
+char** OS::SetupArgs(int argc, char *argv[]) {
+  process_title = argc ? strdup(argv[0]) : NULL;
+  return argv;
+}
+
+
+// OS::SetProcessTitle implemented in platform_darwin_proctitle.cc
+}  // namespace node
+#include "platform_darwin_proctitle.cc"
+namespace node {
+
+
+const char* OS::GetProcessTitle(int *len) {
+  if (process_title) {
+    *len = strlen(process_title);
+    return process_title;
+  }
+  *len = 0;
+  return NULL;
+}
 
 // Researched by Tim Becker and Michael Knight
 // http://blog.kuriositaet.de/?p=257

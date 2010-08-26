@@ -3,12 +3,16 @@
 - readline
   - fix for two column glyphs. use Markus Kuhn's wcwidth.c
   - fix for commands that extend beyond term width
-  - tab completion interface
 - SSL should be factored out of net.js into standalone stream object
-- base64 write and toString for buffers
-- node_crypto, support for Buffer in update function of Cipher, Decipher,
-  Hmac, Sign, Verify. See 9a26946aaa99a3f27905d5ba91220784e864e5d0 for an
-  example of how to do it.
-
+- add completion callbacks to all stream write() methods
+- Erradicate all traces of 'binary' encoding. Only used, now, in OpenSSL
+  binding.
+- Documentation needs a major refactor; should generate more than one HTML
+  page/man page from the single api.markdown file. Deep sections should be
+  allowed.
 - debug and production modes
 - EventSource branch merged
+- TCP servers should have an optional number of maximum connections. When
+  the maximum is reached it stops accepting new connections.
+- compile under clang
+- Use C++ style casts everywhere.

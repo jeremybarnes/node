@@ -136,6 +136,9 @@ static Handle<Value> Socket(const Arguments& args) {
   // default to TCP
   int domain = PF_INET;
   int type = SOCK_STREAM;
+#ifdef SO_REUSEPORT
+  bool set_reuseport = false;
+#endif
 
   if (args[0]->IsString()) {
     String::Utf8Value t(args[0]->ToString());
@@ -158,12 +161,21 @@ static Handle<Value> Socket(const Arguments& args) {
     } else if (0 == strcasecmp(*t, "UDP")) {
       domain = PF_INET;
       type = SOCK_DGRAM;
+#ifdef SO_REUSEPORT
+      set_reuseport = true;
+#endif
     } else if (0 == strcasecmp(*t, "UDP4")) {
       domain = PF_INET;
       type = SOCK_DGRAM;
+#ifdef SO_REUSEPORT
+      set_reuseport = true;
+#endif
     } else if (0 == strcasecmp(*t, "UDP6")) {
       domain = PF_INET6;
       type = SOCK_DGRAM;
+#ifdef SO_REUSEPORT
+      set_reuseport = true;
+#endif
     } else {
       return ThrowException(Exception::Error(
             String::New("Unknown socket type.")));
@@ -179,6 +191,16 @@ static Handle<Value> Socket(const Arguments& args) {
     close(fd);
     return ThrowException(ErrnoException(fcntl_errno, "fcntl"));
   }
+
+#ifdef SO_REUSEPORT
+  // needed for datagrams to be able to have multiple processes listening to
+  // e.g. broadcasted datagrams.
+  if (set_reuseport) {
+    int flags = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&flags,
+               sizeof(flags));
+  }
+#endif
 
   return scope.Close(Integer::New(fd));
 }
@@ -199,16 +221,16 @@ static inline Handle<Value> ParseAddressArgs(Handle<Value> first,
     // UNIX
     String::Utf8Value path(first->ToString());
 
-    if (path.length() >= ARRAY_SIZE(un.sun_path)) {
+    if ((size_t) path.length() >= ARRAY_SIZE(un.sun_path)) {
       return Exception::Error(String::New("Socket path too long"));
     }
 
+    memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
-    strncpy(un.sun_path, *path, ARRAY_SIZE(un.sun_path) - 1);
-    un.sun_path[ARRAY_SIZE(un.sun_path) - 1] = '\0';
+    memcpy(un.sun_path, *path, path.length());
 
     addr = (struct sockaddr*)&un;
-    addrlen = path.length() + sizeof(un.sun_family) + 1;
+    addrlen = sizeof(un) - sizeof(un.sun_path) + path.length() + 1;
 
   } else {
     // TCP or UDP
@@ -350,13 +372,6 @@ static Handle<Value> Connect(const Arguments& args) {
   return Undefined();
 }
 
-// Mac's SUN_LEN is broken
-#if defined(__APPLE__)
-# define SUN_LEN(ptr) ((ptr)->sun_len-2)
-#elif !defined(SUN_LEN)
-# define SUN_LEN(ptr) strlen((ptr)->sun_path)
-#endif
-
 #define ADDRESS_TO_JS(info, address_storage) \
 do { \
   char ip[INET6_ADDRSTRLEN]; \
@@ -381,15 +396,10 @@ do { \
       break; \
     case AF_UNIX: \
       au = (struct sockaddr_un*)&(address_storage); \
-      char un_path[105]; \
-      size_t len; \
-      len = SUN_LEN(au); \
-      strncpy(un_path, au->sun_path, len); \
-      un_path[len] = 0; \
-      (info)->Set(address_symbol, String::New(un_path)); \
+      (info)->Set(address_symbol, String::New(au->sun_path)); \
       break; \
     default: \
-      (info)->Set(address_symbol, String::New("")); \
+      (info)->Set(address_symbol, String::Empty()); \
   } \
 } while (0)
 

@@ -347,6 +347,10 @@ class CodeGenerator: public AstVisitor {
   // expected arguments. Otherwise return -1.
   static int InlineRuntimeCallArgumentsCount(Handle<String> name);
 
+  static Operand ContextOperand(Register context, int index) {
+    return Operand(context, Context::SlotOffset(index));
+  }
+
  private:
   // Construction/Destruction
   explicit CodeGenerator(MacroAssembler* masm);
@@ -406,10 +410,6 @@ class CodeGenerator: public AstVisitor {
   void LoadReference(Reference* ref);
   void UnloadReference(Reference* ref);
 
-  static Operand ContextOperand(Register context, int index) {
-    return Operand(context, Context::SlotOffset(index));
-  }
-
   Operand SlotOperand(Slot* slot, Register tmp);
 
   Operand ContextSlotOperandCheckExtensions(Slot* slot,
@@ -457,6 +457,7 @@ class CodeGenerator: public AstVisitor {
   // Support for compiling assignment expressions.
   void EmitSlotAssignment(Assignment* node);
   void EmitNamedPropertyAssignment(Assignment* node);
+  void EmitKeyedPropertyAssignment(Assignment* node);
 
   // Receiver is passed on the frame and not consumed.
   Result EmitNamedLoad(Handle<String> name, bool is_contextual);
@@ -469,6 +470,9 @@ class CodeGenerator: public AstVisitor {
   // The object and the property name are passed on the stack, and
   // not changed.
   Result EmitKeyedLoad();
+
+  // Receiver, key, and value are passed on the frame and consumed.
+  Result EmitKeyedStore(StaticType* key_type);
 
   // Special code for typeof expressions: Unfortunately, we must
   // be careful when loading the expression in 'typeof'
@@ -487,6 +491,13 @@ class CodeGenerator: public AstVisitor {
 
   void GenericBinaryOperation(BinaryOperation* expr,
                               OverwriteMode overwrite_mode);
+
+  // Emits code sequence that jumps to a JumpTarget if the inputs
+  // are both smis.  Cannot be in MacroAssembler because it takes
+  // advantage of TypeInfo to skip unneeded checks.
+  void JumpIfBothSmiUsingTypeInfo(Result* left,
+                                  Result* right,
+                                  JumpTarget* both_smi);
 
   // Emits code sequence that jumps to deferred code if the input
   // is not a smi.  Cannot be in MacroAssembler because it takes
@@ -600,6 +611,8 @@ class CodeGenerator: public AstVisitor {
   void GenerateIsSpecObject(ZoneList<Expression*>* args);
   void GenerateIsFunction(ZoneList<Expression*>* args);
   void GenerateIsUndetectableObject(ZoneList<Expression*>* args);
+  void GenerateIsStringWrapperSafeForDefaultValueOf(
+      ZoneList<Expression*>* args);
 
   // Support for construct call checks.
   void GenerateIsConstructCall(ZoneList<Expression*>* args);
@@ -665,6 +678,8 @@ class CodeGenerator: public AstVisitor {
   void GenerateMathSin(ZoneList<Expression*>* args);
   void GenerateMathCos(ZoneList<Expression*>* args);
   void GenerateMathSqrt(ZoneList<Expression*>* args);
+
+  void GenerateIsRegExpEquivalent(ZoneList<Expression*>* args);
 
 // Simple condition analysis.
   enum ConditionAnalysis {
@@ -748,6 +763,18 @@ class TranscendentalCacheStub: public CodeStub {
   int MinorKey() { return type_; }
   Runtime::FunctionId RuntimeFunction();
   void GenerateOperation(MacroAssembler* masm, Label* on_nan_result);
+};
+
+
+class ToBooleanStub: public CodeStub {
+ public:
+  ToBooleanStub() { }
+
+  void Generate(MacroAssembler* masm);
+
+ private:
+  Major MajorKey() { return ToBoolean; }
+  int MinorKey() { return 0; }
 };
 
 

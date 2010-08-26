@@ -86,6 +86,30 @@ static inline void blob_unref(Blob *blob) {
   }
 }
 
+static inline size_t base64_decoded_size(const char *src, size_t size) {
+  const char *const end = src + size;
+  const int remainder = size % 4;
+
+  size = (size / 4) * 3;
+  if (remainder) {
+    if (size == 0 && remainder == 1) {
+      // special case: 1-byte input cannot be decoded
+      size = 0;
+    } else {
+      // non-padded input, add 1 or 2 extra bytes
+      size += 1 + (remainder == 3);
+    }
+  }
+
+  // check for trailing padding (1 or 2 bytes)
+  if (size > 0) {
+    if (end[-1] == '=') size--;
+    if (end[-2] == '=') size--;
+  }
+
+  return size;
+}
+
 #if 0
 // When someone calls buffer.asciiSlice, data is not copied. Instead V8
 // references in the underlying Blob with this ExternalAsciiStringResource.
@@ -149,6 +173,13 @@ Handle<Value> Buffer::New(const Arguments &args) {
     Local<String> s = args[0]->ToString();
     enum encoding e = ParseEncoding(args[1], UTF8);
     int length = e == UTF8 ? s->Utf8Length() : s->Length();
+
+    // input gets base64-decoded, adjust buffer size
+    if (e == BASE64) {
+      const String::AsciiValue data(s);
+      length = base64_decoded_size(*data, data.length());
+    }
+
     buffer = new Buffer(length);
   } else if (Buffer::HasInstance(args[0]) && args.Length() > 2) {
     // var slice = new Buffer(buffer, 123, 130);
@@ -269,6 +300,92 @@ Handle<Value> Buffer::Utf8Slice(const Arguments &args) {
   SLICE_ARGS(args[0], args[1])
   const char *data = const_cast<char*>(parent->data() + start);
   Local<String> string = String::New(data, end - start);
+  return scope.Close(string);
+}
+
+static const char *base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                  "abcdefghijklmnopqrstuvwxyz"
+                                  "0123456789+/";
+static const int unbase64_table[] =
+  {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63
+  ,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1
+  ,-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14
+  ,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1
+  ,-1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40
+  ,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+  };
+
+
+Handle<Value> Buffer::Base64Slice(const Arguments &args) {
+  HandleScope scope;
+  Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
+  SLICE_ARGS(args[0], args[1])
+
+  int n = end - start;
+  int out_len = (n + 2 - ((n + 2) % 3)) / 3 * 4;
+  char *out = new char[out_len];
+
+  uint8_t bitbuf[3];
+  int i = start; // data() index
+  int j = 0; // out index
+  char c;
+  bool b1_oob, b2_oob;
+
+  while (i < end) {
+    bitbuf[0] = parent->data()[i++];
+
+    if (i < end) {
+      bitbuf[1] = parent->data()[i];
+      b1_oob = false;
+    }  else {
+      bitbuf[1] = 0;
+      b1_oob = true;
+    }
+    i++;
+
+    if (i < end) {
+      bitbuf[2] = parent->data()[i];
+      b2_oob = false;
+    }  else {
+      bitbuf[2] = 0;
+      b2_oob = true;
+    }
+    i++;
+
+
+    c = bitbuf[0] >> 2;
+    assert(c < 64);
+    out[j++] = base64_table[c];
+    assert(j < out_len);
+
+    c = ((bitbuf[0] & 0x03) << 4) | (bitbuf[1] >> 4);
+    assert(c < 64);
+    out[j++] = base64_table[c];
+    assert(j < out_len);
+
+    if (b1_oob) {
+      out[j++] = '=';
+    } else {
+      c = ((bitbuf[1] & 0x0F) << 2) | (bitbuf[2] >> 6);
+      assert(c < 64);
+      out[j++] = base64_table[c];
+    }
+    assert(j < out_len);
+
+    if (b2_oob) {
+      out[j++] = '=';
+    } else {
+      c = bitbuf[2] & 0x3F;
+      assert(c < 64);
+      out[j++]  = base64_table[c];
+    }
+    assert(j <= out_len);
+  }
+
+  Local<String> string = String::New(out, out_len);
+  delete [] out;
   return scope.Close(string);
 }
 
@@ -408,6 +525,70 @@ Handle<Value> Buffer::AsciiWrite(const Arguments &args) {
   return scope.Close(Integer::New(written));
 }
 
+// var bytesWritten = buffer.base64Write(string, offset);
+Handle<Value> Buffer::Base64Write(const Arguments &args) {
+  HandleScope scope;
+
+  assert(unbase64_table['/'] == 63);
+  assert(unbase64_table['+'] == 62);
+  assert(unbase64_table['T'] == 19);
+  assert(unbase64_table['Z'] == 25);
+  assert(unbase64_table['t'] == 45);
+  assert(unbase64_table['z'] == 51);
+
+  Buffer *buffer = ObjectWrap::Unwrap<Buffer>(args.This());
+
+  if (!args[0]->IsString()) {
+    return ThrowException(Exception::TypeError(String::New(
+            "Argument must be a string")));
+  }
+
+  String::AsciiValue s(args[0]->ToString());
+  size_t offset = args[1]->Int32Value();
+
+  // handle zero-length buffers graciously
+  if (offset == 0 && buffer->length_ == 0) {
+    return scope.Close(Integer::New(0));
+  }
+
+  if (offset >= buffer->length_) {
+    return ThrowException(Exception::TypeError(String::New(
+            "Offset is out of bounds")));
+  }
+
+  const size_t size = base64_decoded_size(*s, s.length());
+  if (size > buffer->length_ - offset) {
+    // throw exception, don't silently truncate
+    return ThrowException(Exception::TypeError(String::New(
+            "Buffer too small")));
+  }
+
+  char a, b, c, d;
+  char *dst = buffer->data();
+  const char *src = *s;
+  const char *const srcEnd = src + s.length();
+
+  while (src < srcEnd) {
+    const int remaining = srcEnd - src;
+    if (remaining == 0 || *src == '=') break;
+    a = unbase64_table[*src++];
+
+    if (remaining == 1 || *src == '=') break;
+    b = unbase64_table[*src++];
+    *dst++ = (a << 2) | ((b & 0x30) >> 4);
+
+    if (remaining == 2 || *src == '=') break;
+    c = unbase64_table[*src++];
+    *dst++ = ((b & 0x0F) << 4) | ((c & 0x3C) >> 2);
+
+    if (remaining == 3 || *src == '=') break;
+    d = unbase64_table[*src++];
+    *dst++ = ((c & 0x03) << 6) | (d & 0x3F);
+  }
+
+  return scope.Close(Integer::New(size));
+}
+
 
 Handle<Value> Buffer::BinaryWrite(const Arguments &args) {
   HandleScope scope;
@@ -520,6 +701,22 @@ Handle<Value> Buffer::ByteLength(const Arguments &args) {
 }
 
 
+Handle<Value> Buffer::MakeFastBuffer(const Arguments &args) {
+  HandleScope scope;
+
+  Buffer *buffer = ObjectWrap::Unwrap<Buffer>(args[0]->ToObject());
+  Local<Object> fast_buffer = args[1]->ToObject();;
+  uint32_t offset = args[2]->Uint32Value();
+  uint32_t length = args[3]->Uint32Value();
+
+  fast_buffer->SetIndexedPropertiesToPixelData((uint8_t*)buffer->data() + offset,
+                                               length);
+
+  return Undefined();
+}
+
+
+
 void Buffer::Initialize(Handle<Object> target) {
   HandleScope scope;
 
@@ -534,6 +731,7 @@ void Buffer::Initialize(Handle<Object> target) {
   // copy free
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "binarySlice", Buffer::BinarySlice);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "asciiSlice", Buffer::AsciiSlice);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "base64Slice", Buffer::Base64Slice);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "slice", Buffer::Slice);
   // TODO NODE_SET_PROTOTYPE_METHOD(t, "utf16Slice", Utf16Slice);
   // copy
@@ -542,12 +740,16 @@ void Buffer::Initialize(Handle<Object> target) {
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "utf8Write", Buffer::Utf8Write);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "asciiWrite", Buffer::AsciiWrite);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "binaryWrite", Buffer::BinaryWrite);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "base64Write", Buffer::Base64Write);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "unpack", Buffer::Unpack);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "copy", Buffer::Copy);
 
   NODE_SET_METHOD(constructor_template->GetFunction(),
                   "byteLength",
                   Buffer::ByteLength);
+  NODE_SET_METHOD(constructor_template->GetFunction(),
+                  "makeFastBuffer",
+                  Buffer::MakeFastBuffer);
 
   target->Set(String::NewSymbol("Buffer"), constructor_template->GetFunction());
 }
