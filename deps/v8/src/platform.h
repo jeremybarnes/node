@@ -302,7 +302,7 @@ class VirtualMemory {
   void* address() {
     ASSERT(IsReserved());
     return address_;
-  };
+  }
 
   // Returns the size of the reserved memory.
   size_t size() { return size_; }
@@ -362,12 +362,19 @@ class ThreadHandle {
 
 class Thread: public ThreadHandle {
  public:
-  // Opaque data type for thread-local storage keys.
 #ifndef __CYGWIN__
-  enum LocalStorageKey {};
+  // Opaque data type for thread-local storage keys.
+  // LOCAL_STORAGE_KEY_MIN_VALUE and LOCAL_STORAGE_KEY_MAX_VALUE are specified
+  // to ensure that enumeration type has correct value range (see Issue 830 for
+  // more details).
+  enum LocalStorageKey {
+    LOCAL_STORAGE_KEY_MIN_VALUE = kMinInt,
+    LOCAL_STORAGE_KEY_MAX_VALUE = kMaxInt
+  };
 #else
   typedef void *LocalStorageKey;
 #endif
+
 
   // Create new thread.
   Thread();

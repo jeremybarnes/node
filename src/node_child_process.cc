@@ -170,16 +170,8 @@ Handle<Value> ChildProcess::Kill(const Arguments& args) {
   if (args.Length() > 0) {
     if (args[0]->IsNumber()) {
       sig = args[0]->Int32Value();
-    } else if (args[0]->IsString()) {
-      Local<String> signame = args[0]->ToString();
-      Local<Object> process = v8::Context::GetCurrent()->Global();
-      Local<Object> node_obj = process->Get(String::NewSymbol("process"))->ToObject();
-
-      Local<Value> sig_v = node_obj->Get(signame);
-      if (!sig_v->IsNumber()) {
-        return ThrowException(Exception::Error(String::New("Unknown signal")));
-      }
-      sig = sig_v->Int32Value();
+    } else {
+      return ThrowException(Exception::Error(String::New("Bad argument.")));
     }
   }
 
@@ -286,8 +278,7 @@ int ChildProcess::Spawn(const char *file,
     close(stdin_pipe[0]);
     stdio_fds[0] = stdin_pipe[1];
     SetNonBlocking(stdin_pipe[1]);
-  }
-  else {
+  } else {
     stdio_fds[0] = custom_fds[0];
   }
 
@@ -295,8 +286,7 @@ int ChildProcess::Spawn(const char *file,
     close(stdout_pipe[1]);
     stdio_fds[1] = stdout_pipe[0];
     SetNonBlocking(stdout_pipe[0]);
-  }
-  else {
+  } else {
     stdio_fds[1] = custom_fds[1];
   }
 
@@ -304,8 +294,7 @@ int ChildProcess::Spawn(const char *file,
     close(stderr_pipe[1]);
     stdio_fds[2] = stderr_pipe[0];
     SetNonBlocking(stderr_pipe[0]);
-  }
-  else {
+  } else {
     stdio_fds[2] = custom_fds[2];
   }
 

@@ -175,7 +175,7 @@ into `buf2`, starting at the 8th byte in `buf2`.
     // !!!!!!!!qrst!!!!!!!!!!!!!
     
 
-### buffer.slice(start, end)
+### buffer.slice(start, end=buffer.length)
 
 Returns a new buffer which references the
 same memory as the old, but offset and cropped by the `start` and `end`
@@ -860,8 +860,9 @@ Experimental
 
 Read the data from `readableStream` and send it to the `writableStream`.
 When `writeableStream.write(data)` returns `false` `readableStream` will be
-paused until the `drain` event occurs on the `writableStream`. `callback` is
-called when `writableStream` is closed.
+paused until the `drain` event occurs on the `writableStream`. `callback` gets
+an error as its only argument and is called when `writableStream` is closed or
+when an error occurs.
 
 
 ## Timers
@@ -1447,19 +1448,6 @@ See pwrite(2).
 The callback will be given two arguments `(err, written)` where `written`
 specifies how many _bytes_ were written.
 
-### fs.write(fd, str, position, encoding='utf8', [callback])
-
-Write the entire string `str` using the given `encoding` to the file specified
-by `fd`.
-
-`position` refers to the offset from the beginning of the file where this data
-should be written. If `position` is `null`, the data will be written at the
-current position.
-See pwrite(2).
-
-The callback will be given two arguments `(err, written)` where `written`
-specifies how many _bytes_ were written.
-
 ### fs.writeSync(fd, buffer, offset, length, position)
 
 Synchronous version of buffer-based `fs.write()`. Returns the number of bytes written.
@@ -1482,19 +1470,6 @@ Read data from the file specified by `fd`.
 If `position` is `null`, data will be read from the current file position.
 
 The callback is given the two arguments, `(err, bytesRead)`.
-
-### fs.read(fd, length, position, encoding, [callback])
-
-Read data from the file specified by `fd`.
-
-`length` is an integer specifying the number of bytes to read.
-
-`position` is an integer specifying where to begin reading from in the file.
-If `position` is `null`, data will be read from the current file position.
-
-`encoding` is the desired encoding of the string of data read in from `fd`.
-
-The callback is given the three arguments, `(err, str, bytesRead)`.
 
 ### fs.readSync(fd, buffer, offset, length, position)
 
@@ -1893,6 +1868,24 @@ header information and the first body to the client. The second time
 data, and sends that separately. That is, the response is buffered up to the
 first chunk of body.
 
+### response.addTrailers(headers)
+
+This method adds HTTP trailing headers (a header but at the end of the
+message) to the response. 
+
+Trailers will **only** be emitted if chunked encoding is used for the 
+response; if it is not (e.g., if the request was HTTP/1.0), they will
+be silently discarded.
+
+Note that HTTP requires the `Trailer` header to be sent if you intend to
+emit trailers, with a list of the header fields in its value. E.g.,
+
+    response.writeHead(200, { 'Content-Type': 'text/plain',
+                              'Trailer': 'TraceInfo' });
+    response.write(fileData);
+    response.addTrailers({'Content-MD5': "7895bf4b8828b55ceaf47747b4bca667"});
+    response.end();
+
 
 ### response.end([data], [encoding])
 
@@ -2207,6 +2200,25 @@ Set this property to reject connections when the server's connection count gets 
 ### server.connections
 
 The number of concurrent connections on the server.
+
+
+## net.isIP
+
+### net.isIP(input)
+
+Tests if input is an IP address. Returns 0 for invalid strings,
+returns 4 for IP version 4 addresses, and returns 6 for IP version 6 addresses.
+
+
+### net.isIPv4(input)
+
+Returns true if input is a version 4 IP address, otherwise returns false.
+
+
+### net.isIPv6(input)
+
+Returns true if input is a version 6 IP address, otherwise returns false.
+
 
 
 
@@ -2987,9 +2999,10 @@ Take a base URL, and a href URL, and resolve them as a browser would for an anch
 
 This module provides utilities for dealing with query strings.  It provides the following methods:
 
-### querystring.stringify(obj, sep='&', eq='=', munge=true)
+### querystring.stringify(obj, sep='&', eq='=')
 
 Serialize an object to a query string.  Optionally override the default separator and assignment characters.
+
 Example:
 
     querystring.stringify({foo: 'bar'})
@@ -3000,39 +3013,17 @@ Example:
     // returns
     'foo:bar;baz:bob'
 
-By default, this function will perform PHP/Rails-style parameter munging for arrays and objects used as
-values within `obj`.
-Example:
-
-    querystring.stringify({foo: ['bar', 'baz', 'boz']})
-    // returns
-    'foo%5B%5D=bar&foo%5B%5D=baz&foo%5B%5D=boz'
-
-    querystring.stringify({foo: {bar: 'baz'}})
-    // returns
-    'foo%5Bbar%5D=baz'
-
-If you wish to disable the array munging (e.g. when generating parameters for a Java servlet), you
-can set the `munge` argument to `false`.
-Example:
-
-    querystring.stringify({foo: ['bar', 'baz', 'boz']}, '&', '=', false)
-    // returns
-    'foo=bar&foo=baz&foo=boz'
-
-Note that when `munge` is `false`, parameter names with object values will still be munged.
-
 ### querystring.parse(str, sep='&', eq='=')
 
 Deserialize a query string to an object.  Optionally override the default separator and assignment characters.
+
+Example:
 
     querystring.parse('a=b&b=c')
     // returns
     { 'a': 'b'
     , 'b': 'c'
     }
-
-This function can parse both munged and unmunged query strings (see `stringify` for details).
 
 ### querystring.escape
 

@@ -260,9 +260,16 @@ class V8EXPORT HeapGraphNode {
 
   /**
    * Returns node id. For the same heap object, the id remains the same
-   * across all snapshots.
+   * across all snapshots. Not applicable to aggregated heap snapshots
+   * as they only contain aggregated instances.
    */
   uint64_t GetId() const;
+
+  /**
+   * Returns the number of instances. Only applicable to aggregated
+   * heap snapshots.
+   */
+  int GetInstancesCount() const;
 
   /** Returns node's own size, in bytes. */
   int GetSelfSize() const;
@@ -313,6 +320,18 @@ class V8EXPORT HeapSnapshotsDiff {
  */
 class V8EXPORT HeapSnapshot {
  public:
+  enum Type {
+    kFull = 0,       // Heap snapshot with all instances and references.
+    kAggregated = 1  // Snapshot doesn't contain individual heap entries,
+                     // instead they are grouped by constructor name.
+  };
+  enum SerializationFormat {
+    kJSON = 0  // See format description near 'Serialize' method.
+  };
+
+  /** Returns heap snapshot type. */
+  Type GetType() const;
+
   /** Returns heap snapshot UID (assigned by the profiler.) */
   unsigned GetUid() const;
 
@@ -322,8 +341,35 @@ class V8EXPORT HeapSnapshot {
   /** Returns the root node of the heap graph. */
   const HeapGraphNode* GetRoot() const;
 
-  /** Returns a diff between this snapshot and another one. */
+  /**
+   * Returns a diff between this snapshot and another one. Only snapshots
+   * of the same type can be compared.
+   */
   const HeapSnapshotsDiff* CompareWith(const HeapSnapshot* snapshot) const;
+
+  /**
+   * Prepare a serialized representation of the snapshot. The result
+   * is written into the stream provided in chunks of specified size.
+   * The total length of the serialized snapshot is unknown in
+   * advance, it is can be roughly equal to JS heap size (that means,
+   * it can be really big - tens of megabytes).
+   *
+   * For the JSON format, heap contents are represented as an object
+   * with the following structure:
+   *
+   *  {
+   *    snapshot: {title: "...", uid: nnn},
+   *    nodes: [
+   *      meta-info (JSON string),
+   *      nodes themselves
+   *    ],
+   *    strings: [strings]
+   *  }
+   *
+   * Outgoing node links are stored after each node. Nodes reference strings
+   * and other nodes by their indexes in corresponding arrays.
+   */
+  void Serialize(OutputStream* stream, SerializationFormat format) const;
 };
 
 
@@ -341,8 +387,13 @@ class V8EXPORT HeapProfiler {
   /** Returns a profile by uid. */
   static const HeapSnapshot* FindSnapshot(unsigned uid);
 
-  /** Takes a heap snapshot and returns it. Title may be an empty string. */
-  static const HeapSnapshot* TakeSnapshot(Handle<String> title);
+  /**
+   * Takes a heap snapshot and returns it. Title may be an empty string.
+   * See HeapSnapshot::Type for types description.
+   */
+  static const HeapSnapshot* TakeSnapshot(
+      Handle<String> title,
+      HeapSnapshot::Type type = HeapSnapshot::kFull);
 };
 
 

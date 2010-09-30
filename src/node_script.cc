@@ -78,6 +78,10 @@ void node::Script::Initialize (Handle<Object> target) {
 
 
 Handle<Value> node::Script::New (const Arguments& args) {
+  if (!args.IsConstructCall()) {
+    return FromConstructorTemplate(constructor_template, args);
+  }
+
   HandleScope scope;
 
   node::Script *t = new node::Script();
@@ -212,6 +216,7 @@ template <node::Script::EvalInputFlags iFlag,
     for (i = 0; i < keys->Length(); i++) {
       Handle<String> key = keys->Get(Integer::New(i))->ToString();
       Handle<Value> value = sandbox->Get(key);
+      if (value == sandbox) { value = context->Global(); }
       context->Global()->Set(key, value);
     }
   }
@@ -264,6 +269,7 @@ template <node::Script::EvalInputFlags iFlag,
     for (i = 0; i < keys->Length(); i++) {
       Handle<String> key = keys->Get(Integer::New(i))->ToString();
       Handle<Value> value = context->Global()->Get(key);
+      if (value == context->Global()) { value = sandbox; }
       sandbox->Set(key, value);
     }
   }

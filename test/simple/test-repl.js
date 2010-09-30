@@ -10,6 +10,9 @@ var sys = require("sys"),
   prompt_tcp = "node via TCP socket> ",
   server_tcp, server_unix, client_tcp, client_unix, timer;
 
+// absolute path to test/fixtures/a.js
+var moduleFilename = require("path").join(common.fixturesDir, "a.js");
+
 common.error('repl test');
 
 // function for REPL to run
@@ -55,12 +58,15 @@ function tcp_test() {
       send_expect([
           { client: client_tcp, send: "", expect: prompt_tcp },
           { client: client_tcp, send: "invoke_me(333)\n", expect: ('\'' + "invoked 333" + '\'\n' + prompt_tcp) },
-          { client: client_tcp, send: "a += 1\n", expect: ("12346" + '\n' + prompt_tcp) }
+          { client: client_tcp, send: "a += 1\n", expect: ("12346" + '\n' + prompt_tcp) },
+          { client: client_tcp,
+            send: "require('" + moduleFilename + "').number\n",
+            expect: ("42" + '\n' + prompt_tcp) }
         ]);
     });
 
     client_tcp.addListener('data', function (data) {
-      read_buffer += data.asciiSlice(0, data.length);
+      read_buffer += data.toString('ascii', 0, data.length);
       common.error("TCP data: " + JSON.stringify(read_buffer) + ", expecting " + JSON.stringify(client_tcp.expect));
       if (read_buffer.indexOf(prompt_tcp) !== -1) {
         assert.strictEqual(client_tcp.expect, read_buffer);
@@ -121,7 +127,7 @@ function unix_test() {
     });
 
     client_unix.addListener('data', function (data) {
-      read_buffer += data.asciiSlice(0, data.length);
+      read_buffer += data.toString('ascii', 0, data.length);
       common.error("Unix data: " + JSON.stringify(read_buffer) + ", expecting " + JSON.stringify(client_unix.expect));
       if (read_buffer.indexOf(prompt_unix) !== -1) {
         assert.strictEqual(client_unix.expect, read_buffer);

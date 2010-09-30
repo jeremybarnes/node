@@ -27,7 +27,13 @@ var caPem = fs.readFileSync(common.fixturesDir+"/test_ca.pem", 'ascii');
 var certPem = fs.readFileSync(common.fixturesDir+"/test_cert.pem", 'ascii');
 var keyPem = fs.readFileSync(common.fixturesDir+"/test_key.pem", 'ascii');
 
-var credentials = crypto.createCredentials({key:keyPem, cert:certPem, ca:caPem});
+try{
+  var credentials = crypto.createCredentials({key:keyPem, cert:certPem, ca:caPem});
+} catch (e) {
+  console.log("Not compiled with OPENSSL support.");
+  process.exit();
+}
+
 
 var https_server = http.createServer(function (req, res) {
   res.id = request_number;
@@ -41,7 +47,8 @@ var https_server = http.createServer(function (req, res) {
      + '"issuer":"/C=UK/ST=Acknack Ltd/L=Rhys Jones/O=node.js'
      + '/OU=Test TLS Certificate/CN=localhost","valid_from":'
      + '"Nov 11 09:52:22 2009 GMT","valid_to":'
-     + '"Nov  6 09:52:22 2029 GMT"}');
+     + '"Nov  6 09:52:22 2029 GMT",'
+     + '"fingerprint":"2A:7A:C2:DD:E5:F9:CC:53:72:35:99:7A:02:5A:71:38:52:EC:8A:DF"}');
 
   if (req.id == 0) {
     assert.equal("GET", req.method);
@@ -92,7 +99,8 @@ https_server.addListener("listening", function() {
         + '"issuer":"/C=UK/ST=Acknack Ltd/L=Rhys Jones/O=node.js'
         + '/OU=Test TLS Certificate/CN=localhost","valid_from":'
         + '"Nov 11 09:52:22 2009 GMT","valid_to":'
-        + '"Nov  6 09:52:22 2029 GMT"}');
+        + '"Nov  6 09:52:22 2029 GMT",'
+        + '"fingerprint":"2A:7A:C2:DD:E5:F9:CC:53:72:35:99:7A:02:5A:71:38:52:EC:8A:DF"}');
     c.write( "GET /hello?hello=world&foo=b==ar HTTP/1.1\r\n\r\n" );
     requests_sent += 1;
   });

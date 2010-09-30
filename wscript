@@ -18,12 +18,7 @@ blddir = 'build'
 jobs=1
 if os.environ.has_key('JOBS'):
   jobs = int(os.environ['JOBS'])
-else:
-  try:
-    import multiprocessing
-    jobs = multiprocessing.cpu_count()
-  except:
-    pass
+
 
 def set_options(opt):
   # the gcc module provides a --debug-level option
@@ -176,18 +171,19 @@ def configure(conf):
   if Options.options.efence:
     conf.check(lib='efence', libpath=['/usr/lib', '/usr/local/lib'], uselib_store='EFENCE')
 
-  if not conf.check(lib="execinfo", includes=['/usr/include', '/usr/local/include'], libpath=['/usr/lib', '/usr/local/lib'], uselib_store="EXECINFO"):
-    # Note on Darwin/OS X: This will fail, but will still be used as the
-    # execinfo stuff are part of the standard library.
-    if sys.platform.startswith("freebsd"):
-      conf.fatal("Install the libexecinfo port from /usr/ports/devel/libexecinfo.")
+  if sys.platform.startswith("freebsd"):
+     if not conf.check(lib="execinfo",
+                       includes=['/usr/include', '/usr/local/include'],
+                       libpath=['/usr/lib', '/usr/local/lib'],
+                       uselib_store="EXECINFO"):
+       conf.fatal("Install the libexecinfo port from /usr/ports/devel/libexecinfo.")
 
   if not Options.options.without_ssl:
     if conf.check_cfg(package='openssl',
                       args='--cflags --libs',
                       uselib_store='OPENSSL'):
       Options.options.use_openssl = conf.env["USE_OPENSSL"] = True
-      conf.env.append_value("CXXFLAGS", "-DHAVE_OPENSSL=1")
+      conf.env.append_value("CPPFLAGS", "-DHAVE_OPENSSL=1")
     else:
       libssl = conf.check_cc(lib='ssl',
                              header_name='openssl/ssl.h',
@@ -199,7 +195,13 @@ def configure(conf):
                                 uselib_store='OPENSSL')
       if libcrypto and libssl:
         conf.env["USE_OPENSSL"] = Options.options.use_openssl = True
-        conf.env.append_value("CXXFLAGS", "-DHAVE_OPENSSL=1")
+        conf.env.append_value("CPPFLAGS", "-DHAVE_OPENSSL=1")
+      else:
+        conf.fatal("Could not autodetect OpenSSL support. " +
+                   "Make sure OpenSSL development packages are installed. " +
+                   "Use configure --without-ssl to disable this message.")
+  else:
+    Options.options.use_openssl = conf.env["USE_OPENSSL"] = False
 
   conf.check(lib='rt', uselib_store='RT')
 
@@ -289,13 +291,11 @@ def configure(conf):
     # used by platform_darwin_*.cc
     conf.env.append_value('LINKFLAGS', ['-framework','Carbon'])
 
-  conf.env.append_value("CCFLAGS", "-DX_STACKSIZE=%d" % (1024*64))
-
+  # Needed for getaddrinfo in libeio
+  conf.env.append_value("CPPFLAGS", "-DX_STACKSIZE=%d" % (1024*64))
   # LFS
-  conf.env.append_value('CCFLAGS',  '-D_LARGEFILE_SOURCE')
-  conf.env.append_value('CXXFLAGS', '-D_LARGEFILE_SOURCE')
-  conf.env.append_value('CCFLAGS',  '-D_FILE_OFFSET_BITS=64')
-  conf.env.append_value('CXXFLAGS', '-D_FILE_OFFSET_BITS=64')
+  conf.env.append_value('CPPFLAGS',  '-D_LARGEFILE_SOURCE')
+  conf.env.append_value('CPPFLAGS',  '-D_FILE_OFFSET_BITS=64')
 
   ## needed for node_file.cc fdatasync
   ## Strangely on OSX 10.6 the g++ doesn't see fdatasync but gcc does?
@@ -309,14 +309,12 @@ def configure(conf):
     }
   """
   if conf.check_cxx(msg="Checking for fdatasync(2) with c++", fragment=code):
-    conf.env.append_value('CXXFLAGS', '-DHAVE_FDATASYNC=1')
+    conf.env.append_value('CPPFLAGS', '-DHAVE_FDATASYNC=1')
   else:
-    conf.env.append_value('CXXFLAGS', '-DHAVE_FDATASYNC=0')
+    conf.env.append_value('CPPFLAGS', '-DHAVE_FDATASYNC=0')
 
   # platform
-  platform_def = '-DPLATFORM="' + conf.env['DEST_OS'] + '"'
-  conf.env.append_value('CCFLAGS', platform_def)
-  conf.env.append_value('CXXFLAGS', platform_def)
+  conf.env.append_value('CPPFLAGS', '-DPLATFORM="' + conf.env['DEST_OS'] + '"')
 
   # Split off debug variant before adding variant specific defines
   debug_env = conf.env.copy()
@@ -325,14 +323,18 @@ def configure(conf):
   # Configure debug variant
   conf.setenv('debug')
   debug_env.set_variant('debug')
-  debug_env.append_value('CCFLAGS', ['-DDEBUG', '-g', '-O0', '-Wall', '-Wextra'])
-  debug_env.append_value('CXXFLAGS', ['-DDEBUG', '-g', '-O0', '-Wall', '-Wextra'])
+  debug_env.append_value('CPPFLAGS', '-DDEBUG')
+  debug_compile_flags = ['-g', '-O0', '-Wall', '-Wextra']
+  debug_env.append_value('CCFLAGS', debug_compile_flags)
+  debug_env.append_value('CXXFLAGS', debug_compile_flags)
   conf.write_config_header("config.h")
 
   # Configure default variant
   conf.setenv('default')
-  conf.env.append_value('CCFLAGS', ['-DNDEBUG', '-g', '-O3'])
-  conf.env.append_value('CXXFLAGS', ['-DNDEBUG', '-g', '-O3'])
+  conf.env.append_value('CPPFLAGS', '-DNDEBUG')
+  default_compile_flags = ['-g', '-O3']
+  conf.env.append_value('CCFLAGS', default_compile_flags)
+  conf.env.append_value('CXXFLAGS', default_compile_flags)
   conf.write_config_header("config.h")
 
 
@@ -565,6 +567,7 @@ def build(bld):
   node.install_path = '${PREFIX}/bin'
   node.chmod = 0755
   node.source = """
+    src/node_main.cc
     src/node.cc
     src/node_buffer.cc
     src/node_extensions.cc

@@ -1,4 +1,4 @@
-// Copyright 2009 the V8 project authors. All rights reserved.
+// Copyright 2010 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -55,7 +55,6 @@ namespace internal {
 String* Heap::hidden_symbol_;
 Object* Heap::roots_[Heap::kRootListLength];
 
-
 NewSpace Heap::new_space_;
 OldSpace* Heap::old_pointer_space_ = NULL;
 OldSpace* Heap::old_data_space_ = NULL;
@@ -63,9 +62,6 @@ OldSpace* Heap::code_space_ = NULL;
 MapSpace* Heap::map_space_ = NULL;
 CellSpace* Heap::cell_space_ = NULL;
 LargeObjectSpace* Heap::lo_space_ = NULL;
-
-static const int kMinimumPromotionLimit = 2*MB;
-static const int kMinimumAllocationLimit = 8*MB;
 
 int Heap::old_gen_promotion_limit_ = kMinimumPromotionLimit;
 int Heap::old_gen_allocation_limit_ = kMinimumAllocationLimit;
@@ -104,6 +100,7 @@ List<Heap::GCEpilogueCallbackPair> Heap::gc_epilogue_callbacks_;
 
 GCCallback Heap::global_gc_prologue_callback_ = NULL;
 GCCallback Heap::global_gc_epilogue_callback_ = NULL;
+HeapObjectCallback Heap::gc_safe_size_of_old_object_ = NULL;
 
 // Variables set based on semispace_size_ and old_generation_size_ in
 // ConfigureHeap.
@@ -190,6 +187,33 @@ bool Heap::HasBeenSetup() {
          map_space_ != NULL &&
          cell_space_ != NULL &&
          lo_space_ != NULL;
+}
+
+
+int Heap::GcSafeSizeOfOldObject(HeapObject* object) {
+  ASSERT(!Heap::InNewSpace(object));  // Code only works for old objects.
+  ASSERT(!MarkCompactCollector::are_map_pointers_encoded());
+  MapWord map_word = object->map_word();
+  map_word.ClearMark();
+  map_word.ClearOverflow();
+  return object->SizeFromMap(map_word.ToMap());
+}
+
+
+int Heap::GcSafeSizeOfOldObjectWithEncodedMap(HeapObject* object) {
+  ASSERT(!Heap::InNewSpace(object));  // Code only works for old objects.
+  ASSERT(MarkCompactCollector::are_map_pointers_encoded());
+  uint32_t marker = Memory::uint32_at(object->address());
+  if (marker == MarkCompactCollector::kSingleFreeEncoding) {
+    return kIntSize;
+  } else if (marker == MarkCompactCollector::kMultiFreeEncoding) {
+    return Memory::int_at(object->address() + kIntSize);
+  } else {
+    MapWord map_word = object->map_word();
+    Address map_address = map_word.DecodeMapAddress(Heap::map_space());
+    Map* map = reinterpret_cast<Map*>(HeapObject::FromAddress(map_address));
+    return object->SizeFromMap(map);
+  }
 }
 
 
@@ -377,17 +401,26 @@ void Heap::GarbageCollectionEpilogue() {
 }
 
 
-void Heap::CollectAllGarbage(bool force_compaction) {
+void Heap::CollectAllGarbage(bool force_compaction,
+                             CollectionPolicy collectionPolicy) {
   // Since we are ignoring the return value, the exact choice of space does
   // not matter, so long as we do not specify NEW_SPACE, which would not
   // cause a full GC.
   MarkCompactCollector::SetForceCompaction(force_compaction);
-  CollectGarbage(0, OLD_POINTER_SPACE);
+  CollectGarbage(0, OLD_POINTER_SPACE, collectionPolicy);
   MarkCompactCollector::SetForceCompaction(false);
 }
 
 
-bool Heap::CollectGarbage(int requested_size, AllocationSpace space) {
+void Heap::CollectAllAvailableGarbage() {
+  CompilationCache::Clear();
+  CollectAllGarbage(true, AGGRESSIVE);
+}
+
+
+bool Heap::CollectGarbage(int requested_size,
+                          AllocationSpace space,
+                          CollectionPolicy collectionPolicy) {
   // The VM is in the GC state until exiting this function.
   VMState state(GC);
 
@@ -414,7 +447,7 @@ bool Heap::CollectGarbage(int requested_size, AllocationSpace space) {
         ? &Counters::gc_scavenger
         : &Counters::gc_compactor;
     rate->Start();
-    PerformGarbageCollection(space, collector, &tracer);
+    PerformGarbageCollection(collector, &tracer, collectionPolicy);
     rate->Stop();
 
     GarbageCollectionEpilogue();
@@ -447,7 +480,7 @@ bool Heap::CollectGarbage(int requested_size, AllocationSpace space) {
 
 void Heap::PerformScavenge() {
   GCTracer tracer;
-  PerformGarbageCollection(NEW_SPACE, SCAVENGER, &tracer);
+  PerformGarbageCollection(SCAVENGER, &tracer, NORMAL);
 }
 
 
@@ -540,6 +573,13 @@ void Heap::EnsureFromSpaceIsCommitted() {
 
   // Committing memory to from space failed.
   // Try shrinking and try again.
+  PagedSpaces spaces;
+  for (PagedSpace* space = spaces.next();
+       space != NULL;
+       space = spaces.next()) {
+    space->RelinkPageListInChunkOrder(true);
+  }
+
   Shrink();
   if (new_space_.CommitFromSpaceIfNeeded()) return;
 
@@ -567,6 +607,22 @@ class ClearThreadJSFunctionResultCachesVisitor: public ThreadVisitor  {
 void Heap::ClearJSFunctionResultCaches() {
   if (Bootstrapper::IsActive()) return;
   ClearThreadJSFunctionResultCachesVisitor visitor;
+  ThreadManager::IterateArchivedThreads(&visitor);
+}
+
+
+class ClearThreadNormalizedMapCachesVisitor: public ThreadVisitor {
+  virtual void VisitThread(ThreadLocalTop* top) {
+    Context* context = top->context_;
+    if (context == NULL) return;
+    context->global()->global_context()->normalized_map_cache()->Clear();
+  }
+};
+
+
+void Heap::ClearNormalizedMapCaches() {
+  if (Bootstrapper::IsActive()) return;
+  ClearThreadNormalizedMapCachesVisitor visitor;
   ThreadManager::IterateArchivedThreads(&visitor);
 }
 
@@ -613,9 +669,9 @@ void Heap::UpdateSurvivalRateTrend(int start_new_space_size) {
   survival_rate_ = survival_rate;
 }
 
-void Heap::PerformGarbageCollection(AllocationSpace space,
-                                    GarbageCollector collector,
-                                    GCTracer* tracer) {
+void Heap::PerformGarbageCollection(GarbageCollector collector,
+                                    GCTracer* tracer,
+                                    CollectionPolicy collectionPolicy) {
   VerifySymbolTable();
   if (collector == MARK_COMPACTOR && global_gc_prologue_callback_) {
     ASSERT(!allocation_allowed_);
@@ -637,12 +693,6 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
   int start_new_space_size = Heap::new_space()->Size();
 
   if (collector == MARK_COMPACTOR) {
-    if (FLAG_flush_code) {
-      // Flush all potentially unused code.
-      GCTracer::Scope gc_scope(tracer, GCTracer::Scope::MC_FLUSH_CODE);
-      FlushCode();
-    }
-
     // Perform mark-sweep with optional compaction.
     MarkCompact(tracer);
 
@@ -651,25 +701,45 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
 
     UpdateSurvivalRateTrend(start_new_space_size);
 
-    int old_gen_size = PromotedSpaceSize();
-    old_gen_promotion_limit_ =
-        old_gen_size + Max(kMinimumPromotionLimit, old_gen_size / 3);
-    old_gen_allocation_limit_ =
-        old_gen_size + Max(kMinimumAllocationLimit, old_gen_size / 2);
+    UpdateOldSpaceLimits();
 
-    if (high_survival_rate_during_scavenges &&
-        IsStableOrIncreasingSurvivalTrend()) {
-      // Stable high survival rates of young objects both during partial and
-      // full collection indicate that mutator is either building or modifying
-      // a structure with a long lifetime.
-      // In this case we aggressively raise old generation memory limits to
-      // postpone subsequent mark-sweep collection and thus trade memory
-      // space for the mutation speed.
-      old_gen_promotion_limit_ *= 2;
-      old_gen_allocation_limit_ *= 2;
+    // Major GC would invoke weak handle callbacks on weakly reachable
+    // handles, but won't collect weakly reachable objects until next
+    // major GC.  Therefore if we collect aggressively and weak handle callback
+    // has been invoked, we rerun major GC to release objects which become
+    // garbage.
+    if (collectionPolicy == AGGRESSIVE) {
+      // Note: as weak callbacks can execute arbitrary code, we cannot
+      // hope that eventually there will be no weak callbacks invocations.
+      // Therefore stop recollecting after several attempts.
+      const int kMaxNumberOfAttempts = 7;
+      for (int attempt = 0; attempt < kMaxNumberOfAttempts; attempt++) {
+        { DisableAssertNoAllocation allow_allocation;
+          GCTracer::Scope scope(tracer, GCTracer::Scope::EXTERNAL);
+          if (!GlobalHandles::PostGarbageCollectionProcessing()) break;
+        }
+        MarkCompact(tracer);
+        // Weak handle callbacks can allocate data, so keep limits correct.
+        UpdateOldSpaceLimits();
+      }
+    } else {
+      if (high_survival_rate_during_scavenges &&
+          IsStableOrIncreasingSurvivalTrend()) {
+        // Stable high survival rates of young objects both during partial and
+        // full collection indicate that mutator is either building or modifying
+        // a structure with a long lifetime.
+        // In this case we aggressively raise old generation memory limits to
+        // postpone subsequent mark-sweep collection and thus trade memory
+        // space for the mutation speed.
+        old_gen_promotion_limit_ *= 2;
+        old_gen_allocation_limit_ *= 2;
+      }
     }
 
-    old_gen_exhausted_ = false;
+    { DisableAssertNoAllocation allow_allocation;
+      GCTracer::Scope scope(tracer, GCTracer::Scope::EXTERNAL);
+      GlobalHandles::PostGarbageCollectionProcessing();
+    }
   } else {
     tracer_ = tracer;
     Scavenge();
@@ -679,12 +749,6 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
   }
 
   Counters::objs_since_last_young.Set(0);
-
-  if (collector == MARK_COMPACTOR) {
-    DisableAssertNoAllocation allow_allocation;
-    GCTracer::Scope scope(tracer, GCTracer::Scope::EXTERNAL);
-    GlobalHandles::PostGarbageCollectionProcessing();
-  }
 
   // Update relocatables.
   Relocatable::PostGarbageCollectionProcessing();
@@ -732,8 +796,6 @@ void Heap::MarkCompact(GCTracer* tracer) {
 
   MarkCompactCollector::CollectGarbage();
 
-  MarkCompactEpilogue(is_compacting);
-
   LOG(ResourceEvent("markcompact", "end"));
 
   gc_state_ = NOT_IN_GC;
@@ -755,18 +817,11 @@ void Heap::MarkCompactPrologue(bool is_compacting) {
 
   CompilationCache::MarkCompactPrologue();
 
-  Top::MarkCompactPrologue(is_compacting);
-  ThreadManager::MarkCompactPrologue(is_compacting);
-
   CompletelyClearInstanceofCache();
 
   if (is_compacting) FlushNumberStringCache();
-}
 
-
-void Heap::MarkCompactEpilogue(bool is_compacting) {
-  Top::MarkCompactEpilogue(is_compacting);
-  ThreadManager::MarkCompactEpilogue(is_compacting);
+  ClearNormalizedMapCaches();
 }
 
 
@@ -1100,6 +1155,10 @@ class ScavengingVisitor : public StaticVisitorBase {
                     &ObjectEvacuationStrategy<POINTER_OBJECT>::
                         VisitSpecialized<SharedFunctionInfo::kSize>);
 
+    table_.Register(kVisitJSFunction,
+                    &ObjectEvacuationStrategy<POINTER_OBJECT>::
+                    VisitSpecialized<JSFunction::kSize>);
+
     table_.RegisterSpecializations<ObjectEvacuationStrategy<DATA_OBJECT>,
                                    kVisitDataObject,
                                    kVisitDataObjectGeneric>();
@@ -1415,7 +1474,7 @@ bool Heap::CreateInitialMaps() {
   set_meta_map(new_meta_map);
   new_meta_map->set_map(new_meta_map);
 
-  obj = AllocatePartialMap(FIXED_ARRAY_TYPE, FixedArray::kHeaderSize);
+  obj = AllocatePartialMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_fixed_array_map(Map::cast(obj));
 
@@ -1457,6 +1516,11 @@ bool Heap::CreateInitialMaps() {
   oddball_map()->set_prototype(null_value());
   oddball_map()->set_constructor(null_value());
 
+  obj = AllocateMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
+  if (obj->IsFailure()) return false;
+  set_fixed_cow_array_map(Map::cast(obj));
+  ASSERT(fixed_array_map() != fixed_cow_array_map());
+
   obj = AllocateMap(HEAP_NUMBER_TYPE, HeapNumber::kSize);
   if (obj->IsFailure()) return false;
   set_heap_number_map(Map::cast(obj));
@@ -1472,17 +1536,17 @@ bool Heap::CreateInitialMaps() {
     roots_[entry.index] = Map::cast(obj);
   }
 
-  obj = AllocateMap(STRING_TYPE, SeqTwoByteString::kAlignedSize);
+  obj = AllocateMap(STRING_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_undetectable_string_map(Map::cast(obj));
   Map::cast(obj)->set_is_undetectable();
 
-  obj = AllocateMap(ASCII_STRING_TYPE, SeqAsciiString::kAlignedSize);
+  obj = AllocateMap(ASCII_STRING_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_undetectable_ascii_string_map(Map::cast(obj));
   Map::cast(obj)->set_is_undetectable();
 
-  obj = AllocateMap(BYTE_ARRAY_TYPE, ByteArray::kAlignedSize);
+  obj = AllocateMap(BYTE_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_byte_array_map(Map::cast(obj));
 
@@ -1525,7 +1589,7 @@ bool Heap::CreateInitialMaps() {
   if (obj->IsFailure()) return false;
   set_external_float_array_map(Map::cast(obj));
 
-  obj = AllocateMap(CODE_TYPE, Code::kHeaderSize);
+  obj = AllocateMap(CODE_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_code_map(Map::cast(obj));
 
@@ -1549,19 +1613,19 @@ bool Heap::CreateInitialMaps() {
     roots_[entry.index] = Map::cast(obj);
   }
 
-  obj = AllocateMap(FIXED_ARRAY_TYPE, HeapObject::kHeaderSize);
+  obj = AllocateMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_hash_table_map(Map::cast(obj));
 
-  obj = AllocateMap(FIXED_ARRAY_TYPE, HeapObject::kHeaderSize);
+  obj = AllocateMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_context_map(Map::cast(obj));
 
-  obj = AllocateMap(FIXED_ARRAY_TYPE, HeapObject::kHeaderSize);
+  obj = AllocateMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_catch_context_map(Map::cast(obj));
 
-  obj = AllocateMap(FIXED_ARRAY_TYPE, HeapObject::kHeaderSize);
+  obj = AllocateMap(FIXED_ARRAY_TYPE, kVariableSizeSentinel);
   if (obj->IsFailure()) return false;
   set_global_context_map(Map::cast(obj));
 
@@ -1788,6 +1852,13 @@ bool Heap::CreateInitialObjects() {
   set_instanceof_cache_answer(Smi::FromInt(0));
 
   CreateFixedStubs();
+
+  // Allocate the dictionary of intrinsic function names.
+  obj = StringDictionary::Allocate(Runtime::kNumFunctions);
+  if (obj->IsFailure()) return false;
+  obj = Runtime::InitializeIntrinsicFunctionNames(obj);
+  if (obj->IsFailure()) return false;
+  set_intrinsic_function_names(StringDictionary::cast(obj));
 
   if (InitializeNumberStringCache()->IsFailure()) return false;
 
@@ -2354,109 +2425,6 @@ Object* Heap::AllocateExternalArray(int length,
 }
 
 
-// The StackVisitor is used to traverse all the archived threads to see if
-// there are activations on any of the stacks corresponding to the code.
-class FlushingStackVisitor : public ThreadVisitor {
- public:
-  explicit FlushingStackVisitor(Code* code) : found_(false), code_(code) {}
-
-  void VisitThread(ThreadLocalTop* top) {
-    // If we already found the code in a previous traversed thread we return.
-    if (found_) return;
-
-    for (StackFrameIterator it(top); !it.done(); it.Advance()) {
-      if (code_->contains(it.frame()->pc())) {
-        found_ = true;
-        return;
-      }
-    }
-  }
-  bool FoundCode() {return found_;}
-
- private:
-  bool found_;
-  Code* code_;
-};
-
-
-static bool CodeIsActive(Code* code) {
-  // Make sure we are not referencing the code from the stack.
-  for (StackFrameIterator it; !it.done(); it.Advance()) {
-    if (code->contains(it.frame()->pc())) return true;
-  }
-  // Iterate the archived stacks in all threads to check if
-  // the code is referenced.
-  FlushingStackVisitor threadvisitor(code);
-  ThreadManager::IterateArchivedThreads(&threadvisitor);
-  if (threadvisitor.FoundCode()) return true;
-  return false;
-}
-
-
-static void FlushCodeForFunction(JSFunction* function) {
-  SharedFunctionInfo* shared_info = function->shared();
-
-  // Special handling if the function and shared info objects
-  // have different code objects.
-  if (function->code() != shared_info->code()) {
-    // If the shared function has been flushed but the function has not,
-    // we flush the function if possible.
-    if (!shared_info->is_compiled() && function->is_compiled() &&
-        !CodeIsActive(function->code())) {
-      function->set_code(shared_info->code());
-    }
-    return;
-  }
-
-  // The function must be compiled and have the source code available,
-  // to be able to recompile it in case we need the function again.
-  if (!(shared_info->is_compiled() && shared_info->HasSourceCode())) return;
-
-  // We never flush code for Api functions.
-  if (shared_info->IsApiFunction()) return;
-
-  // Only flush code for functions.
-  if (!shared_info->code()->kind() == Code::FUNCTION) return;
-
-  // Function must be lazy compilable.
-  if (!shared_info->allows_lazy_compilation()) return;
-
-  // If this is a full script wrapped in a function we do no flush the code.
-  if (shared_info->is_toplevel()) return;
-
-  // If this function is in the compilation cache we do not flush the code.
-  if (CompilationCache::HasFunction(shared_info)) return;
-
-  // Check stack and archived threads for the code.
-  if (CodeIsActive(shared_info->code())) return;
-
-  // Compute the lazy compilable version of the code.
-  Code* code = Builtins::builtin(Builtins::LazyCompile);
-  shared_info->set_code(code);
-  function->set_code(code);
-}
-
-
-void Heap::FlushCode() {
-#ifdef ENABLE_DEBUGGER_SUPPORT
-  // Do not flush code if the debugger is loaded or there are breakpoints.
-  if (Debug::IsLoaded() || Debug::has_break_points()) return;
-#endif
-  HeapObjectIterator it(old_pointer_space());
-  for (HeapObject* obj = it.next(); obj != NULL; obj = it.next()) {
-    if (obj->IsJSFunction()) {
-      JSFunction* function = JSFunction::cast(obj);
-
-      // The function must have a valid context and not be a builtin.
-      if (function->unchecked_context()->IsContext() &&
-          !function->IsBuiltin()) {
-        FlushCodeForFunction(function);
-      }
-    }
-  }
-}
-
-
 Object* Heap::CreateCode(const CodeDesc& desc,
                          Code::Flags flags,
                          Handle<Object> self_reference) {
@@ -2910,7 +2878,9 @@ Object* Heap::CopyJSObject(JSObject* source) {
   FixedArray* properties = FixedArray::cast(source->properties());
   // Update elements if necessary.
   if (elements->length() > 0) {
-    Object* elem = CopyFixedArray(elements);
+    Object* elem =
+        (elements->map() == fixed_cow_array_map()) ?
+        elements : CopyFixedArray(elements);
     if (elem->IsFailure()) return elem;
     JSObject::cast(clone)->set_elements(FixedArray::cast(elem));
   }
@@ -4057,8 +4027,8 @@ bool Heap::ConfigureHeapDefault() {
 
 
 void Heap::RecordStats(HeapStats* stats, bool take_snapshot) {
-  *stats->start_marker = 0xDECADE00;
-  *stats->end_marker = 0xDECADE01;
+  *stats->start_marker = HeapStats::kStartMarker;
+  *stats->end_marker = HeapStats::kEndMarker;
   *stats->new_space_size = new_space_.Size();
   *stats->new_space_capacity = new_space_.Capacity();
   *stats->old_pointer_space_size = old_pointer_space_->Size();
@@ -4128,6 +4098,8 @@ bool Heap::Setup(bool create_heap_objects) {
   ScavengingVisitor::Initialize();
   NewSpaceScavenger::Initialize();
   MarkCompactCollector::Initialize();
+
+  MarkMapPointersAsEncoded(false);
 
   // Setup memory allocator and reserve a chunk of memory for new
   // space.  The chunk is double the size of the requested reserved
@@ -4815,7 +4787,6 @@ GCTracer::~GCTracer() {
     PrintF("sweep=%d ", static_cast<int>(scopes_[Scope::MC_SWEEP]));
     PrintF("sweepns=%d ", static_cast<int>(scopes_[Scope::MC_SWEEP_NEWSPACE]));
     PrintF("compact=%d ", static_cast<int>(scopes_[Scope::MC_COMPACT]));
-    PrintF("flushcode=%d ", static_cast<int>(scopes_[Scope::MC_FLUSH_CODE]));
 
     PrintF("total_size_before=%d ", start_size_);
     PrintF("total_size_after=%d ", Heap::SizeOfObjects());

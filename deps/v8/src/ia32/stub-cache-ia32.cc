@@ -257,16 +257,8 @@ void StubCache::GenerateProbe(MacroAssembler* masm,
 void StubCompiler::GenerateLoadGlobalFunctionPrototype(MacroAssembler* masm,
                                                        int index,
                                                        Register prototype) {
-  // Load the global or builtins object from the current context.
-  __ mov(prototype, Operand(esi, Context::SlotOffset(Context::GLOBAL_INDEX)));
-  // Load the global context from the global or builtins object.
-  __ mov(prototype,
-         FieldOperand(prototype, GlobalObject::kGlobalContextOffset));
-  // Load the function from the global context.
-  __ mov(prototype, Operand(prototype, Context::SlotOffset(index)));
-  // Load the initial map.  The global functions all have initial maps.
-  __ mov(prototype,
-         FieldOperand(prototype, JSFunction::kPrototypeOrInitialMapOffset));
+  __ LoadGlobalFunction(index, prototype);
+  __ LoadGlobalFunctionInitialMap(prototype, prototype);
   // Load the prototype from the initial map.
   __ mov(prototype, FieldOperand(prototype, Map::kPrototypeOffset));
 }
@@ -1263,6 +1255,61 @@ void CallStubCompiler::GenerateNameCheck(String* name, Label* miss) {
 }
 
 
+void CallStubCompiler::GenerateGlobalReceiverCheck(JSObject* object,
+                                                   JSObject* holder,
+                                                   String* name,
+                                                   Label* miss) {
+  ASSERT(holder->IsGlobalObject());
+
+  // Get the number of arguments.
+  const int argc = arguments().immediate();
+
+  // Get the receiver from the stack.
+  __ mov(edx, Operand(esp, (argc + 1) * kPointerSize));
+
+  // If the object is the holder then we know that it's a global
+  // object which can only happen for contextual calls. In this case,
+  // the receiver cannot be a smi.
+  if (object != holder) {
+    __ test(edx, Immediate(kSmiTagMask));
+    __ j(zero, miss, not_taken);
+  }
+
+  // Check that the maps haven't changed.
+  CheckPrototypes(object, edx, holder, ebx, eax, edi, name, miss);
+}
+
+
+void CallStubCompiler::GenerateLoadFunctionFromCell(JSGlobalPropertyCell* cell,
+                                                    JSFunction* function,
+                                                    Label* miss) {
+  // Get the value from the cell.
+  __ mov(edi, Immediate(Handle<JSGlobalPropertyCell>(cell)));
+  __ mov(edi, FieldOperand(edi, JSGlobalPropertyCell::kValueOffset));
+
+  // Check that the cell contains the same function.
+  if (Heap::InNewSpace(function)) {
+    // We can't embed a pointer to a function in new space so we have
+    // to verify that the shared function info is unchanged. This has
+    // the nice side effect that multiple closures based on the same
+    // function can all use this call IC. Before we load through the
+    // function, we have to verify that it still is a function.
+    __ test(edi, Immediate(kSmiTagMask));
+    __ j(zero, miss, not_taken);
+    __ CmpObjectType(edi, JS_FUNCTION_TYPE, ebx);
+    __ j(not_equal, miss, not_taken);
+
+    // Check the shared function info. Make sure it hasn't changed.
+    __ cmp(FieldOperand(edi, JSFunction::kSharedFunctionInfoOffset),
+           Immediate(Handle<SharedFunctionInfo>(function->shared())));
+    __ j(not_equal, miss, not_taken);
+  } else {
+    __ cmp(Operand(edi), Immediate(Handle<JSFunction>(function)));
+    __ j(not_equal, miss, not_taken);
+  }
+}
+
+
 Object* CallStubCompiler::GenerateMissBranch() {
   Object* obj = StubCache::ComputeCallMiss(arguments().immediate(), kind_);
   if (obj->IsFailure()) return obj;
@@ -1328,9 +1375,9 @@ Object* CallStubCompiler::CompileCallField(JSObject* object,
 
 Object* CallStubCompiler::CompileArrayPushCall(Object* object,
                                                JSObject* holder,
+                                               JSGlobalPropertyCell* cell,
                                                JSFunction* function,
-                                               String* name,
-                                               CheckType check) {
+                                               String* name) {
   // ----------- S t a t e -------------
   //  -- ecx                 : name
   //  -- esp[0]              : return address
@@ -1338,12 +1385,9 @@ Object* CallStubCompiler::CompileArrayPushCall(Object* object,
   //  -- ...
   //  -- esp[(argc + 1) * 4] : receiver
   // -----------------------------------
-  ASSERT(check == RECEIVER_MAP_CHECK);
 
   // If object is not an array, bail out to regular call.
-  if (!object->IsJSArray()) {
-    return Heap::undefined_value();
-  }
+  if (!object->IsJSArray() || cell != NULL) return Heap::undefined_value();
 
   Label miss;
 
@@ -1366,16 +1410,18 @@ Object* CallStubCompiler::CompileArrayPushCall(Object* object,
     __ mov(eax, FieldOperand(edx, JSArray::kLengthOffset));
     __ ret((argc + 1) * kPointerSize);
   } else {
+    Label call_builtin;
+
     // Get the elements array of the object.
     __ mov(ebx, FieldOperand(edx, JSArray::kElementsOffset));
 
-    // Check that the elements are in fast mode (not dictionary).
+    // Check that the elements are in fast mode and writable.
     __ cmp(FieldOperand(ebx, HeapObject::kMapOffset),
            Immediate(Factory::fixed_array_map()));
-    __ j(not_equal, &miss);
+    __ j(not_equal, &call_builtin);
 
     if (argc == 1) {  // Otherwise fall through to call builtin.
-      Label call_builtin, exit, with_write_barrier, attempt_to_grow_elements;
+      Label exit, with_write_barrier, attempt_to_grow_elements;
 
       // Get the array's length into eax and calculate new length.
       __ mov(eax, FieldOperand(edx, JSArray::kLengthOffset));
@@ -1456,10 +1502,9 @@ Object* CallStubCompiler::CompileArrayPushCall(Object* object,
 
       // Elements are in new space, so write barrier is not required.
       __ ret((argc + 1) * kPointerSize);
-
-      __ bind(&call_builtin);
     }
 
+    __ bind(&call_builtin);
     __ TailCallExternalReference(ExternalReference(Builtins::c_ArrayPush),
                                  argc + 1,
                                  1);
@@ -1476,9 +1521,9 @@ Object* CallStubCompiler::CompileArrayPushCall(Object* object,
 
 Object* CallStubCompiler::CompileArrayPopCall(Object* object,
                                               JSObject* holder,
+                                              JSGlobalPropertyCell* cell,
                                               JSFunction* function,
-                                              String* name,
-                                              CheckType check) {
+                                              String* name) {
   // ----------- S t a t e -------------
   //  -- ecx                 : name
   //  -- esp[0]              : return address
@@ -1486,12 +1531,9 @@ Object* CallStubCompiler::CompileArrayPopCall(Object* object,
   //  -- ...
   //  -- esp[(argc + 1) * 4] : receiver
   // -----------------------------------
-  ASSERT(check == RECEIVER_MAP_CHECK);
 
   // If object is not an array, bail out to regular call.
-  if (!object->IsJSArray()) {
-    return Heap::undefined_value();
-  }
+  if (!object->IsJSArray() || cell != NULL) return Heap::undefined_value();
 
   Label miss, return_undefined, call_builtin;
 
@@ -1511,10 +1553,10 @@ Object* CallStubCompiler::CompileArrayPopCall(Object* object,
   // Get the elements array of the object.
   __ mov(ebx, FieldOperand(edx, JSArray::kElementsOffset));
 
-  // Check that the elements are in fast mode (not dictionary).
+  // Check that the elements are in fast mode and writable.
   __ cmp(FieldOperand(ebx, HeapObject::kMapOffset),
          Immediate(Factory::fixed_array_map()));
-  __ j(not_equal, &miss);
+  __ j(not_equal, &call_builtin);
 
   // Get the array's length into ecx and calculate new length.
   __ mov(ecx, FieldOperand(edx, JSArray::kLengthOffset));
@@ -1558,11 +1600,12 @@ Object* CallStubCompiler::CompileArrayPopCall(Object* object,
 }
 
 
-Object* CallStubCompiler::CompileStringCharCodeAtCall(Object* object,
-                                                      JSObject* holder,
-                                                      JSFunction* function,
-                                                      String* name,
-                                                      CheckType check) {
+Object* CallStubCompiler::CompileStringCharCodeAtCall(
+    Object* object,
+    JSObject* holder,
+    JSGlobalPropertyCell* cell,
+    JSFunction* function,
+    String* name) {
   // ----------- S t a t e -------------
   //  -- ecx                 : function name
   //  -- esp[0]              : return address
@@ -1572,7 +1615,7 @@ Object* CallStubCompiler::CompileStringCharCodeAtCall(Object* object,
   // -----------------------------------
 
   // If object is not a string, bail out to regular call.
-  if (!object->IsString()) return Heap::undefined_value();
+  if (!object->IsString() || cell != NULL) return Heap::undefined_value();
 
   const int argc = arguments().immediate();
 
@@ -1628,9 +1671,9 @@ Object* CallStubCompiler::CompileStringCharCodeAtCall(Object* object,
 
 Object* CallStubCompiler::CompileStringCharAtCall(Object* object,
                                                   JSObject* holder,
+                                                  JSGlobalPropertyCell* cell,
                                                   JSFunction* function,
-                                                  String* name,
-                                                  CheckType check) {
+                                                  String* name) {
   // ----------- S t a t e -------------
   //  -- ecx                 : function name
   //  -- esp[0]              : return address
@@ -1640,7 +1683,7 @@ Object* CallStubCompiler::CompileStringCharAtCall(Object* object,
   // -----------------------------------
 
   // If object is not a string, bail out to regular call.
-  if (!object->IsString()) return Heap::undefined_value();
+  if (!object->IsString() || cell != NULL) return Heap::undefined_value();
 
   const int argc = arguments().immediate();
 
@@ -1697,6 +1740,79 @@ Object* CallStubCompiler::CompileStringCharAtCall(Object* object,
 }
 
 
+Object* CallStubCompiler::CompileStringFromCharCodeCall(
+    Object* object,
+    JSObject* holder,
+    JSGlobalPropertyCell* cell,
+    JSFunction* function,
+    String* name) {
+  // ----------- S t a t e -------------
+  //  -- ecx                 : function name
+  //  -- esp[0]              : return address
+  //  -- esp[(argc - n) * 4] : arg[n] (zero-based)
+  //  -- ...
+  //  -- esp[(argc + 1) * 4] : receiver
+  // -----------------------------------
+
+  const int argc = arguments().immediate();
+
+  // If the object is not a JSObject or we got an unexpected number of
+  // arguments, bail out to the regular call.
+  if (!object->IsJSObject() || argc != 1) return Heap::undefined_value();
+
+  Label miss;
+  GenerateNameCheck(name, &miss);
+
+  if (cell == NULL) {
+    __ mov(edx, Operand(esp, 2 * kPointerSize));
+
+    STATIC_ASSERT(kSmiTag == 0);
+    __ test(edx, Immediate(kSmiTagMask));
+    __ j(zero, &miss);
+
+    CheckPrototypes(JSObject::cast(object), edx, holder, ebx, eax, edi, name,
+                    &miss);
+  } else {
+    ASSERT(cell->value() == function);
+    GenerateGlobalReceiverCheck(JSObject::cast(object), holder, name, &miss);
+    GenerateLoadFunctionFromCell(cell, function, &miss);
+  }
+
+  // Load the char code argument.
+  Register code = ebx;
+  __ mov(code, Operand(esp, 1 * kPointerSize));
+
+  // Check the code is a smi.
+  Label slow;
+  STATIC_ASSERT(kSmiTag == 0);
+  __ test(code, Immediate(kSmiTagMask));
+  __ j(not_zero, &slow);
+
+  // Convert the smi code to uint16.
+  __ and_(code, Immediate(Smi::FromInt(0xffff)));
+
+  StringCharFromCodeGenerator char_from_code_generator(code, eax);
+  char_from_code_generator.GenerateFast(masm());
+  __ ret(2 * kPointerSize);
+
+  ICRuntimeCallHelper call_helper;
+  char_from_code_generator.GenerateSlow(masm(), call_helper);
+
+  // Tail call the full function. We do not have to patch the receiver
+  // because the function makes no use of it.
+  __ bind(&slow);
+  __ InvokeFunction(function, arguments(), JUMP_FUNCTION);
+
+  __ bind(&miss);
+  // ecx: function name.
+  Object* obj = GenerateMissBranch();
+  if (obj->IsFailure()) return obj;
+
+  // Return the generated code.
+  return (cell == NULL) ? GetCode(function) : GetCode(NORMAL, name);
+}
+
+
 Object* CallStubCompiler::CompileCallConstant(Object* object,
                                               JSObject* holder,
                                               JSFunction* function,
@@ -1713,12 +1829,10 @@ Object* CallStubCompiler::CompileCallConstant(Object* object,
   SharedFunctionInfo* function_info = function->shared();
   if (function_info->HasCustomCallGenerator()) {
     const int id = function_info->custom_call_generator_id();
-    Object* result =
-        CompileCustomCall(id, object, holder, function, name, check);
+    Object* result = CompileCustomCall(
+        id, object, holder, NULL, function, name);
     // undefined means bail out to regular compiler.
-    if (!result->IsUndefined()) {
-      return result;
-    }
+    if (!result->IsUndefined()) return result;
   }
 
   Label miss_in_smi_check;
@@ -1929,6 +2043,16 @@ Object* CallStubCompiler::CompileCallGlobal(JSObject* object,
   //  -- ...
   //  -- esp[(argc + 1) * 4] : receiver
   // -----------------------------------
+
+  SharedFunctionInfo* function_info = function->shared();
+  if (function_info->HasCustomCallGenerator()) {
+    const int id = function_info->custom_call_generator_id();
+    Object* result = CompileCustomCall(
+        id, object, holder, cell, function, name);
+    // undefined means bail out to regular compiler.
+    if (!result->IsUndefined()) return result;
+  }
+
   Label miss;
 
   GenerateNameCheck(name, &miss);
@@ -1936,44 +2060,9 @@ Object* CallStubCompiler::CompileCallGlobal(JSObject* object,
   // Get the number of arguments.
   const int argc = arguments().immediate();
 
-  // Get the receiver from the stack.
-  __ mov(edx, Operand(esp, (argc + 1) * kPointerSize));
+  GenerateGlobalReceiverCheck(object, holder, name, &miss);
 
-  // If the object is the holder then we know that it's a global
-  // object which can only happen for contextual calls. In this case,
-  // the receiver cannot be a smi.
-  if (object != holder) {
-    __ test(edx, Immediate(kSmiTagMask));
-    __ j(zero, &miss, not_taken);
-  }
-
-  // Check that the maps haven't changed.
-  CheckPrototypes(object, edx, holder, ebx, eax, edi, name, &miss);
-
-  // Get the value from the cell.
-  __ mov(edi, Immediate(Handle<JSGlobalPropertyCell>(cell)));
-  __ mov(edi, FieldOperand(edi, JSGlobalPropertyCell::kValueOffset));
-
-  // Check that the cell contains the same function.
-  if (Heap::InNewSpace(function)) {
-    // We can't embed a pointer to a function in new space so we have
-    // to verify that the shared function info is unchanged. This has
-    // the nice side effect that multiple closures based on the same
-    // function can all use this call IC. Before we load through the
-    // function, we have to verify that it still is a function.
-    __ test(edi, Immediate(kSmiTagMask));
-    __ j(zero, &miss, not_taken);
-    __ CmpObjectType(edi, JS_FUNCTION_TYPE, ebx);
-    __ j(not_equal, &miss, not_taken);
-
-    // Check the shared function info. Make sure it hasn't changed.
-    __ cmp(FieldOperand(edi, JSFunction::kSharedFunctionInfoOffset),
-           Immediate(Handle<SharedFunctionInfo>(function->shared())));
-    __ j(not_equal, &miss, not_taken);
-  } else {
-    __ cmp(Operand(edi), Immediate(Handle<JSFunction>(function)));
-    __ j(not_equal, &miss, not_taken);
-  }
+  GenerateLoadFunctionFromCell(cell, function, &miss);
 
   // Patch the receiver on the stack with the global proxy.
   if (object->IsGlobalObject()) {

@@ -1,8 +1,31 @@
-diff --git a/deps/v8/SConstruct b/deps/v8/SConstruct
-index 7219e9d..b8de1b8 100644
---- a/deps/v8/SConstruct
-+++ b/deps/v8/SConstruct
-@@ -670,7 +670,7 @@ SIMPLE_OPTIONS = {
+From 9bf51816bed45ef41d3e5e54bedcb0c8d01384e8 Mon Sep 17 00:00:00 2001
+From: unknown <cyg_server@.(none)>
+Date: Wed, 8 Sep 2010 14:57:59 -0700
+Subject: [PATCH] Patch for Cygwin
+
+---
+ SConstruct             |    3 +-
+ src/SConscript         |    1 +
+ src/platform-cygwin.cc |  858 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/platform.h         |    5 +
+ src/utils.h            |    2 +-
+ tools/utils.py         |    2 +
+ 6 files changed, 868 insertions(+), 3 deletions(-)
+ create mode 100644 src/platform-cygwin.cc
+
+diff --git a/SConstruct b/SConstruct
+index 2a39583..9328699 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -292,7 +292,6 @@ V8_EXTRA_FLAGS = {
+   'gcc': {
+     'all': {
+       'WARNINGFLAGS': ['-Wall',
+-                       '-Werror',
+                        '-W',
+                        '-Wno-unused-parameter',
+                        '-Wnon-virtual-dtor']
+@@ -666,7 +665,7 @@ SIMPLE_OPTIONS = {
      'help': 'the toolchain to use (' + TOOLCHAIN_GUESS + ')'
    },
    'os': {
@@ -11,11 +34,11 @@ index 7219e9d..b8de1b8 100644
      'default': OS_GUESS,
      'help': 'the os to build for (' + OS_GUESS + ')'
    },
-diff --git a/deps/v8/src/SConscript b/deps/v8/src/SConscript
-index 8466a0c..9ff3414 100755
---- a/deps/v8/src/SConscript
-+++ b/deps/v8/src/SConscript
-@@ -206,6 +206,7 @@ SOURCES = {
+diff --git a/src/SConscript b/src/SConscript
+index 7fae8d4..e2b01aa 100755
+--- a/src/SConscript
++++ b/src/SConscript
+@@ -202,6 +202,7 @@ SOURCES = {
    'os:android': ['platform-linux.cc', 'platform-posix.cc'],
    'os:macos':   ['platform-macos.cc', 'platform-posix.cc'],
    'os:solaris': ['platform-solaris.cc', 'platform-posix.cc'],
@@ -23,11 +46,11 @@ index 8466a0c..9ff3414 100755
    'os:nullos':  ['platform-nullos.cc'],
    'os:win32':   ['platform-win32.cc'],
    'mode:release': [],
-diff --git a/deps/v8/src/platform-cygwin.cc b/deps/v8/src/platform-cygwin.cc
+diff --git a/src/platform-cygwin.cc b/src/platform-cygwin.cc
 new file mode 100644
 index 0000000..34410e8
 --- /dev/null
-+++ b/deps/v8/src/platform-cygwin.cc
++++ b/src/platform-cygwin.cc
 @@ -0,0 +1,858 @@
 +// Copyright 2006-2008 the V8 project authors. All rights reserved.
 +// Redistribution and use in source and binary forms, with or without
@@ -887,26 +910,46 @@ index 0000000..34410e8
 +#endif  // ENABLE_LOGGING_AND_PROFILING
 +
 +} }  // namespace v8::internal
-diff --git a/deps/v8/src/platform.h b/deps/v8/src/platform.h
-index d63ca5e..1091ba6 100644
---- a/deps/v8/src/platform.h
-+++ b/deps/v8/src/platform.h
-@@ -360,7 +360,11 @@ class ThreadHandle {
+diff --git a/src/platform.h b/src/platform.h
+index e9e7c22..f4ce29f 100644
+--- a/src/platform.h
++++ b/src/platform.h
+@@ -362,6 +362,7 @@ class ThreadHandle {
+ 
  class Thread: public ThreadHandle {
   public:
-   // Opaque data type for thread-local storage keys.
 +#ifndef __CYGWIN__
-   enum LocalStorageKey {};
+   // Opaque data type for thread-local storage keys.
+   // LOCAL_STORAGE_KEY_MIN_VALUE and LOCAL_STORAGE_KEY_MAX_VALUE are specified
+   // to ensure that enumeration type has correct value range (see Issue 830 for
+@@ -370,6 +371,10 @@ class Thread: public ThreadHandle {
+     LOCAL_STORAGE_KEY_MIN_VALUE = kMinInt,
+     LOCAL_STORAGE_KEY_MAX_VALUE = kMaxInt
+   };
 +#else
 +  typedef void *LocalStorageKey;
 +#endif
++
  
    // Create new thread.
    Thread();
-diff --git a/deps/v8/tools/utils.py b/deps/v8/tools/utils.py
-index 3a55722..505c398 100644
---- a/deps/v8/tools/utils.py
-+++ b/deps/v8/tools/utils.py
+diff --git a/src/utils.h b/src/utils.h
+index d605891..30db7ab 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -947,7 +947,7 @@ inline Dest BitCast(const Source& source) {
+ }
+ 
+ template <class Dest, class Source>
+-inline Dest BitCast(Source* source) {
++inline Dest BitCast(Source*& source) {
+   return BitCast<Dest>(reinterpret_cast<uintptr_t>(source));
+ }
+ 
+diff --git a/tools/utils.py b/tools/utils.py
+index 8083091..7733157 100644
+--- a/tools/utils.py
++++ b/tools/utils.py
 @@ -59,6 +59,8 @@ def GuessOS():
      return 'openbsd'
    elif id == 'SunOS':
@@ -916,3 +959,6 @@ index 3a55722..505c398 100644
    else:
      return None
  
+-- 
+1.7.2
+

@@ -31,7 +31,6 @@
 #include "api.h"
 #include "arguments.h"
 #include "bootstrapper.h"
-#include "codegen.h"
 #include "compiler.h"
 #include "debug.h"
 #include "execution.h"
@@ -773,6 +772,7 @@ bool CompileLazy(Handle<JSFunction> function,
                  ClearExceptionFlag flag) {
   if (function->shared()->is_compiled()) {
     function->set_code(function->shared()->code());
+    function->shared()->set_code_age(0);
     return true;
   } else {
     CompilationInfo info(function, 0, receiver);
@@ -788,6 +788,7 @@ bool CompileLazyInLoop(Handle<JSFunction> function,
                        ClearExceptionFlag flag) {
   if (function->shared()->is_compiled()) {
     function->set_code(function->shared()->code());
+    function->shared()->set_code_age(0);
     return true;
   } else {
     CompilationInfo info(function, 1, receiver);

@@ -372,6 +372,7 @@ TEST(RetainerProfile) {
   i::HeapIterator iterator;
   for (i::HeapObject* obj = iterator.next(); obj != NULL; obj = iterator.next())
     ret_profile.CollectStats(obj);
+  ret_profile.CoarseAndAggregate();
   RetainerProfilePrinter printer;
   ret_profile.DebugPrintStats(&printer);
   const char* retainers_of_a = printer.GetRetainers("A");
@@ -650,6 +651,8 @@ TEST(HeapSnapshotCodeObjects) {
   CompileAndRunScript(
       "function lazy(x) { return x - 1; }\n"
       "function compiled(x) { return x + 1; }\n"
+      "var inferred = function(x) { return x; }\n"
+      "var anonymous = (function() { return function() { return 0; } })();\n"
       "compiled(1)");
   const v8::HeapSnapshot* snapshot =
       v8::HeapProfiler::TakeSnapshot(v8::String::New("code"));
@@ -663,6 +666,18 @@ TEST(HeapSnapshotCodeObjects) {
       GetProperty(global, v8::HeapGraphEdge::kProperty, "lazy");
   CHECK_NE(NULL, lazy);
   CHECK_EQ(v8::HeapGraphNode::kClosure, lazy->GetType());
+  const v8::HeapGraphNode* inferred =
+      GetProperty(global, v8::HeapGraphEdge::kProperty, "inferred");
+  CHECK_NE(NULL, inferred);
+  CHECK_EQ(v8::HeapGraphNode::kClosure, inferred->GetType());
+  v8::String::AsciiValue inferred_name(inferred->GetName());
+  CHECK_EQ("inferred", *inferred_name);
+  const v8::HeapGraphNode* anonymous =
+      GetProperty(global, v8::HeapGraphEdge::kProperty, "anonymous");
+  CHECK_NE(NULL, anonymous);
+  CHECK_EQ(v8::HeapGraphNode::kClosure, anonymous->GetType());
+  v8::String::AsciiValue anonymous_name(anonymous->GetName());
+  CHECK_EQ("(anonymous function)", *anonymous_name);
 
   // Find references to code.
   const v8::HeapGraphNode* compiled_code =
@@ -862,6 +877,268 @@ TEST(Issue822) {
   i::Handle<i::JSObject> jsobj = v8::Utils::OpenHandle(*obj);
   // This call must not cause an assertion error in debug builds.
   i::HeapSnapshotTester::CalculateNetworkSize(*jsobj);
+}
+
+
+static const v8::HeapGraphNode* GetChild(
+    const v8::HeapGraphNode* node,
+    v8::HeapGraphNode::Type type,
+    const char* name,
+    const v8::HeapGraphNode* after = NULL) {
+  bool ignore_child = after == NULL ? false : true;
+  for (int i = 0, count = node->GetChildrenCount(); i < count; ++i) {
+    const v8::HeapGraphEdge* prop = node->GetChild(i);
+    const v8::HeapGraphNode* child = prop->GetToNode();
+    v8::String::AsciiValue child_name(child->GetName());
+    if (!ignore_child
+        && child->GetType() == type
+        && strcmp(name, *child_name) == 0)
+      return child;
+    if (after != NULL && child == after) ignore_child = false;
+  }
+  return NULL;
+}
+
+static bool IsNodeRetainedAs(const v8::HeapGraphNode* node,
+                             int element) {
+  for (int i = 0, count = node->GetRetainersCount(); i < count; ++i) {
+    const v8::HeapGraphEdge* prop = node->GetRetainer(i);
+    if (prop->GetType() == v8::HeapGraphEdge::kElement
+        && element == prop->GetName()->Int32Value())
+      return true;
+  }
+  return false;
+}
+
+TEST(AggregatedHeapSnapshot) {
+  v8::HandleScope scope;
+  LocalContext env;
+
+  CompileAndRunScript(
+      "function A() {}\n"
+      "function B(x) { this.x = x; }\n"
+      "var a = new A();\n"
+      "var b = new B(a);");
+  const v8::HeapSnapshot* snapshot =
+      v8::HeapProfiler::TakeSnapshot(
+          v8::String::New("agg"), v8::HeapSnapshot::kAggregated);
+  const v8::HeapGraphNode* strings = GetChild(snapshot->GetRoot(),
+                                              v8::HeapGraphNode::kInternal,
+                                              "STRING_TYPE");
+  CHECK_NE(NULL, strings);
+  CHECK_NE(0, strings->GetSelfSize());
+  CHECK_NE(0, strings->GetInstancesCount());
+  const v8::HeapGraphNode* maps = GetChild(snapshot->GetRoot(),
+                                           v8::HeapGraphNode::kInternal,
+                                           "MAP_TYPE");
+  CHECK_NE(NULL, maps);
+  CHECK_NE(0, maps->GetSelfSize());
+  CHECK_NE(0, maps->GetInstancesCount());
+
+  const v8::HeapGraphNode* a = GetChild(snapshot->GetRoot(),
+                                        v8::HeapGraphNode::kObject,
+                                        "A");
+  CHECK_NE(NULL, a);
+  CHECK_NE(0, a->GetSelfSize());
+  CHECK_EQ(1, a->GetInstancesCount());
+
+  const v8::HeapGraphNode* b = GetChild(snapshot->GetRoot(),
+                                        v8::HeapGraphNode::kObject,
+                                        "B");
+  CHECK_NE(NULL, b);
+  CHECK_NE(0, b->GetSelfSize());
+  CHECK_EQ(1, b->GetInstancesCount());
+
+  const v8::HeapGraphNode* glob_prop = GetChild(snapshot->GetRoot(),
+                                                v8::HeapGraphNode::kObject,
+                                                "(global property)",
+                                                b);
+  CHECK_NE(NULL, glob_prop);
+  CHECK_EQ(0, glob_prop->GetSelfSize());
+  CHECK_EQ(0, glob_prop->GetInstancesCount());
+  CHECK_NE(0, glob_prop->GetChildrenCount());
+
+  const v8::HeapGraphNode* a_from_glob_prop = GetChild(
+      glob_prop,
+      v8::HeapGraphNode::kObject,
+      "A");
+  CHECK_NE(NULL, a_from_glob_prop);
+  CHECK_EQ(0, a_from_glob_prop->GetSelfSize());
+  CHECK_EQ(0, a_from_glob_prop->GetInstancesCount());
+  CHECK_EQ(0, a_from_glob_prop->GetChildrenCount());  // Retains nothing.
+  CHECK(IsNodeRetainedAs(a_from_glob_prop, 1));  // (global propery) has 1 ref.
+
+  const v8::HeapGraphNode* b_with_children = GetChild(
+      snapshot->GetRoot(),
+      v8::HeapGraphNode::kObject,
+      "B",
+      b);
+  CHECK_NE(NULL, b_with_children);
+  CHECK_EQ(0, b_with_children->GetSelfSize());
+  CHECK_EQ(0, b_with_children->GetInstancesCount());
+  CHECK_NE(0, b_with_children->GetChildrenCount());
+
+  const v8::HeapGraphNode* a_from_b = GetChild(
+      b_with_children,
+      v8::HeapGraphNode::kObject,
+      "A");
+  CHECK_NE(NULL, a_from_b);
+  CHECK_EQ(0, a_from_b->GetSelfSize());
+  CHECK_EQ(0, a_from_b->GetInstancesCount());
+  CHECK_EQ(0, a_from_b->GetChildrenCount());  // Retains nothing.
+  CHECK(IsNodeRetainedAs(a_from_b, 1));  // B has 1 ref to A.
+}
+
+namespace {
+
+class TestJSONStream : public v8::OutputStream {
+ public:
+  TestJSONStream() : eos_signaled_(0), abort_countdown_(-1) {}
+  explicit TestJSONStream(int abort_countdown)
+      : eos_signaled_(0), abort_countdown_(abort_countdown) {}
+  virtual ~TestJSONStream() {}
+  virtual void EndOfStream() { ++eos_signaled_; }
+  virtual WriteResult WriteAsciiChunk(char* buffer, int chars_written) {
+    if (abort_countdown_ > 0) --abort_countdown_;
+    if (abort_countdown_ == 0) return kAbort;
+    CHECK_GT(chars_written, 0);
+    i::Vector<char> chunk = buffer_.AddBlock(chars_written, '\0');
+    memcpy(chunk.start(), buffer, chars_written);
+    return kContinue;
+  }
+  void WriteTo(i::Vector<char> dest) { buffer_.WriteTo(dest); }
+  int eos_signaled() { return eos_signaled_; }
+  int size() { return buffer_.size(); }
+ private:
+  i::Collector<char> buffer_;
+  int eos_signaled_;
+  int abort_countdown_;
+};
+
+class AsciiResource: public v8::String::ExternalAsciiStringResource {
+ public:
+  explicit AsciiResource(i::Vector<char> string): data_(string.start()) {
+    length_ = string.length();
+  }
+  virtual const char* data() const { return data_; }
+  virtual size_t length() const { return length_; }
+ private:
+  const char* data_;
+  size_t length_;
+};
+
+}  // namespace
+
+TEST(HeapSnapshotJSONSerialization) {
+  v8::HandleScope scope;
+  LocalContext env;
+
+#define STRING_LITERAL_FOR_TEST \
+  "\"String \\n\\r\\u0008\\u0081\\u0101\\u0801\\u8001\""
+  CompileAndRunScript(
+      "function A(s) { this.s = s; }\n"
+      "function B(x) { this.x = x; }\n"
+      "var a = new A(" STRING_LITERAL_FOR_TEST ");\n"
+      "var b = new B(a);");
+  const v8::HeapSnapshot* snapshot =
+      v8::HeapProfiler::TakeSnapshot(v8::String::New("json"));
+  TestJSONStream stream;
+  snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
+  CHECK_GT(stream.size(), 0);
+  CHECK_EQ(1, stream.eos_signaled());
+  i::ScopedVector<char> json(stream.size());
+  stream.WriteTo(json);
+
+  // Verify that snapshot string is valid JSON.
+  AsciiResource json_res(json);
+  v8::Local<v8::String> json_string = v8::String::NewExternal(&json_res);
+  env->Global()->Set(v8::String::New("json_snapshot"), json_string);
+  v8::Local<v8::Value> snapshot_parse_result = CompileRun(
+      "var parsed = JSON.parse(json_snapshot); true;");
+  CHECK(!snapshot_parse_result.IsEmpty());
+
+  // Verify that snapshot object has required fields.
+  v8::Local<v8::Object> parsed_snapshot =
+      env->Global()->Get(v8::String::New("parsed"))->ToObject();
+  CHECK(parsed_snapshot->Has(v8::String::New("snapshot")));
+  CHECK(parsed_snapshot->Has(v8::String::New("nodes")));
+  CHECK(parsed_snapshot->Has(v8::String::New("strings")));
+
+  // Verify that nodes meta-info is valid JSON.
+  v8::Local<v8::Value> nodes_meta_parse_result = CompileRun(
+      "var parsed_meta = JSON.parse(parsed.nodes[0]); true;");
+  CHECK(!nodes_meta_parse_result.IsEmpty());
+
+  // Get node and edge "member" offsets.
+  v8::Local<v8::Value> meta_analysis_result = CompileRun(
+      "var children_count_offset ="
+      "    parsed_meta.fields.indexOf('children_count');\n"
+      "var children_offset ="
+      "    parsed_meta.fields.indexOf('children');\n"
+      "var children_meta ="
+      "    parsed_meta.types[children_offset];\n"
+      "var child_fields_count = children_meta.fields.length;\n"
+      "var child_type_offset ="
+      "    children_meta.fields.indexOf('type');\n"
+      "var child_name_offset ="
+      "    children_meta.fields.indexOf('name_or_index');\n"
+      "var child_to_node_offset ="
+      "    children_meta.fields.indexOf('to_node');\n"
+      "var property_type ="
+      "    children_meta.types[child_type_offset].indexOf('property');");
+  CHECK(!meta_analysis_result.IsEmpty());
+
+  // A helper function for processing encoded nodes.
+  CompileRun(
+      "function GetChildPosByProperty(pos, prop_name) {\n"
+      "  var nodes = parsed.nodes;\n"
+      "  var strings = parsed.strings;\n"
+      "  for (var i = 0,\n"
+      "      count = nodes[pos + children_count_offset] * child_fields_count;\n"
+      "      i < count; i += child_fields_count) {\n"
+      "    var child_pos = pos + children_offset + i;\n"
+      "    if (nodes[child_pos + child_type_offset] === property_type\n"
+      "       && strings[nodes[child_pos + child_name_offset]] === prop_name)\n"
+      "        return nodes[child_pos + child_to_node_offset];\n"
+      "  }\n"
+      "  return null;\n"
+      "}\n");
+  // Get the string index using the path: <root> -> <global>.b.x.s
+  v8::Local<v8::Value> string_obj_pos_val = CompileRun(
+      "GetChildPosByProperty(\n"
+      "  GetChildPosByProperty(\n"
+      "    GetChildPosByProperty("
+      "      parsed.nodes[1 + children_offset + child_to_node_offset],\"b\"),\n"
+      "    \"x\"),"
+      "  \"s\")");
+  CHECK(!string_obj_pos_val.IsEmpty());
+  int string_obj_pos =
+      static_cast<int>(string_obj_pos_val->ToNumber()->Value());
+  v8::Local<v8::Object> nodes_array =
+      parsed_snapshot->Get(v8::String::New("nodes"))->ToObject();
+  int string_index = static_cast<int>(
+      nodes_array->Get(string_obj_pos + 1)->ToNumber()->Value());
+  CHECK_GT(string_index, 0);
+  v8::Local<v8::Object> strings_array =
+      parsed_snapshot->Get(v8::String::New("strings"))->ToObject();
+  v8::Local<v8::String> string = strings_array->Get(string_index)->ToString();
+  v8::Local<v8::String> ref_string =
+      CompileRun(STRING_LITERAL_FOR_TEST)->ToString();
+#undef STRING_LITERAL_FOR_TEST
+  CHECK_EQ(*v8::String::Utf8Value(ref_string),
+           *v8::String::Utf8Value(string));
+}
+
+
+TEST(HeapSnapshotJSONSerializationAborting) {
+  v8::HandleScope scope;
+  LocalContext env;
+  const v8::HeapSnapshot* snapshot =
+      v8::HeapProfiler::TakeSnapshot(v8::String::New("abort"));
+  TestJSONStream stream(5);
+  snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
+  CHECK_GT(stream.size(), 0);
+  CHECK_EQ(0, stream.eos_signaled());
 }
 
 #endif  // ENABLE_LOGGING_AND_PROFILING
