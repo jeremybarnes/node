@@ -52,6 +52,7 @@
 #include "v8.h"
 
 #include "platform.h"
+#include "vm-state-inl.h"
 
 
 // It seems there is a bug in some Solaris distributions (experienced in
@@ -253,6 +254,10 @@ PosixMemoryMappedFile::~PosixMemoryMappedFile() {
 
 
 void OS::LogSharedLibraryAddresses() {
+}
+
+
+void OS::SignalCodeMovingGC() {
 }
 
 
@@ -597,8 +602,11 @@ class Sampler::PlatformData : public Malloced {
 };
 
 
-Sampler::Sampler(int interval, bool profiling)
-    : interval_(interval), profiling_(profiling), active_(false) {
+Sampler::Sampler(int interval)
+    : interval_(interval),
+      profiling_(false),
+      active_(false),
+      samples_taken_(0) {
   data_ = new PlatformData();
 }
 

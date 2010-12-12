@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2010 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -32,6 +32,7 @@
 #include "execution.h"
 #include "factory.h"
 #include "macro-assembler.h"
+#include "objects.h"
 #include "objects-visiting.h"
 
 namespace v8 {
@@ -70,6 +71,26 @@ Handle<DescriptorArray> Factory::NewDescriptorArray(int number_of_descriptors) {
   ASSERT(0 <= number_of_descriptors);
   CALL_HEAP_FUNCTION(DescriptorArray::Allocate(number_of_descriptors),
                      DescriptorArray);
+}
+
+
+Handle<DeoptimizationInputData> Factory::NewDeoptimizationInputData(
+    int deopt_entry_count,
+    PretenureFlag pretenure) {
+  ASSERT(deopt_entry_count > 0);
+  CALL_HEAP_FUNCTION(DeoptimizationInputData::Allocate(deopt_entry_count,
+                                                       pretenure),
+                     DeoptimizationInputData);
+}
+
+
+Handle<DeoptimizationOutputData> Factory::NewDeoptimizationOutputData(
+    int deopt_entry_count,
+    PretenureFlag pretenure) {
+  ASSERT(deopt_entry_count > 0);
+  CALL_HEAP_FUNCTION(DeoptimizationOutputData::Allocate(deopt_entry_count,
+                                                        pretenure),
+                     DeoptimizationOutputData);
 }
 
 
@@ -243,6 +264,13 @@ Handle<ExternalArray> Factory::NewExternalArray(int length,
 }
 
 
+Handle<JSGlobalPropertyCell> Factory::NewJSGlobalPropertyCell(
+    Handle<Object> value) {
+  CALL_HEAP_FUNCTION(Heap::AllocateJSGlobalPropertyCell(*value),
+                     JSGlobalPropertyCell);
+}
+
+
 Handle<Map> Factory::NewMap(InstanceType type, int instance_size) {
   CALL_HEAP_FUNCTION(Heap::AllocateMap(type, instance_size), Map);
 }
@@ -333,6 +361,15 @@ Handle<JSFunction> Factory::NewFunctionFromSharedFunctionInfo(
                   context->global_context());
   }
   result->set_literals(*literals);
+  result->set_next_function_link(Heap::undefined_value());
+
+  if (V8::UseCrankshaft() &&
+      FLAG_always_opt &&
+      result->is_compiled() &&
+      !function_info->is_toplevel() &&
+      function_info->allows_lazy_compilation()) {
+    result->MarkForLazyRecompilation();
+  }
   return result;
 }
 
@@ -431,7 +468,8 @@ Handle<Object> Factory::NewError(const char* maker,
                                  const char* type,
                                  Handle<JSArray> args) {
   Handle<String> make_str = Factory::LookupAsciiSymbol(maker);
-  Handle<Object> fun_obj(Top::builtins()->GetProperty(*make_str));
+  Handle<Object> fun_obj(Top::builtins()->GetPropertyNoExceptionThrown(
+      *make_str));
   // If the builtins haven't been properly configured yet this error
   // constructor may not have been defined.  Bail out.
   if (!fun_obj->IsJSFunction())
@@ -464,7 +502,7 @@ Handle<Object> Factory::NewError(const char* constructor,
   Handle<JSFunction> fun =
       Handle<JSFunction>(
           JSFunction::cast(
-              Top::builtins()->GetProperty(*constr)));
+              Top::builtins()->GetPropertyNoExceptionThrown(*constr)));
   Object** argv[1] = { Handle<Object>::cast(message).location() };
 
   // Invoke the JavaScript factory method. If an exception is thrown while
@@ -567,12 +605,13 @@ Handle<Code> Factory::CopyCode(Handle<Code> code, Vector<byte> reloc_info) {
 }
 
 
-static inline Object* DoCopyInsert(DescriptorArray* array,
-                                   String* key,
-                                   Object* value,
-                                   PropertyAttributes attributes) {
+MUST_USE_RESULT static inline MaybeObject* DoCopyInsert(
+    DescriptorArray* array,
+    String* key,
+    Object* value,
+    PropertyAttributes attributes) {
   CallbacksDescriptor desc(key, value, attributes);
-  Object* obj = array->CopyInsert(&desc, REMOVE_TRANSITIONS);
+  MaybeObject* obj = array->CopyInsert(&desc, REMOVE_TRANSITIONS);
   return obj;
 }
 
@@ -921,11 +960,15 @@ Handle<MapCache> Factory::NewMapCache(int at_least_space_for) {
 }
 
 
-static Object* UpdateMapCacheWith(Context* context,
-                                  FixedArray* keys,
-                                  Map* map) {
-  Object* result = MapCache::cast(context->map_cache())->Put(keys, map);
-  if (!result->IsFailure()) context->set_map_cache(MapCache::cast(result));
+MUST_USE_RESULT static MaybeObject* UpdateMapCacheWith(Context* context,
+                                                       FixedArray* keys,
+                                                       Map* map) {
+  Object* result;
+  { MaybeObject* maybe_result =
+        MapCache::cast(context->map_cache())->Put(keys, map);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
+  context->set_map_cache(MapCache::cast(result));
   return result;
 }
 

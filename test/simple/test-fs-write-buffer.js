@@ -1,15 +1,15 @@
-common = require("../common");
-assert = common.assert
+var common = require('../common');
+var assert = require('assert');
 var path = require('path'),
     Buffer = require('buffer').Buffer,
     fs = require('fs'),
-    filename = path.join(common.fixturesDir, 'write.txt'),
+    filename = path.join(common.tmpDir, 'write.txt'),
     expected = new Buffer('hello'),
     openCalled = 0,
     writeCalled = 0;
 
 
-fs.open(filename, 'w', 0644, function (err, fd) {
+fs.open(filename, 'w', 0644, function(err, fd) {
   openCalled++;
   if (err) throw err;
 
@@ -26,7 +26,7 @@ fs.open(filename, 'w', 0644, function (err, fd) {
   });
 });
 
-process.addListener("exit", function () {
+process.addListener('exit', function() {
   assert.equal(1, openCalled);
   assert.equal(1, writeCalled);
 });

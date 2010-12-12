@@ -33,7 +33,6 @@
 #include "ic-inl.h"
 #include "runtime.h"
 #include "stub-cache.h"
-#include "utils.h"
 
 namespace v8 {
 namespace internal {
@@ -692,7 +691,6 @@ void KeyedLoadIC::GenerateString(MacroAssembler* masm) {
   //  -- esp[0] : return address
   // -----------------------------------
   Label miss;
-  Label index_out_of_range;
 
   Register receiver = edx;
   Register index = eax;
@@ -707,17 +705,13 @@ void KeyedLoadIC::GenerateString(MacroAssembler* masm) {
                                           result,
                                           &miss,  // When not a string.
                                           &miss,  // When not a number.
-                                          &index_out_of_range,
+                                          &miss,  // When index out of range.
                                           STRING_INDEX_IS_ARRAY_INDEX);
   char_at_generator.GenerateFast(masm);
   __ ret(0);
 
-  ICRuntimeCallHelper call_helper;
+  StubRuntimeCallHelper call_helper;
   char_at_generator.GenerateSlow(masm, call_helper);
-
-  __ bind(&index_out_of_range);
-  __ Set(eax, Immediate(Factory::undefined_value()));
-  __ ret(0);
 
   __ bind(&miss);
   GenerateMiss(masm);
@@ -890,8 +884,8 @@ void KeyedLoadIC::GenerateIndexedInterceptor(MacroAssembler* masm) {
   __ test(edx, Immediate(kSmiTagMask));
   __ j(zero, &slow, not_taken);
 
-  // Check that the key is a smi.
-  __ test(eax, Immediate(kSmiTagMask));
+  // Check that the key is an array index, that is Uint32.
+  __ test(eax, Immediate(kSmiTagMask | kSmiSignMask));
   __ j(not_zero, &slow, not_taken);
 
   // Get the map of the receiver.
@@ -1635,16 +1629,15 @@ void LoadIC::GenerateMiss(MacroAssembler* masm) {
 }
 
 
-// One byte opcode for test eax,0xXXXXXXXX.
-static const byte kTestEaxByte = 0xA9;
-
 bool LoadIC::PatchInlinedLoad(Address address, Object* map, int offset) {
+  if (V8::UseCrankshaft()) return false;
+
   // The address of the instruction following the call.
   Address test_instruction_address =
       address + Assembler::kCallTargetAddressOffset;
   // If the instruction following the call is not a test eax, nothing
   // was inlined.
-  if (*test_instruction_address != kTestEaxByte) return false;
+  if (*test_instruction_address != Assembler::kTestEaxByte) return false;
 
   Address delta_address = test_instruction_address + 1;
   // The delta to the start of the map check instruction.
@@ -1666,14 +1659,70 @@ bool LoadIC::PatchInlinedLoad(Address address, Object* map, int offset) {
 }
 
 
+// One byte opcode for mov ecx,0xXXXXXXXX.
+// Marks inlined contextual loads using all kinds of cells. Generated
+// code has the hole check:
+//   mov reg, <cell>
+//   mov reg, (<cell>, value offset)
+//   cmp reg, <the hole>
+//   je  slow
+//   ;; use reg
+static const byte kMovEcxByte = 0xB9;
+
+// One byte opcode for mov edx,0xXXXXXXXX.
+// Marks inlined contextual loads using only "don't delete"
+// cells. Generated code doesn't have the hole check:
+//   mov reg, <cell>
+//   mov reg, (<cell>, value offset)
+//   ;; use reg
+static const byte kMovEdxByte = 0xBA;
+
+bool LoadIC::PatchInlinedContextualLoad(Address address,
+                                        Object* map,
+                                        Object* cell,
+                                        bool is_dont_delete) {
+  if (V8::UseCrankshaft()) return false;
+
+  // The address of the instruction following the call.
+  Address mov_instruction_address =
+      address + Assembler::kCallTargetAddressOffset;
+  // If the instruction following the call is not a mov ecx/edx,
+  // nothing was inlined.
+  byte b = *mov_instruction_address;
+  if (b != kMovEcxByte && b != kMovEdxByte) return false;
+  // If we don't have the hole check generated, we can only support
+  // "don't delete" cells.
+  if (b == kMovEdxByte && !is_dont_delete) return false;
+
+  Address delta_address = mov_instruction_address + 1;
+  // The delta to the start of the map check instruction.
+  int delta = *reinterpret_cast<int*>(delta_address);
+
+  // The map address is the last 4 bytes of the 7-byte
+  // operand-immediate compare instruction, so we add 3 to get the
+  // offset to the last 4 bytes.
+  Address map_address = mov_instruction_address + delta + 3;
+  *(reinterpret_cast<Object**>(map_address)) = map;
+
+  // The cell is in the last 4 bytes of a five byte mov reg, imm32
+  // instruction, so we add 1 to get the offset to the last 4 bytes.
+  Address offset_address =
+      mov_instruction_address + delta + kOffsetToLoadInstruction + 1;
+  *reinterpret_cast<Object**>(offset_address) = cell;
+  return true;
+}
+
+
 bool StoreIC::PatchInlinedStore(Address address, Object* map, int offset) {
+  if (V8::UseCrankshaft()) return false;
+
   // The address of the instruction following the call.
   Address test_instruction_address =
       address + Assembler::kCallTargetAddressOffset;
 
   // If the instruction following the call is not a test eax, nothing
   // was inlined.
-  if (*test_instruction_address != kTestEaxByte) return false;
+  if (*test_instruction_address != Assembler::kTestEaxByte) return false;
 
   // Extract the encoded deltas from the test eax instruction.
   Address encoded_offsets_address = test_instruction_address + 1;
@@ -1713,11 +1762,13 @@ bool StoreIC::PatchInlinedStore(Address address, Object* map, int offset) {
 
 
 static bool PatchInlinedMapCheck(Address address, Object* map) {
+  if (V8::UseCrankshaft()) return false;
+
   Address test_instruction_address =
       address + Assembler::kCallTargetAddressOffset;
   // The keyed load has a fast inlined case if the IC call instruction
   // is immediately followed by a test instruction.
-  if (*test_instruction_address != kTestEaxByte) return false;
+  if (*test_instruction_address != Assembler::kTestEaxByte) return false;
 
   // Fetch the offset from the test instruction to the map cmp
   // instruction.  This offset is stored in the last 4 bytes of the 5
@@ -1913,6 +1964,24 @@ void StoreIC::GenerateNormal(MacroAssembler* masm) {
 }
 
 
+void StoreIC::GenerateGlobalProxy(MacroAssembler* masm) {
+  // ----------- S t a t e -------------
+  //  -- eax    : value
+  //  -- ecx    : name
+  //  -- edx    : receiver
+  //  -- esp[0] : return address
+  // -----------------------------------
+  __ pop(ebx);
+  __ push(edx);
+  __ push(ecx);
+  __ push(eax);
+  __ push(ebx);
+
+  // Do tail-call to runtime routine.
+  __ TailCallRuntime(Runtime::kSetProperty, 3, 1);
+}
+
+
 // Defined in ic.cc.
 Object* KeyedStoreIC_Miss(Arguments args);
 
@@ -1954,7 +2023,57 @@ void KeyedStoreIC::GenerateMiss(MacroAssembler* masm) {
   __ TailCallExternalReference(ref, 3, 1);
 }
 
+
 #undef __
+
+
+Condition CompareIC::ComputeCondition(Token::Value op) {
+  switch (op) {
+    case Token::EQ_STRICT:
+    case Token::EQ:
+      return equal;
+    case Token::LT:
+      return less;
+    case Token::GT:
+      // Reverse left and right operands to obtain ECMA-262 conversion order.
+      return less;
+    case Token::LTE:
+      // Reverse left and right operands to obtain ECMA-262 conversion order.
+      return greater_equal;
+    case Token::GTE:
+      return greater_equal;
+    default:
+      UNREACHABLE();
+      return no_condition;
+  }
+}
+
+
+void CompareIC::UpdateCaches(Handle<Object> x, Handle<Object> y) {
+  HandleScope scope;
+  Handle<Code> rewritten;
+#ifdef DEBUG
+  State previous_state = GetState();
+#endif
+  State state = TargetState(x, y);
+  if (state == GENERIC) {
+    CompareStub stub(GetCondition(), strict(), NO_COMPARE_FLAGS);
+    rewritten = stub.GetCode();
+  } else {
+    ICCompareStub stub(op_, state);
+    rewritten = stub.GetCode();
+  }
+  set_target(*rewritten);
+
+#ifdef DEBUG
+  if (FLAG_trace_ic) {
+    PrintF("[CompareIC (%s->%s)#%s]\n",
+           GetStateName(previous_state),
+           GetStateName(state),
+           Token::Name(op_));
+  }
+#endif
+}
 
 
 } }  // namespace v8::internal

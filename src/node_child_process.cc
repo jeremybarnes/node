@@ -13,7 +13,12 @@
 #include <sys/wait.h>
 #endif
 
+# ifdef __APPLE__
+# include <crt_externs.h>
+# define environ (*_NSGetEnviron())
+# else
 extern char **environ;
+# endif
 
 namespace node {
 
@@ -29,6 +34,16 @@ static inline int SetNonBlocking(int fd) {
   int r = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   if (r != 0) {
     perror("SetNonBlocking()");
+  }
+  return r;
+}
+
+
+static inline int SetCloseOnExec(int fd) {
+  int flags = fcntl(fd, F_GETFD, 0);
+  int r = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+  if (r != 0) {
+    perror("SetCloseOnExec()");
   }
   return r;
 }
@@ -136,6 +151,8 @@ Handle<Value> ChildProcess::Spawn(const Arguments& args) {
   for (i = 0; i < argv_length; i++) free(argv[i]);
   delete [] argv;
 
+  free(cwd);
+
   for (i = 0; i < envc; i++) free(env[i]);
   delete [] env;
 
@@ -211,11 +228,27 @@ int ChildProcess::Spawn(const char *file,
   int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
 
   /* An implementation of popen(), basically */
-  if (custom_fds[0] == -1 && pipe(stdin_pipe) < 0 ||
-      custom_fds[1] == -1 && pipe(stdout_pipe) < 0 ||
-      custom_fds[2] == -1 && pipe(stderr_pipe) < 0) {
+  if ((custom_fds[0] == -1 && pipe(stdin_pipe) < 0) ||
+      (custom_fds[1] == -1 && pipe(stdout_pipe) < 0) ||
+      (custom_fds[2] == -1 && pipe(stderr_pipe) < 0)) {
     perror("pipe()");
     return -1;
+  }
+
+  // Set the close-on-exec FD flag
+  if (custom_fds[0] == -1) {
+    SetCloseOnExec(stdin_pipe[0]);
+    SetCloseOnExec(stdin_pipe[1]);
+  }
+
+  if (custom_fds[1] == -1) {
+    SetCloseOnExec(stdout_pipe[0]);
+    SetCloseOnExec(stdout_pipe[1]);
+  }
+
+  if (custom_fds[2] == -1) {
+    SetCloseOnExec(stderr_pipe[0]);
+    SetCloseOnExec(stderr_pipe[1]);
   }
 
   // Save environ in the case that we get it clobbered

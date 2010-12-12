@@ -35,6 +35,7 @@
 #include "v8.h"
 
 #include "platform.h"
+#include "vm-state-inl.h"
 
 
 namespace v8 {
@@ -236,6 +237,11 @@ OS::MemoryMappedFile* OS::MemoryMappedFile::create(const char* name, int size,
 
 
 void OS::LogSharedLibraryAddresses() {
+  UNIMPLEMENTED();
+}
+
+
+void OS::SignalCodeMovingGC() {
   UNIMPLEMENTED();
 }
 

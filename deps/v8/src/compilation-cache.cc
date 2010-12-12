@@ -86,6 +86,9 @@ class CompilationSubCache {
   // Clear this sub-cache evicting all its content.
   void Clear();
 
+  // Remove given shared function info from sub-cache.
+  void Remove(Handle<SharedFunctionInfo> function_info);
+
   // Number of generations in this sub-cache.
   inline int generations() { return generations_; }
 
@@ -110,6 +113,9 @@ class CompilationCacheScript : public CompilationSubCache {
   void Put(Handle<String> source, Handle<SharedFunctionInfo> function_info);
 
  private:
+  MUST_USE_RESULT MaybeObject* TryTablePut(
+      Handle<String> source, Handle<SharedFunctionInfo> function_info);
+
   // Note: Returns a new hash table if operation results in expansion.
   Handle<CompilationCacheTable> TablePut(
       Handle<String> source, Handle<SharedFunctionInfo> function_info);
@@ -137,6 +143,12 @@ class CompilationCacheEval: public CompilationSubCache {
            Handle<SharedFunctionInfo> function_info);
 
  private:
+  MUST_USE_RESULT MaybeObject* TryTablePut(
+      Handle<String> source,
+      Handle<Context> context,
+      Handle<SharedFunctionInfo> function_info);
+
+
   // Note: Returns a new hash table if operation results in expansion.
   Handle<CompilationCacheTable> TablePut(
       Handle<String> source,
@@ -159,6 +171,10 @@ class CompilationCacheRegExp: public CompilationSubCache {
            JSRegExp::Flags flags,
            Handle<FixedArray> data);
  private:
+  MUST_USE_RESULT MaybeObject* TryTablePut(Handle<String> source,
+                                           JSRegExp::Flags flags,
+                                           Handle<FixedArray> data);
+
   // Note: Returns a new hash table if operation results in expansion.
   Handle<CompilationCacheTable> TablePut(Handle<String> source,
                                          JSRegExp::Flags flags,
@@ -233,6 +249,18 @@ void CompilationSubCache::Iterate(ObjectVisitor* v) {
 
 void CompilationSubCache::Clear() {
   MemsetPointer(tables_, Heap::undefined_value(), generations_);
+}
+
+
+void CompilationSubCache::Remove(Handle<SharedFunctionInfo> function_info) {
+  // Probe the script generation tables. Make sure not to leak handles
+  // into the caller's handle scope.
+  { HandleScope scope;
+    for (int generation = 0; generation < generations(); generation++) {
+      Handle<CompilationCacheTable> table = GetTable(generation);
+      table->Remove(*function_info);
+    }
+  }
 }
 
 
@@ -320,11 +348,18 @@ Handle<SharedFunctionInfo> CompilationCacheScript::Lookup(Handle<String> source,
 }
 
 
+MaybeObject* CompilationCacheScript::TryTablePut(
+    Handle<String> source,
+    Handle<SharedFunctionInfo> function_info) {
+  Handle<CompilationCacheTable> table = GetFirstTable();
+  return table->Put(*source, *function_info);
+}
+
+
 Handle<CompilationCacheTable> CompilationCacheScript::TablePut(
     Handle<String> source,
     Handle<SharedFunctionInfo> function_info) {
-  CALL_HEAP_FUNCTION(GetFirstTable()->Put(*source, *function_info),
-                     CompilationCacheTable);
+  CALL_HEAP_FUNCTION(TryTablePut(source, function_info), CompilationCacheTable);
 }
 
 
@@ -366,13 +401,20 @@ Handle<SharedFunctionInfo> CompilationCacheEval::Lookup(
 }
 
 
+MaybeObject* CompilationCacheEval::TryTablePut(
+    Handle<String> source,
+    Handle<Context> context,
+    Handle<SharedFunctionInfo> function_info) {
+  Handle<CompilationCacheTable> table = GetFirstTable();
+  return table->PutEval(*source, *context, *function_info);
+}
+
+
 Handle<CompilationCacheTable> CompilationCacheEval::TablePut(
     Handle<String> source,
     Handle<Context> context,
     Handle<SharedFunctionInfo> function_info) {
-  CALL_HEAP_FUNCTION(GetFirstTable()->PutEval(*source,
-                                              *context,
-                                              *function_info),
+  CALL_HEAP_FUNCTION(TryTablePut(source, context, function_info),
                      CompilationCacheTable);
 }
 
@@ -415,12 +457,20 @@ Handle<FixedArray> CompilationCacheRegExp::Lookup(Handle<String> source,
 }
 
 
+MaybeObject* CompilationCacheRegExp::TryTablePut(
+    Handle<String> source,
+    JSRegExp::Flags flags,
+    Handle<FixedArray> data) {
+  Handle<CompilationCacheTable> table = GetFirstTable();
+  return table->PutRegExp(*source, flags, *data);
+}
+
+
 Handle<CompilationCacheTable> CompilationCacheRegExp::TablePut(
     Handle<String> source,
     JSRegExp::Flags flags,
     Handle<FixedArray> data) {
-  CALL_HEAP_FUNCTION(GetFirstTable()->PutRegExp(*source, flags, *data),
-                     CompilationCacheTable);
+  CALL_HEAP_FUNCTION(TryTablePut(source, flags, data), CompilationCacheTable);
 }
 
 
@@ -429,6 +479,15 @@ void CompilationCacheRegExp::Put(Handle<String> source,
                                  Handle<FixedArray> data) {
   HandleScope scope;
   SetFirstTable(TablePut(source, flags, data));
+}
+
+
+void CompilationCache::Remove(Handle<SharedFunctionInfo> function_info) {
+  if (!IsEnabled()) return;
+
+  eval_global.Remove(function_info);
+  eval_contextual.Remove(function_info);
+  script.Remove(function_info);
 }
 
 
@@ -507,6 +566,45 @@ void CompilationCache::PutRegExp(Handle<String> source,
   }
 
   reg_exp.Put(source, flags, data);
+}
+
+
+static bool SourceHashCompare(void* key1, void* key2) {
+  return key1 == key2;
+}
+
+
+static HashMap* EagerOptimizingSet() {
+  static HashMap map(&SourceHashCompare);
+  return &map;
+}
+
+
+bool CompilationCache::ShouldOptimizeEagerly(Handle<JSFunction> function) {
+  if (FLAG_opt_eagerly) return true;
+  uint32_t hash = function->SourceHash();
+  void* key = reinterpret_cast<void*>(hash);
+  return EagerOptimizingSet()->Lookup(key, hash, false) != NULL;
+}
+
+
+void CompilationCache::MarkForEagerOptimizing(Handle<JSFunction> function) {
+  uint32_t hash = function->SourceHash();
+  void* key = reinterpret_cast<void*>(hash);
+  EagerOptimizingSet()->Lookup(key, hash, true);
+}
+
+
+void CompilationCache::MarkForLazyOptimizing(Handle<JSFunction> function) {
+  uint32_t hash = function->SourceHash();
+  void* key = reinterpret_cast<void*>(hash);
+  EagerOptimizingSet()->Remove(key, hash);
+}
+
+
+void CompilationCache::ResetEagerOptimizingData() {
+  HashMap* set = EagerOptimizingSet();
+  if (set->occupancy() > 0) set->Clear();
 }
 
 

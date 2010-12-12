@@ -37,17 +37,13 @@ namespace v8 {
 namespace internal {
 
 
-StackFrame::Type ExitFrame::GetStateForFramePointer(Address fp, State* state) {
-  if (fp == 0) return NONE;
-  // Compute frame type and stack pointer.
+Address ExitFrame::ComputeStackPointer(Address fp) {
+  Address marker = Memory::Address_at(fp + ExitFrameConstants::kMarkerOffset);
   Address sp = fp + ExitFrameConstants::kSPOffset;
-
-  // Fill in the state.
-  state->sp = sp;
-  state->fp = fp;
-  state->pc_address = reinterpret_cast<Address*>(sp - 1 * kPointerSize);
-  ASSERT(*state->pc_address != NULL);
-  return EXIT;
+  if (marker == NULL) {
+    sp -= DwVfpRegister::kNumRegisters * kDoubleSize + 2 * kPointerSize;
+  }
+  return sp;
 }
 
 

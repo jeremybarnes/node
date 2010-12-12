@@ -27,8 +27,12 @@
 
 #include "v8.h"
 
+#include "ast.h"
+#include "deoptimizer.h"
 #include "frames-inl.h"
+#include "full-codegen.h"
 #include "mark-compact.h"
+#include "safepoint-table.h"
 #include "scopeinfo.h"
 #include "string-stream.h"
 #include "top.h"
@@ -143,8 +147,8 @@ void StackFrameIterator::Reset() {
     state.pc_address =
         reinterpret_cast<Address*>(StandardFrame::ComputePCAddress(fp_));
     type = StackFrame::ComputeType(&state);
-    if (SingletonFor(type) == NULL) return;
   }
+  if (SingletonFor(type) == NULL) return;
   frame_ = SingletonFor(type, &state);
 }
 
@@ -203,17 +207,36 @@ bool StackTraceFrameIterator::IsValidFrame() {
 // -------------------------------------------------------------------------
 
 
+bool SafeStackFrameIterator::ExitFrameValidator::IsValidFP(Address fp) {
+  if (!validator_.IsValid(fp)) return false;
+  Address sp = ExitFrame::ComputeStackPointer(fp);
+  if (!validator_.IsValid(sp)) return false;
+  StackFrame::State state;
+  ExitFrame::FillState(fp, sp, &state);
+  if (!validator_.IsValid(reinterpret_cast<Address>(state.pc_address))) {
+    return false;
+  }
+  return *state.pc_address != NULL;
+}
+
+
 SafeStackFrameIterator::SafeStackFrameIterator(
     Address fp, Address sp, Address low_bound, Address high_bound) :
-    maintainer_(), low_bound_(low_bound), high_bound_(high_bound),
-    is_valid_top_(
-        IsWithinBounds(low_bound, high_bound,
-                       Top::c_entry_fp(Top::GetCurrentThread())) &&
-        Top::handler(Top::GetCurrentThread()) != NULL),
+    maintainer_(),
+    stack_validator_(low_bound, high_bound),
+    is_valid_top_(IsValidTop(low_bound, high_bound)),
     is_valid_fp_(IsWithinBounds(low_bound, high_bound, fp)),
     is_working_iterator_(is_valid_top_ || is_valid_fp_),
     iteration_done_(!is_working_iterator_),
     iterator_(is_valid_top_, is_valid_fp_ ? fp : NULL, sp) {
+}
+
+
+bool SafeStackFrameIterator::IsValidTop(Address low_bound, Address high_bound) {
+  Address fp = Top::c_entry_fp(Top::GetCurrentThread());
+  ExitFrameValidator validator(low_bound, high_bound);
+  if (!validator.IsValidFP(fp)) return false;
+  return Top::handler(Top::GetCurrentThread()) != NULL;
 }
 
 
@@ -258,9 +281,8 @@ bool SafeStackFrameIterator::IsValidCaller(StackFrame* frame) {
     // sure that caller FP address is valid.
     Address caller_fp = Memory::Address_at(
         frame->fp() + EntryFrameConstants::kCallerFPOffset);
-    if (!IsValidStackAddress(caller_fp)) {
-      return false;
-    }
+    ExitFrameValidator validator(stack_validator_);
+    if (!validator.IsValidFP(caller_fp)) return false;
   } else if (frame->is_arguments_adaptor()) {
     // See ArgumentsAdaptorFrame::GetCallerStackPointer. It assumes that
     // the number of arguments is stored on stack as Smi. We need to check
@@ -306,10 +328,32 @@ void SafeStackTraceFrameIterator::Advance() {
 #endif
 
 
+Code* StackFrame::GetSafepointData(Address pc,
+                                   uint8_t** safepoint_entry,
+                                   unsigned* stack_slots) {
+  PcToCodeCache::PcToCodeCacheEntry* entry = PcToCodeCache::GetCacheEntry(pc);
+  uint8_t* cached_safepoint_entry = entry->safepoint_entry;
+  if (cached_safepoint_entry == NULL) {
+    cached_safepoint_entry = entry->code->GetSafepointEntry(pc);
+    ASSERT(cached_safepoint_entry != NULL);  // No safepoint found.
+    entry->safepoint_entry = cached_safepoint_entry;
+  } else {
+    ASSERT(cached_safepoint_entry == entry->code->GetSafepointEntry(pc));
+  }
+
+  // Fill in the results and return the code.
+  Code* code = entry->code;
+  *safepoint_entry = cached_safepoint_entry;
+  *stack_slots = code->stack_slots();
+  return code;
+}
+
+
 bool StackFrame::HasHandler() const {
   StackHandlerIterator it(this, top_handler());
   return !it.done();
 }
+
 
 void StackFrame::IteratePc(ObjectVisitor* v,
                            Address* pc_address,
@@ -337,7 +381,16 @@ StackFrame::Type StackFrame::ComputeType(State* state) {
   // really the function.
   const int offset = StandardFrameConstants::kMarkerOffset;
   Object* marker = Memory::Object_at(state->fp + offset);
-  if (!marker->IsSmi()) return JAVA_SCRIPT;
+  if (!marker->IsSmi()) {
+    // If we're using a "safe" stack iterator, we treat optimized
+    // frames as normal JavaScript frames to avoid having to look
+    // into the heap to determine the state. This is safe as long
+    // as nobody tries to GC...
+    if (SafeStackFrameIterator::is_active()) return JAVA_SCRIPT;
+    Code::Kind kind = GetContainingCode(*(state->pc_address))->kind();
+    ASSERT(kind == Code::FUNCTION || kind == Code::OPTIMIZED_FUNCTION);
+    return (kind == Code::OPTIMIZED_FUNCTION) ? OPTIMIZED : JAVA_SCRIPT;
+  }
   return static_cast<StackFrame::Type>(Smi::cast(marker)->value());
 }
 
@@ -415,6 +468,22 @@ Address ExitFrame::GetCallerStackPointer() const {
 }
 
 
+StackFrame::Type ExitFrame::GetStateForFramePointer(Address fp, State* state) {
+  if (fp == 0) return NONE;
+  Address sp = ComputeStackPointer(fp);
+  FillState(fp, sp, state);
+  ASSERT(*state->pc_address != NULL);
+  return EXIT;
+}
+
+
+void ExitFrame::FillState(Address fp, Address sp, State* state) {
+  state->sp = sp;
+  state->fp = fp;
+  state->pc_address = reinterpret_cast<Address*>(sp - 1 * kPointerSize);
+}
+
+
 Address StandardFrame::GetExpressionAddress(int n) const {
   const int offset = StandardFrameConstants::kExpressionsOffset;
   return fp() + offset - n * kPointerSize;
@@ -451,6 +520,70 @@ bool StandardFrame::IsExpressionInsideHandler(int n) const {
     if (it.handler()->includes(address)) return true;
   }
   return false;
+}
+
+
+void OptimizedFrame::Iterate(ObjectVisitor* v) const {
+#ifdef DEBUG
+  // Make sure that optimized frames do not contain any stack handlers.
+  StackHandlerIterator it(this, top_handler());
+  ASSERT(it.done());
+#endif
+
+  // Make sure that we're not doing "safe" stack frame iteration. We cannot
+  // possibly find pointers in optimized frames in that state.
+  ASSERT(!SafeStackFrameIterator::is_active());
+
+  // Compute the safepoint information.
+  unsigned stack_slots = 0;
+  uint8_t* safepoint_entry = NULL;
+  Code* code = StackFrame::GetSafepointData(
+      pc(), &safepoint_entry, &stack_slots);
+  unsigned slot_space = stack_slots * kPointerSize;
+
+  // Visit the outgoing parameters. This is usually dealt with by the
+  // callee, but while GC'ing we artificially lower the number of
+  // arguments to zero and let the caller deal with it.
+  Object** parameters_base = &Memory::Object_at(sp());
+  Object** parameters_limit = &Memory::Object_at(
+      fp() + JavaScriptFrameConstants::kFunctionOffset - slot_space);
+
+  // Visit the registers that contain pointers if any.
+  if (SafepointTable::HasRegisters(safepoint_entry)) {
+    for (int i = kNumSafepointRegisters - 1; i >=0; i--) {
+      if (SafepointTable::HasRegisterAt(safepoint_entry, i)) {
+        int reg_stack_index = MacroAssembler::SafepointRegisterStackIndex(i);
+        v->VisitPointer(parameters_base + reg_stack_index);
+      }
+    }
+    // Skip the words containing the register values.
+    parameters_base += kNumSafepointRegisters;
+  }
+
+  // We're done dealing with the register bits.
+  safepoint_entry += kNumSafepointRegisters >> kBitsPerByteLog2;
+
+  // Visit the rest of the parameters.
+  v->VisitPointers(parameters_base, parameters_limit);
+
+  // Visit pointer spill slots and locals.
+  for (unsigned index = 0; index < stack_slots; index++) {
+    int byte_index = index >> kBitsPerByteLog2;
+    int bit_index = index & (kBitsPerByte - 1);
+    if ((safepoint_entry[byte_index] & (1U << bit_index)) != 0) {
+      v->VisitPointer(parameters_limit + index);
+    }
+  }
+
+  // Visit the context and the function.
+  Object** fixed_base = &Memory::Object_at(
+      fp() + JavaScriptFrameConstants::kFunctionOffset);
+  Object** fixed_limit = &Memory::Object_at(fp());
+  v->VisitPointers(fixed_base, fixed_limit);
+
+  // Visit the return address in the callee and incoming arguments.
+  IteratePc(v, pc_address(), code);
+  IterateArguments(v);
 }
 
 
@@ -510,6 +643,185 @@ Address JavaScriptFrame::GetCallerStackPointer() const {
   }
   const int offset = StandardFrameConstants::kCallerSPOffset;
   return fp() + offset + (arguments * kPointerSize);
+}
+
+
+void JavaScriptFrame::GetFunctions(List<JSFunction*>* functions) {
+  ASSERT(functions->length() == 0);
+  functions->Add(JSFunction::cast(function()));
+}
+
+
+void JavaScriptFrame::Summarize(List<FrameSummary>* functions) {
+  ASSERT(functions->length() == 0);
+  Code* code_pointer = code();
+  int offset = static_cast<int>(pc() - code_pointer->address());
+  FrameSummary summary(receiver(),
+                       JSFunction::cast(function()),
+                       code_pointer,
+                       offset,
+                       IsConstructor());
+  functions->Add(summary);
+}
+
+
+void FrameSummary::Print() {
+  PrintF("receiver: ");
+  receiver_->ShortPrint();
+  PrintF("\nfunction: ");
+  function_->shared()->DebugName()->ShortPrint();
+  PrintF("\ncode: ");
+  code_->ShortPrint();
+  if (code_->kind() == Code::FUNCTION) PrintF(" NON-OPT");
+  if (code_->kind() == Code::OPTIMIZED_FUNCTION) PrintF(" OPT");
+  PrintF("\npc: %d\n", offset_);
+}
+
+
+void OptimizedFrame::Summarize(List<FrameSummary>* frames) {
+  ASSERT(frames->length() == 0);
+  ASSERT(is_optimized());
+
+  int deopt_index = AstNode::kNoNumber;
+  DeoptimizationInputData* data = GetDeoptimizationData(&deopt_index);
+
+  // BUG(3243555): Since we don't have a lazy-deopt registered at
+  // throw-statements, we can't use the translation at the call-site of
+  // throw. An entry with no deoptimization index indicates a call-site
+  // without a lazy-deopt. As a consequence we are not allowed to inline
+  // functions containing throw.
+  if (deopt_index == Safepoint::kNoDeoptimizationIndex) {
+    JavaScriptFrame::Summarize(frames);
+    return;
+  }
+
+  TranslationIterator it(data->TranslationByteArray(),
+                         data->TranslationIndex(deopt_index)->value());
+  Translation::Opcode opcode = static_cast<Translation::Opcode>(it.Next());
+  ASSERT(opcode == Translation::BEGIN);
+  int frame_count = it.Next();
+
+  // We create the summary in reverse order because the frames
+  // in the deoptimization translation are ordered bottom-to-top.
+  int i = frame_count;
+  while (i > 0) {
+    opcode = static_cast<Translation::Opcode>(it.Next());
+    if (opcode == Translation::FRAME) {
+      // We don't inline constructor calls, so only the first, outermost
+      // frame can be a constructor frame in case of inlining.
+      bool is_constructor = (i == frame_count) && IsConstructor();
+
+      i--;
+      int ast_id = it.Next();
+      int function_id = it.Next();
+      it.Next();  // Skip height.
+      JSFunction* function =
+          JSFunction::cast(data->LiteralArray()->get(function_id));
+
+      // The translation commands are ordered and the receiver is always
+      // at the first position. Since we are always at a call when we need
+      // to construct a stack trace, the receiver is always in a stack slot.
+      opcode = static_cast<Translation::Opcode>(it.Next());
+      ASSERT(opcode == Translation::STACK_SLOT);
+      int input_slot_index = it.Next();
+
+      // Get the correct receiver in the optimized frame.
+      Object* receiver = NULL;
+      // Positive index means the value is spilled to the locals area. Negative
+      // means it is stored in the incoming parameter area.
+      if (input_slot_index >= 0) {
+        receiver = GetExpression(input_slot_index);
+      } else {
+        // Index -1 overlaps with last parameter, -n with the first parameter,
+        // (-n - 1) with the receiver with n being the number of parameters
+        // of the outermost, optimized frame.
+        int parameter_count = ComputeParametersCount();
+        int parameter_index = input_slot_index + parameter_count;
+        receiver = (parameter_index == -1)
+            ? this->receiver()
+            : this->GetParameter(parameter_index);
+      }
+
+      Code* code = function->shared()->code();
+      DeoptimizationOutputData* output_data =
+          DeoptimizationOutputData::cast(code->deoptimization_data());
+      unsigned entry = Deoptimizer::GetOutputInfo(output_data,
+                                                  ast_id,
+                                                  function->shared());
+      unsigned pc_offset =
+          FullCodeGenerator::PcField::decode(entry) + Code::kHeaderSize;
+      ASSERT(pc_offset > 0);
+
+      FrameSummary summary(receiver, function, code, pc_offset, is_constructor);
+      frames->Add(summary);
+    } else {
+      // Skip over operands to advance to the next opcode.
+      it.Skip(Translation::NumberOfOperandsFor(opcode));
+    }
+  }
+}
+
+
+DeoptimizationInputData* OptimizedFrame::GetDeoptimizationData(
+    int* deopt_index) {
+  ASSERT(is_optimized());
+
+  JSFunction* opt_function = JSFunction::cast(function());
+  Code* code = opt_function->code();
+
+  // The code object may have been replaced by lazy deoptimization. Fall
+  // back to a slow search in this case to find the original optimized
+  // code object.
+  if (!code->contains(pc())) {
+    code = PcToCodeCache::GcSafeFindCodeForPc(pc());
+  }
+  ASSERT(code != NULL);
+  ASSERT(code->kind() == Code::OPTIMIZED_FUNCTION);
+
+  SafepointTable table(code);
+  unsigned pc_offset = static_cast<unsigned>(pc() - code->instruction_start());
+  for (unsigned i = 0; i < table.length(); i++) {
+    if (table.GetPcOffset(i) == pc_offset) {
+      *deopt_index = table.GetDeoptimizationIndex(i);
+      break;
+    }
+  }
+  ASSERT(*deopt_index != AstNode::kNoNumber);
+
+  return DeoptimizationInputData::cast(code->deoptimization_data());
+}
+
+
+void OptimizedFrame::GetFunctions(List<JSFunction*>* functions) {
+  ASSERT(functions->length() == 0);
+  ASSERT(is_optimized());
+
+  int deopt_index = AstNode::kNoNumber;
+  DeoptimizationInputData* data = GetDeoptimizationData(&deopt_index);
+
+  TranslationIterator it(data->TranslationByteArray(),
+                         data->TranslationIndex(deopt_index)->value());
+  Translation::Opcode opcode = static_cast<Translation::Opcode>(it.Next());
+  ASSERT(opcode == Translation::BEGIN);
+  int frame_count = it.Next();
+
+  // We insert the frames in reverse order because the frames
+  // in the deoptimization translation are ordered bottom-to-top.
+  while (frame_count > 0) {
+    opcode = static_cast<Translation::Opcode>(it.Next());
+    if (opcode == Translation::FRAME) {
+      frame_count--;
+      it.Next();  // Skip ast id.
+      int function_id = it.Next();
+      it.Next();  // Skip height.
+      JSFunction* function =
+          JSFunction::cast(data->LiteralArray()->get(function_id));
+      functions->Add(function);
+    } else {
+      // Skip over operands to advance to the next opcode.
+      it.Skip(Translation::NumberOfOperandsFor(opcode));
+    }
+  }
 }
 
 
@@ -755,7 +1067,11 @@ void StandardFrame::IterateExpressions(ObjectVisitor* v) const {
 void JavaScriptFrame::Iterate(ObjectVisitor* v) const {
   IterateExpressions(v);
   IteratePc(v, pc_address(), code());
+  IterateArguments(v);
+}
 
+
+void JavaScriptFrame::IterateArguments(ObjectVisitor* v) const {
   // Traverse callee-saved registers, receiver, and parameters.
   const int kBaseOffset = JavaScriptFrameConstants::kSavedRegistersOffset;
   const int kLimitOffset = JavaScriptFrameConstants::kReceiverOffset;
@@ -817,6 +1133,7 @@ Code* PcToCodeCache::GcSafeFindCodeForPc(Address pc) {
   }
 }
 
+
 PcToCodeCache::PcToCodeCacheEntry* PcToCodeCache::GetCacheEntry(Address pc) {
   Counters::pc_to_code.Increment();
   ASSERT(IsPowerOf2(kPcToCodeCacheSize));
@@ -833,6 +1150,7 @@ PcToCodeCache::PcToCodeCacheEntry* PcToCodeCache::GetCacheEntry(Address pc) {
     // been set. Otherwise, we risk trying to use a cache entry before
     // the code has been computed.
     entry->code = GcSafeFindCodeForPc(pc);
+    entry->safepoint_entry = NULL;
     entry->pc = pc;
   }
   return entry;

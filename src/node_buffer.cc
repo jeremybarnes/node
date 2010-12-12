@@ -82,47 +82,56 @@ static size_t ByteLength (Handle<String> string, enum encoding enc) {
 }
 
 
-Buffer* Buffer::New(size_t size) {
+Handle<Object> Buffer::New(Handle<String> string) {
   HandleScope scope;
 
-  Local<Value> arg = Integer::NewFromUnsigned(size);
+  // get Buffer from global scope.
+  Local<Object> global = v8::Context::GetCurrent()->Global();
+  Local<Value> bv = global->Get(String::NewSymbol("Buffer"));
+  assert(bv->IsFunction());
+  Local<Function> b = Local<Function>::Cast(bv);
+
+  Local<Value> argv[1] = { Local<Value>::New(string) };
+  Local<Object> instance = b->NewInstance(1, argv);
+
+  return scope.Close(instance);
+}
+
+
+Buffer* Buffer::New(size_t length) {
+  HandleScope scope;
+
+  Local<Value> arg = Integer::NewFromUnsigned(length);
   Local<Object> b = constructor_template->GetFunction()->NewInstance(1, &arg);
 
   return ObjectWrap::Unwrap<Buffer>(b);
 }
 
 
-char* Buffer::Data(Handle<Object> obj) {
-  if (obj->HasIndexedPropertiesInPixelData()) {
-    return (char*)obj->GetIndexedPropertiesPixelData();
-  }
-
+Buffer* Buffer::New(char* data, size_t length) {
   HandleScope scope;
 
-  // Return true for "SlowBuffer"
-  if (constructor_template->HasInstance(obj)) {
-    return ObjectWrap::Unwrap<Buffer>(obj)->data();
-  }
+  Local<Value> arg = Integer::NewFromUnsigned(0);
+  Local<Object> obj = constructor_template->GetFunction()->NewInstance(1, &arg);
 
-  // Not a buffer.
-  return NULL;
+  Buffer *buffer = ObjectWrap::Unwrap<Buffer>(obj);
+  buffer->Replace(data, length, NULL, NULL);
+
+  return buffer;
 }
 
 
-size_t Buffer::Length(Handle<Object> obj) {
-  if (obj->HasIndexedPropertiesInPixelData()) {
-    return (size_t)obj->GetIndexedPropertiesPixelDataLength();
-  }
-
+Buffer* Buffer::New(char *data, size_t length,
+                    free_callback callback, void *hint) {
   HandleScope scope;
 
-  // Return true for "SlowBuffer"
-  if (constructor_template->HasInstance(obj)) {
-    return ObjectWrap::Unwrap<Buffer>(obj)->length();
-  }
+  Local<Value> arg = Integer::NewFromUnsigned(0);
+  Local<Object> obj = constructor_template->GetFunction()->NewInstance(1, &arg);
 
-  // Not a buffer.
-  return 0;
+  Buffer *buffer = ObjectWrap::Unwrap<Buffer>(obj);
+  buffer->Replace(data, length, callback, hint);
+
+  return buffer;
 }
 
 
@@ -137,40 +146,59 @@ Handle<Value> Buffer::New(const Arguments &args) {
   if (args[0]->IsInt32()) {
     // var buffer = new Buffer(1024);
     size_t length = args[0]->Uint32Value();
-    buffer = new Buffer(length);
-
+    buffer = new Buffer(args.This(), length);
   } else {
     return ThrowException(Exception::TypeError(String::New("Bad argument")));
   }
-
-  buffer->Wrap(args.This());
-  args.This()->SetIndexedPropertiesToExternalArrayData(buffer->data(),
-                                                       kExternalUnsignedByteArray,
-                                                       buffer->length());
-  args.This()->Set(length_symbol, Integer::New(buffer->length_));
-
   return args.This();
 }
 
 
-Buffer::Buffer(size_t length) : ObjectWrap() {
-  off_ = 0;
-  length_ = length;
-  data_ = new char[length_];
+Buffer::Buffer(Handle<Object> wrapper, size_t length) : ObjectWrap() {
+  Wrap(wrapper);
 
-  V8::AdjustAmountOfExternalAllocatedMemory(sizeof(Buffer) + length_);
+  length_ = 0;
+  callback_ = NULL;
+
+  Replace(NULL, length, NULL, NULL);
 }
 
 
 Buffer::~Buffer() {
-  //fprintf(stderr, "free buffer (%d refs left)\n", blob_->refs);
-  delete data_;
-  V8::AdjustAmountOfExternalAllocatedMemory(-(sizeof(Buffer) + length_));
+  Replace(NULL, 0, NULL, NULL);
 }
 
 
-char* Buffer::data() {
-  return data_;
+void Buffer::Replace(char *data, size_t length,
+                     free_callback callback, void *hint) {
+  HandleScope scope;
+
+  if (callback_) {
+    callback_(data_, callback_hint_);
+  } else if (length_) {
+    delete [] data_;
+    V8::AdjustAmountOfExternalAllocatedMemory(-(sizeof(Buffer) + length_));
+  }
+
+  length_ = length;
+  callback_ = callback;
+  callback_hint_ = hint;
+
+  if (callback_) {
+    data_ = data;
+  } else if (length_) {
+    data_ = new char[length_];
+    if (data)
+      memcpy(data_, data, length_);
+    V8::AdjustAmountOfExternalAllocatedMemory(sizeof(Buffer) + length_);
+  } else {
+    data_ = NULL;
+  }
+
+  handle_->SetIndexedPropertiesToExternalArrayData(data_,
+                                                   kExternalUnsignedByteArray,
+                                                   length_);
+  handle_->Set(length_symbol, Integer::NewFromUnsigned(length_));
 }
 
 
@@ -179,7 +207,7 @@ Handle<Value> Buffer::BinarySlice(const Arguments &args) {
   Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
   SLICE_ARGS(args[0], args[1])
 
-  char *data = parent->data() + start;
+  char *data = parent->data_ + start;
   //Local<String> string = String::New(data, end - start);
 
   Local<Value> b =  Encode(data, end - start, BINARY);
@@ -193,7 +221,7 @@ Handle<Value> Buffer::AsciiSlice(const Arguments &args) {
   Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
   SLICE_ARGS(args[0], args[1])
 
-  char* data = parent->data() + start;
+  char* data = parent->data_ + start;
   Local<String> string = String::New(data, end - start);
 
   return scope.Close(string);
@@ -204,7 +232,7 @@ Handle<Value> Buffer::Utf8Slice(const Arguments &args) {
   HandleScope scope;
   Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
   SLICE_ARGS(args[0], args[1])
-  char *data = parent->data() + start;
+  char *data = parent->data_ + start;
   Local<String> string = String::New(data, end - start);
   return scope.Close(string);
 }
@@ -213,15 +241,24 @@ static const char *base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                   "abcdefghijklmnopqrstuvwxyz"
                                   "0123456789+/";
 static const int unbase64_table[] =
-  {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-2,-1,-1,-2,-1,-1
   ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63
+  ,-2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63
   ,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1
   ,-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14
   ,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1
   ,-1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40
   ,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  ,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
   };
+#define unbase64(x) unbase64_table[(uint8_t)(x)]
 
 
 Handle<Value> Buffer::Base64Slice(const Arguments &args) {
@@ -240,10 +277,10 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
   bool b1_oob, b2_oob;
 
   while (i < end) {
-    bitbuf[0] = parent->data()[i++];
+    bitbuf[0] = parent->data_[i++];
 
     if (i < end) {
-      bitbuf[1] = parent->data()[i];
+      bitbuf[1] = parent->data_[i];
       b1_oob = false;
     }  else {
       bitbuf[1] = 0;
@@ -252,7 +289,7 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
     i++;
 
     if (i < end) {
-      bitbuf[2] = parent->data()[i];
+      bitbuf[2] = parent->data_[i];
       b2_oob = false;
     }  else {
       bitbuf[2] = 0;
@@ -263,12 +300,12 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
 
     c = bitbuf[0] >> 2;
     assert(c < 64);
-    out[j++] = base64_table[c];
+    out[j++] = base64_table[(int)c];
     assert(j < out_len);
 
     c = ((bitbuf[0] & 0x03) << 4) | (bitbuf[1] >> 4);
     assert(c < 64);
-    out[j++] = base64_table[c];
+    out[j++] = base64_table[(int)c];
     assert(j < out_len);
 
     if (b1_oob) {
@@ -276,7 +313,7 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
     } else {
       c = ((bitbuf[1] & 0x0F) << 2) | (bitbuf[2] >> 6);
       assert(c < 64);
-      out[j++] = base64_table[c];
+      out[j++] = base64_table[(int)c];
     }
     assert(j < out_len);
 
@@ -285,7 +322,7 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
     } else {
       c = bitbuf[2] & 0x3F;
       assert(c < 64);
-      out[j++]  = base64_table[c];
+      out[j++]  = base64_table[(int)c];
     }
     assert(j <= out_len);
   }
@@ -307,12 +344,14 @@ Handle<Value> Buffer::Copy(const Arguments &args) {
             "First arg should be a Buffer")));
   }
 
-  Buffer *target = ObjectWrap::Unwrap<Buffer>(args[0]->ToObject());
+  Local<Object> target = args[0]->ToObject();
+  char *target_data = Buffer::Data(target);
+  ssize_t target_length = Buffer::Length(target);
 
   ssize_t target_start = args[1]->Int32Value();
   ssize_t source_start = args[2]->Int32Value();
   ssize_t source_end = args[3]->IsInt32() ? args[3]->Int32Value()
-                                          : source->length();
+                                          : source->length_;
 
   if (source_end < source_start) {
     return ThrowException(Exception::Error(String::New(
@@ -324,29 +363,29 @@ Handle<Value> Buffer::Copy(const Arguments &args) {
     return scope.Close(Integer::New(0));
   }
 
-  if (target_start < 0 || target_start >= target->length()) {
+  if (target_start < 0 || target_start >= target_length) {
     return ThrowException(Exception::Error(String::New(
             "targetStart out of bounds")));
   }
 
-  if (source_start < 0 || source_start >= source->length()) {
+  if (source_start < 0 || source_start >= source->length_) {
     return ThrowException(Exception::Error(String::New(
             "sourceStart out of bounds")));
   }
 
-  if (source_end < 0 || source_end > source->length()) {
+  if (source_end < 0 || source_end > source->length_) {
     return ThrowException(Exception::Error(String::New(
             "sourceEnd out of bounds")));
   }
 
   ssize_t to_copy = MIN(MIN(source_end - source_start,
-                            target->length() - target_start), 
-                            source->length() - source_start);
-  
+                            target_length - target_start),
+                            source->length_ - source_start);
+
 
   // need to use slightly slower memmove is the ranges might overlap
-  memmove((void*)(target->data() + target_start),
-          (const void*)(source->data() + source_start),
+  memmove((void *)(target_data + target_start),
+          (const void*)(source->data_ + source_start),
           to_copy);
 
   return scope.Close(Integer::New(to_copy));
@@ -368,7 +407,6 @@ Handle<Value> Buffer::Utf8Write(const Arguments &args) {
   size_t offset = args[1]->Uint32Value();
 
   if (s->Length() > 0 && offset >= buffer->length_) {
-      //if (s->Utf8Length() > 0 && offset >= buffer->length_) {
     return ThrowException(Exception::TypeError(String::New(
             "Offset is out of bounds")));
   }
@@ -377,7 +415,7 @@ Handle<Value> Buffer::Utf8Write(const Arguments &args) {
                                              : args[2]->Uint32Value();
   max_length = MIN(buffer->length_ - offset, max_length);
 
-  char* p = buffer->data() + offset;
+  char* p = buffer->data_ + offset;
 
   int char_written;
 
@@ -419,7 +457,7 @@ Handle<Value> Buffer::AsciiWrite(const Arguments &args) {
                                              : args[2]->Uint32Value();
   max_length = MIN(s->Length(), MIN(buffer->length_ - offset, max_length));
 
-  char *p = buffer->data() + offset;
+  char *p = buffer->data_ + offset;
 
   int written = s->WriteAscii(p,
                               0,
@@ -428,16 +466,21 @@ Handle<Value> Buffer::AsciiWrite(const Arguments &args) {
   return scope.Close(Integer::New(written));
 }
 
+
 // var bytesWritten = buffer.base64Write(string, offset, [maxLength]);
 Handle<Value> Buffer::Base64Write(const Arguments &args) {
   HandleScope scope;
 
-  assert(unbase64_table['/'] == 63);
-  assert(unbase64_table['+'] == 62);
-  assert(unbase64_table['T'] == 19);
-  assert(unbase64_table['Z'] == 25);
-  assert(unbase64_table['t'] == 45);
-  assert(unbase64_table['z'] == 51);
+  assert(unbase64('/') == 63);
+  assert(unbase64('+') == 62);
+  assert(unbase64('T') == 19);
+  assert(unbase64('Z') == 25);
+  assert(unbase64('t') == 45);
+  assert(unbase64('z') == 51);
+
+  assert(unbase64(' ') == -2);
+  assert(unbase64('\n') == -2);
+  assert(unbase64('\r') == -2);
 
   Buffer *buffer = ObjectWrap::Unwrap<Buffer>(args.This());
 
@@ -467,29 +510,47 @@ Handle<Value> Buffer::Base64Write(const Arguments &args) {
   }
 
   char a, b, c, d;
-  char* dst = buffer->data() + offset;
+  char* start = buffer->data_ + offset;
+  char* dst = start;
   const char *src = *s;
   const char *const srcEnd = src + s.length();
 
   while (src < srcEnd) {
-    const int remaining = srcEnd - src;
-    if (remaining == 0 || *src == '=') break;
-    a = unbase64_table[*src++];
+    int remaining = srcEnd - src;
 
-    if (remaining == 1 || *src == '=') break;
-    b = unbase64_table[*src++];
+    while (unbase64(*src) < 0 && src < srcEnd) {
+      src++;
+      remaining--;
+    }
+    if (remaining == 0 || *src == '=') break;
+    a = unbase64(*src++);
+
+    while (unbase64(*src) < 0 && src < srcEnd) {
+      src++;
+      remaining--;
+    }
+    if (remaining <= 1 || *src == '=') break;
+    b = unbase64(*src++);
     *dst++ = (a << 2) | ((b & 0x30) >> 4);
 
-    if (remaining == 2 || *src == '=') break;
-    c = unbase64_table[*src++];
+    while (unbase64(*src) < 0 && src < srcEnd) {
+      src++;
+      remaining--;
+    }
+    if (remaining <= 2 || *src == '=') break;
+    c = unbase64(*src++);
     *dst++ = ((b & 0x0F) << 4) | ((c & 0x3C) >> 2);
 
-    if (remaining == 3 || *src == '=') break;
-    d = unbase64_table[*src++];
+    while (unbase64(*src) < 0 && src < srcEnd) {
+      src++;
+      remaining--;
+    }
+    if (remaining <= 3 || *src == '=') break;
+    d = unbase64(*src++);
     *dst++ = ((c & 0x03) << 6) | (d & 0x3F);
   }
 
-  return scope.Close(Integer::New(size));
+  return scope.Close(Integer::New(dst - start));
 }
 
 
@@ -512,7 +573,7 @@ Handle<Value> Buffer::BinaryWrite(const Arguments &args) {
             "Offset is out of bounds")));
   }
 
-  char *p = (char*)buffer->data() + offset;
+  char *p = (char*)buffer->data_ + offset;
 
   size_t towrite = MIN((unsigned long) s->Length(), buffer->length_ - offset);
 
@@ -545,8 +606,9 @@ Handle<Value> Buffer::MakeFastBuffer(const Arguments &args) {
   uint32_t offset = args[2]->Uint32Value();
   uint32_t length = args[3]->Uint32Value();
 
-  fast_buffer->SetIndexedPropertiesToPixelData((uint8_t*)buffer->data() + offset,
-                                               length);
+  fast_buffer->SetIndexedPropertiesToExternalArrayData(buffer->data_ + offset,
+                                                       kExternalUnsignedByteArray,
+                                                       length);
 
   return Undefined();
 }
@@ -556,10 +618,12 @@ bool Buffer::HasInstance(v8::Handle<v8::Value> val) {
   if (!val->IsObject()) return false;
   v8::Local<v8::Object> obj = val->ToObject();
 
-  if (obj->HasIndexedPropertiesInPixelData()) return true;
+  if (obj->GetIndexedPropertiesExternalArrayDataType() == kExternalUnsignedByteArray)
+    return true;
 
-  // Return true for "SlowBuffer"
-  if (constructor_template->HasInstance(obj)) return true;
+  // Also check for SlowBuffers that are empty.
+  if (constructor_template->HasInstance(obj))
+    return true;
 
   return false;
 }

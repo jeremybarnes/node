@@ -31,6 +31,7 @@ using namespace v8;
   ThrowException(Exception::TypeError(String::New("Bad argument")))
 static Persistent<String> encoding_symbol;
 static Persistent<String> errno_symbol;
+static Persistent<String> buf_symbol;
 
 // Buffer for readlink()  and other misc callers; keep this scoped at
 // file-level rather than method-level to avoid excess stack usage.
@@ -43,33 +44,31 @@ static int After(eio_req *req) {
 
   ev_unref(EV_DEFAULT_UC);
 
-  int argc = 0;
-  Local<Value> argv[6];  // 6 is the maximum number of args
+  // there is always at least one argument. "error"
+  int argc = 1;
 
-  if (req->errorno != 0) {
-    argc = 1;
-    switch (req->type) {
-      case EIO_STAT:
-      case EIO_LSTAT:
-      case EIO_LINK:
-      case EIO_UNLINK:
-      case EIO_RMDIR:
-      case EIO_RENAME:
-      case EIO_READLINK:
-      case EIO_OPEN:
-      case EIO_CHMOD:
-      case EIO_CHOWN:
-      case EIO_MKDIR:
-        argv[0] = ErrnoException(req->errorno, NULL, "", static_cast<const char*>(req->ptr1));
-        break;
-      default:
-        argv[0] = ErrnoException(req->errorno);
+  // Allocate space for two args. We may only use one depending on the case.
+  // (Feel free to increase this if you need more)
+  Local<Value> argv[2];
+
+  // NOTE: This may be needed to be changed if something returns a -1
+  // for a success, which is possible.
+  if (req->result == -1) {
+    // If the request doesn't have a path parameter set.
+    if (!req->ptr1) {
+      argv[0] = ErrnoException(req->errorno);
+    } else {
+      argv[0] = ErrnoException(req->errorno, NULL, "", static_cast<const char*>(req->ptr1));
     }
   } else {
-    // Note: the error is always given the first argument of the callback.
-    // If there is no error then then the first argument is null.
+    // error value is empty or null for non-error.
     argv[0] = Local<Value>::New(Null());
+
+    // All have at least two args now.
+    argc = 2;
+
     switch (req->type) {
+      // These all have no data to pass.
       case EIO_CLOSE:
       case EIO_RENAME:
       case EIO_UNLINK:
@@ -82,68 +81,59 @@ static int After(eio_req *req) {
       case EIO_SYMLINK:
       case EIO_CHMOD:
       case EIO_CHOWN:
-        argc = 0;
+        // These, however, don't.
+        argc = 1;
         break;
 
       case EIO_OPEN:
       case EIO_SENDFILE:
-        argc = 2;
         argv[1] = Integer::New(req->result);
         break;
 
       case EIO_WRITE:
-        argc = 2;
         argv[1] = Integer::New(req->result);
         break;
 
       case EIO_STAT:
       case EIO_LSTAT:
       case EIO_FSTAT:
-      {
-        struct stat *s = reinterpret_cast<struct stat*>(req->ptr2);
-        argc = 2;
-        argv[1] = BuildStatsObject(s);
+        {
+          struct stat *s = reinterpret_cast<struct stat*>(req->ptr2);
+          argv[1] = BuildStatsObject(s);
+        }
         break;
-      }
 
       case EIO_READLINK:
-      {
-        argc = 2;
         argv[1] = String::New(static_cast<char*>(req->ptr2), req->result);
         break;
-      }
 
       case EIO_READ:
-      {
         // Buffer interface
         argv[1] = Integer::New(req->result);
-        argc = 2;
         break;
-      }
 
       case EIO_READDIR:
-      {
-        char *namebuf = static_cast<char*>(req->ptr2);
-        int nnames = req->result;
+        {
+          char *namebuf = static_cast<char*>(req->ptr2);
+          int nnames = req->result;
 
-        Local<Array> names = Array::New(nnames);
+          Local<Array> names = Array::New(nnames);
 
-        for (int i = 0; i < nnames; i++) {
-          Local<String> name = String::New(namebuf);
-          names->Set(Integer::New(i), name);
+          for (int i = 0; i < nnames; i++) {
+            Local<String> name = String::New(namebuf);
+            names->Set(Integer::New(i), name);
 #ifndef NDEBUG
-          namebuf += strlen(namebuf);
-          assert(*namebuf == '\0');
-          namebuf += 1;
+            namebuf += strlen(namebuf);
+            assert(*namebuf == '\0');
+            namebuf += 1;
 #else
-          namebuf += strlen(namebuf) + 1;
+            namebuf += strlen(namebuf) + 1;
 #endif
-        }
+          }
 
-        argc = 2;
-        argv[1] = names;
+          argv[1] = names;
+        }
         break;
-      }
 
       default:
         assert(0 && "Unhandled eio response");
@@ -564,7 +554,7 @@ static Handle<Value> ReadDir(const Arguments& args) {
     char *name;
     int i = 0;
 
-    while (ent = readdir(dir)) {
+    while ((ent = readdir(dir))) {
       name = ent->d_name;
 
       if (name[0] != '.' || (name[1] && (name[1] != '.' || name[2]))) {
@@ -626,7 +616,7 @@ static Handle<Value> Write(const Arguments& args) {
     return ThrowException(Exception::Error(
                 String::New("Second argument needs to be a buffer")));
   }
-  
+
   Local<Object> buffer_obj = args[1]->ToObject();
   char *buffer_data = Buffer::Data(buffer_obj);
   size_t buffer_length = Buffer::Length(buffer_obj);
@@ -649,6 +639,10 @@ static Handle<Value> Write(const Arguments& args) {
   Local<Value> cb = args[5];
 
   if (cb->IsFunction()) {
+    // Grab a reference to buffer so it isn't GCed
+    Local<Object> cb_obj = cb->ToObject();
+    cb_obj->Set(buf_symbol, buffer_obj);
+
     ASYNC_CALL(write, cb, fd, buf, len, pos)
   } else {
     ssize_t written = pos < 0 ? write(fd, buf, len) : pwrite(fd, buf, len, pos);
@@ -713,6 +707,11 @@ static Handle<Value> Read(const Arguments& args) {
   cb = args[5];
 
   if (cb->IsFunction()) {
+    // Grab a reference to buffer so it isn't GCed
+    // TODO: need test coverage
+    Local<Object> cb_obj = cb->ToObject();
+    cb_obj->Set(buf_symbol, buffer_obj);
+
     ASYNC_CALL(read, cb, fd, buf, len, pos);
   } else {
     // SYNC
@@ -803,6 +802,7 @@ void File::Initialize(Handle<Object> target) {
 
   errno_symbol = NODE_PSYMBOL("errno");
   encoding_symbol = NODE_PSYMBOL("node:encoding");
+  buf_symbol = NODE_PSYMBOL("__buf");
 }
 
 void InitFs(Handle<Object> target) {

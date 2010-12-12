@@ -110,44 +110,6 @@ assertFalse(re.test("\\]"));
 assertFalse(re.test("\x03]"));  // I.e., read as \cc
 
 
-// Test that we handle \s and \S correctly inside some bizarre
-// character classes.
-re = /[\s-:]/;
-assertTrue(re.test('-'));
-assertTrue(re.test(':'));
-assertTrue(re.test(' '));
-assertTrue(re.test('\t'));
-assertTrue(re.test('\n'));
-assertFalse(re.test('a'));
-assertFalse(re.test('Z'));
-
-re = /[\S-:]/;
-assertTrue(re.test('-'));
-assertTrue(re.test(':'));
-assertFalse(re.test(' '));
-assertFalse(re.test('\t'));
-assertFalse(re.test('\n'));
-assertTrue(re.test('a'));
-assertTrue(re.test('Z'));
-
-re = /[^\s-:]/;
-assertFalse(re.test('-'));
-assertFalse(re.test(':'));
-assertFalse(re.test(' '));
-assertFalse(re.test('\t'));
-assertFalse(re.test('\n'));
-assertTrue(re.test('a'));
-assertTrue(re.test('Z'));
-
-re = /[^\S-:]/;
-assertFalse(re.test('-'));
-assertFalse(re.test(':'));
-assertTrue(re.test(' '));
-assertTrue(re.test('\t'));
-assertTrue(re.test('\n'));
-assertFalse(re.test('a'));
-assertFalse(re.test('Z'));
-
 re = /[\s]/;
 assertFalse(re.test('-'));
 assertFalse(re.test(':'));
@@ -502,3 +464,192 @@ for (var i = 0; i < 100; i++) {
   res[3] = "Glopglyf";
   assertEquals("Arglebargle", res.foobar);
 }
+
+// Test that we perform the spec required conversions in the correct order.
+var log;
+var string = "the string";
+var fakeLastIndex = { 
+      valueOf: function() { 
+        log.push("li");
+        return 0;
+      } 
+    };
+var fakeString = { 
+      toString: function() {
+        log.push("ts");
+        return string;
+      }, 
+      length: 0 
+    };
+
+var re = /str/;
+log = [];
+re.lastIndex = fakeLastIndex;
+var result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+// Again, to check if caching interferes.
+log = [];
+re.lastIndex = fakeLastIndex;
+result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+// And one more time, just to be certain.
+log = [];
+re.lastIndex = fakeLastIndex;
+result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+// Now with a global regexp, where lastIndex is actually used.
+re = /str/g;
+log = [];
+re.lastIndex = fakeLastIndex;
+var result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+// Again, to check if caching interferes.
+log = [];
+re.lastIndex = fakeLastIndex;
+result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+// And one more time, just to be certain.
+log = [];
+re.lastIndex = fakeLastIndex;
+result = re.exec(fakeString);
+assertEquals(["str"], result);
+assertEquals(["ts", "li"], log);
+
+
+// Check that properties of RegExp have the correct permissions.
+var re = /x/g;
+var desc = Object.getOwnPropertyDescriptor(re, "global");
+assertEquals(true, desc.value);
+assertEquals(false, desc.configurable);
+assertEquals(false, desc.enumerable);
+assertEquals(false, desc.writable);
+
+desc = Object.getOwnPropertyDescriptor(re, "multiline");
+assertEquals(false, desc.value);
+assertEquals(false, desc.configurable);
+assertEquals(false, desc.enumerable);
+assertEquals(false, desc.writable);
+
+desc = Object.getOwnPropertyDescriptor(re, "ignoreCase");
+assertEquals(false, desc.value);
+assertEquals(false, desc.configurable);
+assertEquals(false, desc.enumerable);
+assertEquals(false, desc.writable);
+
+desc = Object.getOwnPropertyDescriptor(re, "lastIndex");
+assertEquals(0, desc.value);
+assertEquals(false, desc.configurable);
+assertEquals(false, desc.enumerable);
+assertEquals(true, desc.writable);
+
+
+// Check that end-anchored regexps are optimized correctly.
+var re = /(?:a|bc)g$/;
+assertTrue(re.test("ag"));
+assertTrue(re.test("bcg"));
+assertTrue(re.test("abcg"));
+assertTrue(re.test("zimbag"));
+assertTrue(re.test("zimbcg"));
+
+assertFalse(re.test("g"));
+assertFalse(re.test(""));
+
+// Global regexp (non-zero start).
+var re = /(?:a|bc)g$/g;
+assertTrue(re.test("ag"));
+re.lastIndex = 1;  // Near start of string.
+assertTrue(re.test("zimbag"));
+re.lastIndex = 6;  // At end of string.
+assertFalse(re.test("zimbag"));
+re.lastIndex = 5;  // Near end of string.
+assertFalse(re.test("zimbag"));
+re.lastIndex = 4;
+assertTrue(re.test("zimbag"));
+
+// Anchored at both ends.
+var re = /^(?:a|bc)g$/g;
+assertTrue(re.test("ag"));
+re.lastIndex = 1;
+assertFalse(re.test("ag"));
+re.lastIndex = 1;
+assertFalse(re.test("zag"));
+
+// Long max_length of RegExp.
+var re = /VeryLongRegExp!{1,1000}$/;
+assertTrue(re.test("BahoolaVeryLongRegExp!!!!!!"));
+assertFalse(re.test("VeryLongRegExp"));
+assertFalse(re.test("!"));
+
+// End anchor inside disjunction.
+var re = /(?:a$|bc$)/;
+assertTrue(re.test("a"));
+assertTrue(re.test("bc"));
+assertTrue(re.test("abc"));
+assertTrue(re.test("zimzamzumba"));
+assertTrue(re.test("zimzamzumbc"));
+assertFalse(re.test("c"));
+assertFalse(re.test(""));
+
+// Only partially anchored.
+var re = /(?:a|bc$)/;
+assertTrue(re.test("a"));
+assertTrue(re.test("bc"));
+assertEquals(["a"], re.exec("abc"));
+assertEquals(4, re.exec("zimzamzumba").index);
+assertEquals(["bc"], re.exec("zimzomzumbc"));
+assertFalse(re.test("c"));
+assertFalse(re.test(""));
+
+
+function testInvalidRange(str) {
+  try {
+    RegExp(str).test("x");
+  } catch (e) {
+    return;
+  }    
+  assetUnreachable("Allowed invalid range in " + str);
+}
+
+function testValidRange(str) {
+  try { 
+    RegExp(str).test("x");
+  } catch (e) {
+    assertUnreachable("Shouldn't fail parsing: " + str + ", was: " + e);
+  }
+}
+
+testInvalidRange("[\\d-z]");
+testInvalidRange("[z-\\d]");
+testInvalidRange("[\\d-\\d]");
+testInvalidRange("[z-x]");  // Larger value first.
+testInvalidRange("[x-\\d-\\d]");
+
+testValidRange("[x-z]");
+testValidRange("[!--\d]");  // Second "-" is end of range.
+testValidRange("[\d-]");
+testValidRange("[-\d]");
+testValidRange("[-\d-]");
+testValidRange("[^-\d-]");
+testValidRange("[^-\d-]");
+testValidRange("[0-9-\w]");
+
+// Escaped dashes do not count as range operators.
+testValidRange("[\\d\\-z]");
+testValidRange("[z\\-\\d]");
+testValidRange("[\\d\\-\\d]");
+testValidRange("[z\\-x]");
+testValidRange("[x\\-\\d\\-\\d]");
+
+
+
+

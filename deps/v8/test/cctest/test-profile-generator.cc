@@ -89,6 +89,26 @@ TEST(ProfileNodeFindOrAddChild) {
 }
 
 
+TEST(ProfileNodeFindOrAddChildForSameFunction) {
+  const char* empty = "";
+  const char* aaa = "aaa";
+  ProfileNode node(NULL, NULL);
+  CodeEntry entry1(i::Logger::FUNCTION_TAG, empty, aaa, empty, 0,
+                     TokenEnumerator::kNoSecurityToken);
+  ProfileNode* childNode1 = node.FindOrAddChild(&entry1);
+  CHECK_NE(NULL, childNode1);
+  CHECK_EQ(childNode1, node.FindOrAddChild(&entry1));
+  // The same function again.
+  CodeEntry entry2(i::Logger::FUNCTION_TAG, empty, aaa, empty, 0,
+                   TokenEnumerator::kNoSecurityToken);
+  CHECK_EQ(childNode1, node.FindOrAddChild(&entry2));
+  // Now with a different security token.
+  CodeEntry entry3(i::Logger::FUNCTION_TAG, empty, aaa, empty, 0,
+                   TokenEnumerator::kNoSecurityToken + 1);
+  CHECK_EQ(childNode1, node.FindOrAddChild(&entry3));
+}
+
+
 namespace {
 
 class ProfileTreeTestHelper {
@@ -737,6 +757,10 @@ static const ProfileNode* PickChild(const ProfileNode* parent,
 
 
 TEST(RecordStackTraceAtStartProfiling) {
+  // This test does not pass with inlining enabled since inlined functions
+  // don't appear in the stack trace.
+  i::FLAG_use_inlining = false;
+
   if (env.IsEmpty()) {
     v8::HandleScope scope;
     const char* extensions[] = { "v8/profiler" };

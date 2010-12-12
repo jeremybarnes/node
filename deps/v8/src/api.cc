@@ -1,4 +1,4 @@
-// Copyright 2009 the V8 project authors. All rights reserved.
+// Copyright 2010 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,29 +28,34 @@
 #include "v8.h"
 
 #include "api.h"
+
 #include "arguments.h"
 #include "bootstrapper.h"
 #include "compiler.h"
 #include "debug.h"
+#include "deoptimizer.h"
 #include "execution.h"
 #include "global-handles.h"
 #include "heap-profiler.h"
 #include "messages.h"
+#include "parser.h"
 #include "platform.h"
 #include "profile-generator-inl.h"
+#include "runtime-profiler.h"
 #include "serialize.h"
 #include "snapshot.h"
 #include "top.h"
-#include "utils.h"
 #include "v8threads.h"
 #include "version.h"
+#include "vm-state-inl.h"
 
 #include "../include/v8-profiler.h"
+#include "../include/v8-testing.h"
 
 #define LOG_API(expr) LOG(ApiEntryCall(expr))
 
 #ifdef ENABLE_VMSTATE_TRACKING
-#define ENTER_V8 i::VMState __state__(i::OTHER)
+#define ENTER_V8 ASSERT(i::V8::IsRunning()); i::VMState __state__(i::OTHER)
 #define LEAVE_V8 i::VMState __state__(i::EXTERNAL)
 #else
 #define ENTER_V8 ((void) 0)
@@ -96,6 +101,7 @@ namespace v8 {
     }                                                                          \
   } while (false)
 
+
 // --- D a t a   t h a t   i s   s p e c i f i c   t o   a   t h r e a d ---
 
 
@@ -114,7 +120,6 @@ static void DefaultFatalErrorHandler(const char* location,
 }
 
 
-
 static FatalErrorCallback& GetFatalErrorHandler() {
   if (exception_behavior == NULL) {
     exception_behavior = DefaultFatalErrorHandler;
@@ -122,6 +127,10 @@ static FatalErrorCallback& GetFatalErrorHandler() {
   return exception_behavior;
 }
 
+
+void i::FatalProcessOutOfMemory(const char* location) {
+  i::V8::FatalProcessOutOfMemory(location, false);
+}
 
 
 // When V8 cannot allocated memory FatalProcessOutOfMemory is called.
@@ -134,27 +143,27 @@ void i::V8::FatalProcessOutOfMemory(const char* location, bool take_snapshot) {
   heap_stats.new_space_size = &new_space_size;
   int new_space_capacity;
   heap_stats.new_space_capacity = &new_space_capacity;
-  int old_pointer_space_size;
+  intptr_t old_pointer_space_size;
   heap_stats.old_pointer_space_size = &old_pointer_space_size;
-  int old_pointer_space_capacity;
+  intptr_t old_pointer_space_capacity;
   heap_stats.old_pointer_space_capacity = &old_pointer_space_capacity;
-  int old_data_space_size;
+  intptr_t old_data_space_size;
   heap_stats.old_data_space_size = &old_data_space_size;
-  int old_data_space_capacity;
+  intptr_t old_data_space_capacity;
   heap_stats.old_data_space_capacity = &old_data_space_capacity;
-  int code_space_size;
+  intptr_t code_space_size;
   heap_stats.code_space_size = &code_space_size;
-  int code_space_capacity;
+  intptr_t code_space_capacity;
   heap_stats.code_space_capacity = &code_space_capacity;
-  int map_space_size;
+  intptr_t map_space_size;
   heap_stats.map_space_size = &map_space_size;
-  int map_space_capacity;
+  intptr_t map_space_capacity;
   heap_stats.map_space_capacity = &map_space_capacity;
-  int cell_space_size;
+  intptr_t cell_space_size;
   heap_stats.cell_space_size = &cell_space_size;
-  int cell_space_capacity;
+  intptr_t cell_space_capacity;
   heap_stats.cell_space_capacity = &cell_space_capacity;
-  int lo_space_size;
+  intptr_t lo_space_size;
   heap_stats.lo_space_size = &lo_space_size;
   int global_handle_count;
   heap_stats.global_handle_count = &global_handle_count;
@@ -166,9 +175,9 @@ void i::V8::FatalProcessOutOfMemory(const char* location, bool take_snapshot) {
   heap_stats.near_death_global_handle_count = &near_death_global_handle_count;
   int destroyed_global_handle_count;
   heap_stats.destroyed_global_handle_count = &destroyed_global_handle_count;
-  int memory_allocator_size;
+  intptr_t memory_allocator_size;
   heap_stats.memory_allocator_size = &memory_allocator_size;
-  int memory_allocator_capacity;
+  intptr_t memory_allocator_capacity;
   heap_stats.memory_allocator_capacity = &memory_allocator_capacity;
   int objects_per_type[LAST_TYPE + 1] = {0};
   heap_stats.objects_per_type = objects_per_type;
@@ -392,14 +401,18 @@ v8::Handle<Boolean> False() {
 ResourceConstraints::ResourceConstraints()
   : max_young_space_size_(0),
     max_old_space_size_(0),
+    max_executable_size_(0),
     stack_limit_(NULL) { }
 
 
 bool SetResourceConstraints(ResourceConstraints* constraints) {
   int young_space_size = constraints->max_young_space_size();
   int old_gen_size = constraints->max_old_space_size();
-  if (young_space_size != 0 || old_gen_size != 0) {
-    bool result = i::Heap::ConfigureHeap(young_space_size / 2, old_gen_size);
+  int max_executable_size = constraints->max_executable_size();
+  if (young_space_size != 0 || old_gen_size != 0 || max_executable_size != 0) {
+    bool result = i::Heap::ConfigureHeap(young_space_size / 2,
+                                         old_gen_size,
+                                         max_executable_size);
     if (!result) return false;
   }
   if (constraints->stack_limit() != NULL) {
@@ -455,16 +468,34 @@ void V8::DisposeGlobal(i::Object** obj) {
 // --- H a n d l e s ---
 
 
-HandleScope::HandleScope() : is_closed_(false) {
+HandleScope::HandleScope()
+    : prev_next_(i::HandleScope::current_.next),
+      prev_limit_(i::HandleScope::current_.limit),
+      is_closed_(false) {
   API_ENTRY_CHECK("HandleScope::HandleScope");
-  i::HandleScope::Enter(&previous_);
+  i::HandleScope::current_.level++;
 }
 
 
 HandleScope::~HandleScope() {
   if (!is_closed_) {
-    i::HandleScope::Leave(&previous_);
+    Leave();
   }
+}
+
+
+void HandleScope::Leave() {
+  i::HandleScope::current_.level--;
+  ASSERT(i::HandleScope::current_.level >= 0);
+  i::HandleScope::current_.next = prev_next_;
+  if (i::HandleScope::current_.limit != prev_limit_) {
+    i::HandleScope::current_.limit = prev_limit_;
+    i::HandleScope::DeleteExtensions();
+  }
+
+#ifdef DEBUG
+  i::HandleScope::ZapRange(prev_next_, prev_limit_);
+#endif
 }
 
 
@@ -551,7 +582,7 @@ i::Object** v8::HandleScope::RawClose(i::Object** value) {
     result = *value;
   }
   is_closed_ = true;
-  i::HandleScope::Leave(&previous_);
+  Leave();
 
   if (value == NULL) {
     return NULL;
@@ -767,6 +798,12 @@ int TypeSwitch::match(v8::Handle<Value> value) {
 }
 
 
+#define SET_FIELD_WRAPPED(obj, setter, cdata) do {  \
+    i::Handle<i::Object> proxy = FromCData(cdata);  \
+    (obj)->setter(*proxy);                          \
+  } while (false)
+
+
 void FunctionTemplate::SetCallHandler(InvocationCallback callback,
                                       v8::Handle<Value> data) {
   if (IsDeadCheck("v8::FunctionTemplate::SetCallHandler()")) return;
@@ -776,7 +813,7 @@ void FunctionTemplate::SetCallHandler(InvocationCallback callback,
       i::Factory::NewStruct(i::CALL_HANDLER_INFO_TYPE);
   i::Handle<i::CallHandlerInfo> obj =
       i::Handle<i::CallHandlerInfo>::cast(struct_obj);
-  obj->set_callback(*FromCData(callback));
+  SET_FIELD_WRAPPED(obj, set_callback, callback);
   if (data.IsEmpty()) data = v8::Undefined();
   obj->set_data(*Utils::OpenHandle(*data));
   Utils::OpenHandle(this)->set_call_code(*obj);
@@ -792,8 +829,8 @@ static i::Handle<i::AccessorInfo> MakeAccessorInfo(
       v8::PropertyAttribute attributes) {
   i::Handle<i::AccessorInfo> obj = i::Factory::NewAccessorInfo();
   ASSERT(getter != NULL);
-  obj->set_getter(*FromCData(getter));
-  obj->set_setter(*FromCData(setter));
+  SET_FIELD_WRAPPED(obj, set_getter, getter);
+  SET_FIELD_WRAPPED(obj, set_setter, setter);
   if (data.IsEmpty()) data = v8::Undefined();
   obj->set_data(*Utils::OpenHandle(*data));
   obj->set_name(*Utils::OpenHandle(*name));
@@ -877,11 +914,13 @@ void FunctionTemplate::SetNamedInstancePropertyHandler(
       i::Factory::NewStruct(i::INTERCEPTOR_INFO_TYPE);
   i::Handle<i::InterceptorInfo> obj =
       i::Handle<i::InterceptorInfo>::cast(struct_obj);
-  if (getter != 0) obj->set_getter(*FromCData(getter));
-  if (setter != 0) obj->set_setter(*FromCData(setter));
-  if (query != 0) obj->set_query(*FromCData(query));
-  if (remover != 0) obj->set_deleter(*FromCData(remover));
-  if (enumerator != 0) obj->set_enumerator(*FromCData(enumerator));
+
+  if (getter != 0) SET_FIELD_WRAPPED(obj, set_getter, getter);
+  if (setter != 0) SET_FIELD_WRAPPED(obj, set_setter, setter);
+  if (query != 0) SET_FIELD_WRAPPED(obj, set_query, query);
+  if (remover != 0) SET_FIELD_WRAPPED(obj, set_deleter, remover);
+  if (enumerator != 0) SET_FIELD_WRAPPED(obj, set_enumerator, enumerator);
+
   if (data.IsEmpty()) data = v8::Undefined();
   obj->set_data(*Utils::OpenHandle(*data));
   Utils::OpenHandle(this)->set_named_property_handler(*obj);
@@ -905,11 +944,13 @@ void FunctionTemplate::SetIndexedInstancePropertyHandler(
       i::Factory::NewStruct(i::INTERCEPTOR_INFO_TYPE);
   i::Handle<i::InterceptorInfo> obj =
       i::Handle<i::InterceptorInfo>::cast(struct_obj);
-  if (getter != 0) obj->set_getter(*FromCData(getter));
-  if (setter != 0) obj->set_setter(*FromCData(setter));
-  if (query != 0) obj->set_query(*FromCData(query));
-  if (remover != 0) obj->set_deleter(*FromCData(remover));
-  if (enumerator != 0) obj->set_enumerator(*FromCData(enumerator));
+
+  if (getter != 0) SET_FIELD_WRAPPED(obj, set_getter, getter);
+  if (setter != 0) SET_FIELD_WRAPPED(obj, set_setter, setter);
+  if (query != 0) SET_FIELD_WRAPPED(obj, set_query, query);
+  if (remover != 0) SET_FIELD_WRAPPED(obj, set_deleter, remover);
+  if (enumerator != 0) SET_FIELD_WRAPPED(obj, set_enumerator, enumerator);
+
   if (data.IsEmpty()) data = v8::Undefined();
   obj->set_data(*Utils::OpenHandle(*data));
   Utils::OpenHandle(this)->set_indexed_property_handler(*obj);
@@ -928,7 +969,7 @@ void FunctionTemplate::SetInstanceCallAsFunctionHandler(
       i::Factory::NewStruct(i::CALL_HANDLER_INFO_TYPE);
   i::Handle<i::CallHandlerInfo> obj =
       i::Handle<i::CallHandlerInfo>::cast(struct_obj);
-  obj->set_callback(*FromCData(callback));
+  SET_FIELD_WRAPPED(obj, set_callback, callback);
   if (data.IsEmpty()) data = v8::Undefined();
   obj->set_data(*Utils::OpenHandle(*data));
   Utils::OpenHandle(this)->set_instance_call_handler(*obj);
@@ -1043,8 +1084,10 @@ void ObjectTemplate::SetAccessCheckCallbacks(
       i::Factory::NewStruct(i::ACCESS_CHECK_INFO_TYPE);
   i::Handle<i::AccessCheckInfo> info =
       i::Handle<i::AccessCheckInfo>::cast(struct_info);
-  info->set_named_callback(*FromCData(named_callback));
-  info->set_indexed_callback(*FromCData(indexed_callback));
+
+  SET_FIELD_WRAPPED(info, set_named_callback, named_callback);
+  SET_FIELD_WRAPPED(info, set_indexed_callback, indexed_callback);
+
   if (data.IsEmpty()) data = v8::Undefined();
   info->set_data(*Utils::OpenHandle(*data));
 
@@ -1123,13 +1166,13 @@ void ObjectTemplate::SetInternalFieldCount(int value) {
 
 ScriptData* ScriptData::PreCompile(const char* input, int length) {
   unibrow::Utf8InputBuffer<> buf(input, length);
-  return i::PreParse(i::Handle<i::String>(), &buf, NULL);
+  return i::ParserApi::PreParse(i::Handle<i::String>(), &buf, NULL);
 }
 
 
 ScriptData* ScriptData::PreCompile(v8::Handle<String> source) {
   i::Handle<i::String> str = Utils::OpenHandle(*source);
-  return i::PreParse(str, NULL, NULL);
+  return i::ParserApi::PreParse(str, NULL, NULL);
 }
 
 
@@ -1475,7 +1518,8 @@ static i::Handle<i::Object> CallV8HeapFunction(const char* name,
                                                i::Object** argv[],
                                                bool* has_pending_exception) {
   i::Handle<i::String> fmt_str = i::Factory::LookupAsciiSymbol(name);
-  i::Object* object_fun = i::Top::builtins()->GetProperty(*fmt_str);
+  i::Object* object_fun =
+      i::Top::builtins()->GetPropertyNoExceptionThrown(*fmt_str);
   i::Handle<i::JSFunction> fun =
       i::Handle<i::JSFunction>(i::JSFunction::cast(object_fun));
   i::Handle<i::Object> value =
@@ -1591,7 +1635,8 @@ Local<StackFrame> StackTrace::GetFrame(uint32_t index) const {
   ENTER_V8;
   HandleScope scope;
   i::Handle<i::JSArray> self = Utils::OpenHandle(this);
-  i::Handle<i::JSObject> obj(i::JSObject::cast(self->GetElement(index)));
+  i::Object* raw_object = self->GetElementNoExceptionThrown(index);
+  i::Handle<i::JSObject> obj(i::JSObject::cast(raw_object));
   return scope.Close(Utils::StackFrameToLocal(obj));
 }
 
@@ -1658,6 +1703,21 @@ Local<String> StackFrame::GetScriptName() const {
   HandleScope scope;
   i::Handle<i::JSObject> self = Utils::OpenHandle(this);
   i::Handle<i::Object> name = GetProperty(self, "scriptName");
+  if (!name->IsString()) {
+    return Local<String>();
+  }
+  return scope.Close(Local<String>::Cast(Utils::ToLocal(name)));
+}
+
+
+Local<String> StackFrame::GetScriptNameOrSourceURL() const {
+  if (IsDeadCheck("v8::StackFrame::GetScriptNameOrSourceURL()")) {
+    return Local<String>();
+  }
+  ENTER_V8;
+  HandleScope scope;
+  i::Handle<i::JSObject> self = Utils::OpenHandle(this);
+  i::Handle<i::Object> name = GetProperty(self, "scriptNameOrSourceURL");
   if (!name->IsString()) {
     return Local<String>();
   }
@@ -1977,6 +2037,15 @@ void v8::Date::CheckCast(v8::Value* that) {
 }
 
 
+void v8::RegExp::CheckCast(v8::Value* that) {
+  if (IsDeadCheck("v8::RegExp::Cast()")) return;
+  i::Handle<i::Object> obj = Utils::OpenHandle(that);
+  ApiCheck(obj->IsJSRegExp(),
+           "v8::RegExp::Cast()",
+           "Could not convert to regular expression");
+}
+
+
 bool Value::BooleanValue() const {
   if (IsDeadCheck("v8::Value::BooleanValue()")) return false;
   LOG_API("BooleanValue");
@@ -2248,6 +2317,11 @@ bool v8::Object::ForceDelete(v8::Handle<Value> key) {
   HandleScope scope;
   i::Handle<i::JSObject> self = Utils::OpenHandle(this);
   i::Handle<i::Object> key_obj = Utils::OpenHandle(*key);
+
+  // When turning on access checks for a global object deoptimize all functions
+  // as optimized code does not always handle access checks.
+  i::Deoptimizer::DeoptimizeGlobalObject(*self);
+
   EXCEPTION_PREAMBLE();
   i::Handle<i::Object> obj = i::ForceDeleteProperty(self, key_obj);
   has_pending_exception = obj.is_null();
@@ -2387,6 +2461,15 @@ Local<String> v8::Object::ObjectProtoToString() {
 }
 
 
+Local<String> v8::Object::GetConstructorName() {
+  ON_BAILOUT("v8::Object::GetConstructorName()", return Local<v8::String>());
+  ENTER_V8;
+  i::Handle<i::JSObject> self = Utils::OpenHandle(this);
+  i::Handle<i::String> name(self->constructor_name());
+  return Utils::ToLocal(name);
+}
+
+
 bool v8::Object::Delete(v8::Handle<String> key) {
   ON_BAILOUT("v8::Object::Delete()", return false);
   ENTER_V8;
@@ -2483,10 +2566,12 @@ Local<Value> v8::Object::GetRealNamedPropertyInPrototypeChain(
   self_obj->LookupRealNamedPropertyInPrototypes(*key_obj, &lookup);
   if (lookup.IsProperty()) {
     PropertyAttributes attributes;
-    i::Handle<i::Object> result(self_obj->GetProperty(*self_obj,
-                                                      &lookup,
-                                                      *key_obj,
-                                                      &attributes));
+    i::Object* property =
+        self_obj->GetProperty(*self_obj,
+                              &lookup,
+                              *key_obj,
+                              &attributes)->ToObjectUnchecked();
+    i::Handle<i::Object> result(property);
     return Utils::ToLocal(result);
   }
   return Local<Value>();  // No real property was found in prototype chain.
@@ -2502,10 +2587,12 @@ Local<Value> v8::Object::GetRealNamedProperty(Handle<String> key) {
   self_obj->LookupRealNamedProperty(*key_obj, &lookup);
   if (lookup.IsProperty()) {
     PropertyAttributes attributes;
-    i::Handle<i::Object> result(self_obj->GetProperty(*self_obj,
-                                                      &lookup,
-                                                      *key_obj,
-                                                      &attributes));
+    i::Object* property =
+        self_obj->GetProperty(*self_obj,
+                              &lookup,
+                              *key_obj,
+                              &attributes)->ToObjectUnchecked();
+    i::Handle<i::Object> result(property);
     return Utils::ToLocal(result);
   }
   return Local<Value>();  // No real property was found in prototype chain.
@@ -2520,6 +2607,10 @@ void v8::Object::TurnOnAccessCheck() {
   ENTER_V8;
   HandleScope scope;
   i::Handle<i::JSObject> obj = Utils::OpenHandle(this);
+
+  // When turning on access checks for a global object deoptimize all functions
+  // as optimized code does not always handle access checks.
+  i::Deoptimizer::DeoptimizeGlobalObject(*obj);
 
   i::Handle<i::Map> new_map =
     i::Factory::CopyMapDropTransitions(i::Handle<i::Map>(obj->map()));
@@ -2646,8 +2737,9 @@ void v8::Object::SetIndexedPropertiesToPixelData(uint8_t* data, int length) {
     return;
   }
   i::Handle<i::PixelArray> pixels = i::Factory::NewPixelArray(length, data);
-  self->set_map(
-      *i::Factory::GetSlowElementsMap(i::Handle<i::Map>(self->map())));
+  i::Handle<i::Map> slow_map =
+      i::Factory::GetSlowElementsMap(i::Handle<i::Map>(self->map()));
+  self->set_map(*slow_map);
   self->set_elements(*pixels);
 }
 
@@ -2701,8 +2793,9 @@ void v8::Object::SetIndexedPropertiesToExternalArrayData(
   }
   i::Handle<i::ExternalArray> array =
       i::Factory::NewExternalArray(length, array_type, data);
-  self->set_map(
-      *i::Factory::GetSlowElementsMap(i::Handle<i::Map>(self->map())));
+  i::Handle<i::Map> slow_map =
+      i::Factory::GetSlowElementsMap(i::Handle<i::Map>(self->map()));
+  self->set_map(*slow_map);
   self->set_elements(*array);
 }
 
@@ -3183,7 +3276,6 @@ void v8::Object::SetPointerInInternalField(int index, void* value) {
 
 bool v8::V8::Initialize() {
   if (i::V8::IsRunning()) return true;
-  ENTER_V8;
   HandleScope scope;
   if (i::Snapshot::Initialize()) return true;
   return i::V8::Initialize(NULL);
@@ -3196,11 +3288,15 @@ bool v8::V8::Dispose() {
 }
 
 
-HeapStatistics::HeapStatistics(): total_heap_size_(0), used_heap_size_(0) { }
+HeapStatistics::HeapStatistics(): total_heap_size_(0),
+                                  total_heap_size_executable_(0),
+                                  used_heap_size_(0) { }
 
 
 void v8::V8::GetHeapStatistics(HeapStatistics* heap_statistics) {
   heap_statistics->set_total_heap_size(i::Heap::CommittedMemory());
+  heap_statistics->set_total_heap_size_executable(
+      i::Heap::CommittedMemoryExecutable());
   heap_statistics->set_used_heap_size(i::Heap::SizeOfObjects());
 }
 
@@ -3303,6 +3399,7 @@ Persistent<Context> v8::Context::New(
       global_constructor->set_needs_access_check(
           proxy_constructor->needs_access_check());
     }
+    i::RuntimeProfiler::Reset();
   }
   // Leave V8.
 
@@ -3693,6 +3790,57 @@ double v8::Date::NumberValue() const {
   i::Handle<i::Object> obj = Utils::OpenHandle(this);
   i::Handle<i::JSValue> jsvalue = i::Handle<i::JSValue>::cast(obj);
   return jsvalue->value()->Number();
+}
+
+
+static i::Handle<i::String> RegExpFlagsToString(RegExp::Flags flags) {
+  char flags_buf[3];
+  int num_flags = 0;
+  if ((flags & RegExp::kGlobal) != 0) flags_buf[num_flags++] = 'g';
+  if ((flags & RegExp::kMultiline) != 0) flags_buf[num_flags++] = 'm';
+  if ((flags & RegExp::kIgnoreCase) != 0) flags_buf[num_flags++] = 'i';
+  ASSERT(num_flags <= static_cast<int>(ARRAY_SIZE(flags_buf)));
+  return i::Factory::LookupSymbol(
+      i::Vector<const char>(flags_buf, num_flags));
+}
+
+
+Local<v8::RegExp> v8::RegExp::New(Handle<String> pattern,
+                                  Flags flags) {
+  EnsureInitialized("v8::RegExp::New()");
+  LOG_API("RegExp::New");
+  ENTER_V8;
+  EXCEPTION_PREAMBLE();
+  i::Handle<i::JSRegExp> obj = i::Execution::NewJSRegExp(
+      Utils::OpenHandle(*pattern),
+      RegExpFlagsToString(flags),
+      &has_pending_exception);
+  EXCEPTION_BAILOUT_CHECK(Local<v8::RegExp>());
+  return Utils::ToLocal(i::Handle<i::JSRegExp>::cast(obj));
+}
+
+
+Local<v8::String> v8::RegExp::GetSource() const {
+  if (IsDeadCheck("v8::RegExp::GetSource()")) return Local<v8::String>();
+  i::Handle<i::JSRegExp> obj = Utils::OpenHandle(this);
+  return Utils::ToLocal(i::Handle<i::String>(obj->Pattern()));
+}
+
+
+// Assert that the static flags cast in GetFlags is valid.
+#define REGEXP_FLAG_ASSERT_EQ(api_flag, internal_flag)        \
+  STATIC_ASSERT(static_cast<int>(v8::RegExp::api_flag) ==     \
+                static_cast<int>(i::JSRegExp::internal_flag))
+REGEXP_FLAG_ASSERT_EQ(kNone, NONE);
+REGEXP_FLAG_ASSERT_EQ(kGlobal, GLOBAL);
+REGEXP_FLAG_ASSERT_EQ(kIgnoreCase, IGNORE_CASE);
+REGEXP_FLAG_ASSERT_EQ(kMultiline, MULTILINE);
+#undef REGEXP_FLAG_ASSERT_EQ
+
+v8::RegExp::Flags v8::RegExp::GetFlags() const {
+  if (IsDeadCheck("v8::RegExp::GetFlags()")) return v8::RegExp::kNone;
+  i::Handle<i::JSRegExp> obj = Utils::OpenHandle(this);
+  return static_cast<RegExp::Flags>(obj->GetFlags().value());
 }
 
 
@@ -4251,6 +4399,11 @@ void Debug::DebugBreak() {
 }
 
 
+void Debug::CancelDebugBreak() {
+  i::StackGuard::Continue(i::DEBUGBREAK);
+}
+
+
 void Debug::DebugBreakForCommand(ClientData* data) {
   if (!i::V8::IsRunning()) return;
   i::Debugger::EnqueueDebugCommand(data);
@@ -4433,7 +4586,7 @@ double CpuProfileNode::GetSelfSamplesCount() const {
 
 unsigned CpuProfileNode::GetCallUid() const {
   IsDeadCheck("v8::CpuProfileNode::GetCallUid");
-  return reinterpret_cast<const i::ProfileNode*>(this)->entry()->call_uid();
+  return reinterpret_cast<const i::ProfileNode*>(this)->entry()->GetCallUid();
 }
 
 
@@ -4539,9 +4692,11 @@ Handle<Value> HeapGraphEdge::GetName() const {
     case i::HeapGraphEdge::kContextVariable:
     case i::HeapGraphEdge::kInternal:
     case i::HeapGraphEdge::kProperty:
+    case i::HeapGraphEdge::kShortcut:
       return Handle<String>(ToApi<String>(i::Factory::LookupAsciiSymbol(
           edge->name())));
     case i::HeapGraphEdge::kElement:
+    case i::HeapGraphEdge::kHidden:
       return Handle<Number>(ToApi<Number>(i::Factory::NewNumberFromInt(
           edge->index())));
     default: UNREACHABLE();
@@ -4631,15 +4786,9 @@ int HeapGraphNode::GetSelfSize() const {
 }
 
 
-int HeapGraphNode::GetReachableSize() const {
-  IsDeadCheck("v8::HeapSnapshot::GetReachableSize");
-  return ToInternal(this)->ReachableSize();
-}
-
-
-int HeapGraphNode::GetRetainedSize() const {
+int HeapGraphNode::GetRetainedSize(bool exact) const {
   IsDeadCheck("v8::HeapSnapshot::GetRetainedSize");
-  return ToInternal(this)->RetainedSize();
+  return ToInternal(this)->RetainedSize(exact);
 }
 
 
@@ -4679,6 +4828,12 @@ const HeapGraphPath* HeapGraphNode::GetRetainingPath(int index) const {
   IsDeadCheck("v8::HeapSnapshot::GetRetainingPath");
   return reinterpret_cast<const HeapGraphPath*>(
       ToInternal(this)->GetRetainingPaths()->at(index));
+}
+
+
+const HeapGraphNode* HeapGraphNode::GetDominatorNode() const {
+  IsDeadCheck("v8::HeapSnapshot::GetDominatorNode");
+  return reinterpret_cast<const HeapGraphNode*>(ToInternal(this)->dominator());
 }
 
 
@@ -4728,6 +4883,13 @@ Handle<String> HeapSnapshot::GetTitle() const {
 const HeapGraphNode* HeapSnapshot::GetRoot() const {
   IsDeadCheck("v8::HeapSnapshot::GetHead");
   return reinterpret_cast<const HeapGraphNode*>(ToInternal(this)->root());
+}
+
+
+const HeapGraphNode* HeapSnapshot::GetNodeById(uint64_t id) const {
+  IsDeadCheck("v8::HeapSnapshot::GetNodeById");
+  return reinterpret_cast<const HeapGraphNode*>(
+      ToInternal(this)->GetEntryById(id));
 }
 
 
@@ -4795,6 +4957,66 @@ const HeapSnapshot* HeapProfiler::TakeSnapshot(Handle<String> title,
 }
 
 #endif  // ENABLE_LOGGING_AND_PROFILING
+
+
+v8::Testing::StressType internal::Testing::stress_type_ =
+    v8::Testing::kStressTypeOpt;
+
+
+void Testing::SetStressRunType(Testing::StressType type) {
+  internal::Testing::set_stress_type(type);
+}
+
+int Testing::GetStressRuns() {
+#ifdef DEBUG
+  // In debug mode the code runs much slower so stressing will only make two
+  // runs.
+  return 2;
+#else
+  return 5;
+#endif
+}
+
+
+static void SetFlagsFromString(const char* flags) {
+  V8::SetFlagsFromString(flags, i::StrLength(flags));
+}
+
+
+void Testing::PrepareStressRun(int run) {
+  static const char* kLazyOptimizations =
+      "--prepare-always-opt --nolimit-inlining "
+      "--noalways-opt --noopt-eagerly";
+  static const char* kEagerOptimizations = "--opt-eagerly";
+  static const char* kForcedOptimizations = "--always-opt";
+
+  // If deoptimization stressed turn on frequent deoptimization. If no value
+  // is spefified through --deopt-every-n-times use a default default value.
+  static const char* kDeoptEvery13Times = "--deopt-every-n-times=13";
+  if (internal::Testing::stress_type() == Testing::kStressTypeDeopt &&
+      internal::FLAG_deopt_every_n_times == 0) {
+    SetFlagsFromString(kDeoptEvery13Times);
+  }
+
+#ifdef DEBUG
+  // As stressing in debug mode only make two runs skip the deopt stressing
+  // here.
+  if (run == GetStressRuns() - 1) {
+    SetFlagsFromString(kForcedOptimizations);
+  } else {
+    SetFlagsFromString(kEagerOptimizations);
+    SetFlagsFromString(kLazyOptimizations);
+  }
+#else
+  if (run == GetStressRuns() - 1) {
+    SetFlagsFromString(kForcedOptimizations);
+  } else if (run == GetStressRuns() - 2) {
+    SetFlagsFromString(kEagerOptimizations);
+  } else {
+    SetFlagsFromString(kLazyOptimizations);
+  }
+#endif
+}
 
 
 namespace internal {

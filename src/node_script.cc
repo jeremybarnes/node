@@ -3,6 +3,7 @@
 #include <assert.h>
 
 
+
 using namespace v8;
 using namespace node;
 
@@ -107,7 +108,7 @@ Handle<Value> node::Script::CreateContext (const Arguments& args) {
     Local<Object> sandbox = args[0]->ToObject();
     Local<Array> keys = sandbox->GetPropertyNames();
 
-    for (int i = 0; i < keys->Length(); i++) {
+    for (uint32_t i = 0; i < keys->Length(); i++) {
       Handle<String> key = keys->Get(Integer::New(i))->ToString();
       Handle<Value> value = sandbox->Get(key);
       context->Set(key, value);
@@ -233,6 +234,9 @@ template <node::Script::EvalInputFlags iFlag,
     script = oFlag == returnResult ? v8::Script::Compile(code, filename)
                                    : v8::Script::New(code, filename);
     if (script.IsEmpty()) {
+      // FIXME UGLY HACK TO DISPLAY SYNTAX ERRORS.
+      DisplayExceptionLine(try_catch);
+
       // Hack because I can't get a proper stacktrace on SyntaxError
       return try_catch.ReThrow();
     }

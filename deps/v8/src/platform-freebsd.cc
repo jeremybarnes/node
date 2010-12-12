@@ -53,6 +53,7 @@
 #include "v8.h"
 
 #include "platform.h"
+#include "vm-state-inl.h"
 
 
 namespace v8 {
@@ -288,6 +289,10 @@ void OS::LogSharedLibraryAddresses() {
   }
   close(fd);
 #endif
+}
+
+
+void OS::SignalCodeMovingGC() {
 }
 
 
@@ -612,8 +617,11 @@ class Sampler::PlatformData : public Malloced {
 };
 
 
-Sampler::Sampler(int interval, bool profiling)
-    : interval_(interval), profiling_(profiling), active_(false) {
+Sampler::Sampler(int interval)
+    : interval_(interval),
+      profiling_(false),
+      active_(false),
+      samples_taken_(0) {
   data_ = new PlatformData();
 }
 

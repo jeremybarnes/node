@@ -36,7 +36,7 @@
 #include <node_child_process.h>
 #include <node_constants.h>
 #include <node_stdio.h>
-#include <node_natives.h>
+#include <node_javascript.h>
 #include <node_version.h>
 #ifdef HAVE_OPENSSL
 #include <node_crypto.h>
@@ -49,7 +49,12 @@
 
 using namespace v8;
 
+# ifdef __APPLE__
+# include <crt_externs.h>
+# define environ (*_NSGetEnviron())
+# else
 extern char **environ;
+# endif
 
 namespace node {
 
@@ -68,14 +73,16 @@ static Persistent<String> listeners_symbol;
 static Persistent<String> uncaught_exception_symbol;
 static Persistent<String> emit_symbol;
 
+
+static char *eval_string = NULL;
 static int option_end_index = 0;
 static bool use_debug_agent = false;
 static bool debug_wait_connect = false;
 static int debug_port=5858;
+static int max_stack_size = 0;
 
 static ev_check check_tick_watcher;
 static ev_prepare prepare_tick_watcher;
-static ev_idle tick_spinner;
 static bool need_tick_cb;
 static Persistent<String> tick_callback_sym;
 
@@ -165,19 +172,7 @@ static void Check(EV_P_ ev_check *watcher, int revents) {
 static Handle<Value> NeedTickCallback(const Arguments& args) {
   HandleScope scope;
   need_tick_cb = true;
-  // TODO: this tick_spinner shouldn't be necessary. An ev_prepare should be
-  // sufficent, the problem is only in the case of the very last "tick" -
-  // there is nothing left to do in the event loop and libev will exit. The
-  // ev_prepare callback isn't called before exiting. Thus we start this
-  // tick_spinner to keep the event loop alive long enough to handle it.
-  ev_idle_start(EV_DEFAULT_UC_ &tick_spinner);
   return Undefined();
-}
-
-
-static void Spin(EV_P_ ev_idle *watcher, int revents) {
-  assert(watcher == &tick_spinner);
-  assert(revents == EV_IDLE);
 }
 
 
@@ -186,7 +181,6 @@ static void Tick(void) {
   if (!need_tick_cb) return;
 
   need_tick_cb = false;
-  ev_idle_stop(EV_DEFAULT_UC_ &tick_spinner);
 
   HandleScope scope;
 
@@ -792,13 +786,16 @@ Handle<Value> FromConstructorTemplate(Persistent<FunctionTemplate>& t,
   HandleScope scope;
 
   const int argc = args.Length();
-  Local<Value> argv[argc];
+  Local<Value>* argv = new Local<Value>[argc];
 
   for (int i = 0; i < argc; ++i) {
     argv[i] = args[i];
   }
 
   Local<Object> instance = t->GetFunction()->NewInstance(argc, argv);
+
+  delete[] argv;
+
   return scope.Close(instance);
 }
 
@@ -928,26 +925,24 @@ ssize_t DecodeWrite(char *buf,
   return buflen;
 }
 
-// Extracts a C str from a V8 Utf8Value.
-const char* ToCString(const v8::String::Utf8Value& value) {
-  return *value ? *value : "<str conversion failed>";
-}
 
-static void ReportException(TryCatch &try_catch, bool show_line) {
+void DisplayExceptionLine (TryCatch &try_catch) {
+  HandleScope scope;
+
   Handle<Message> message = try_catch.Message();
 
   node::Stdio::DisableRawMode(STDIN_FILENO);
   fprintf(stderr, "\n");
 
-  if (show_line && !message.IsEmpty()) {
+  if (!message.IsEmpty()) {
     // Print (filename):(line number): (message).
     String::Utf8Value filename(message->GetScriptResourceName());
-    const char* filename_string = ToCString(filename);
+    const char* filename_string = *filename;
     int linenum = message->GetLineNumber();
     fprintf(stderr, "%s:%i\n", filename_string, linenum);
     // Print line of source code.
     String::Utf8Value sourceline(message->GetSourceLine());
-    const char* sourceline_string = ToCString(sourceline);
+    const char* sourceline_string = *sourceline;
 
     // HACK HACK HACK
     //
@@ -981,12 +976,28 @@ static void ReportException(TryCatch &try_catch, bool show_line) {
     }
     fprintf(stderr, "\n");
   }
+}
+
+
+static void ReportException(TryCatch &try_catch, bool show_line) {
+  HandleScope scope;
+  Handle<Message> message = try_catch.Message();
+
+  if (show_line) DisplayExceptionLine(try_catch);
 
   String::Utf8Value trace(try_catch.StackTrace());
 
   if (trace.length() > 0) {
     fprintf(stderr, "%s\n", *trace);
+  } else {
+    // this really only happens for RangeErrors, since they're the only
+    // kind that won't have all this info in the trace.
+    Local<Value> er = try_catch.Exception();
+    String::Utf8Value msg(!er->IsObject() ? er->ToString()
+                         : er->ToObject()->Get(String::New("message"))->ToString());
+    fprintf(stderr, "%s\n", *msg);
   }
+
   fflush(stderr);
 }
 
@@ -1008,19 +1019,6 @@ Local<Value> ExecuteString(Local<String> source, Local<Value> filename) {
   }
 
   return scope.Close(result);
-}
-
-
-static Handle<Value> Loop(const Arguments& args) {
-  HandleScope scope;
-  assert(args.Length() == 0);
-
-  // TODO Probably don't need to start this each time.
-  // Avoids failing on test/simple/test-eio-race3.js though
-  ev_idle_start(EV_DEFAULT_UC_ &eio_poller);
-
-  ev_loop(EV_DEFAULT_UC_ 0);
-  return Undefined();
 }
 
 
@@ -1326,12 +1324,22 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
 }
 
 
+// TODO remove me before 0.4
 Handle<Value> Compile(const Arguments& args) {
   HandleScope scope;
+
 
   if (args.Length() < 2) {
     return ThrowException(Exception::TypeError(
           String::New("needs two arguments.")));
+  }
+
+  static bool shown_error_message = false;
+
+  if (!shown_error_message) {
+    shown_error_message = true;
+    fprintf(stderr, "(node) process.compile should not be used. "
+                    "Use require('vm').runInThisContext instead.\n");
   }
 
   Local<String> source = args[0]->ToString();
@@ -1481,32 +1489,9 @@ static Handle<Value> Binding(const Arguments& args) {
 
   } else if (!strcmp(*module_v, "natives")) {
     exports = Object::New();
-    // Explicitly define native sources.
-    // TODO DRY/automate this?
-    exports->Set(String::New("assert"),       String::New(native_assert));
-    exports->Set(String::New("buffer"),       String::New(native_buffer));
-    exports->Set(String::New("child_process"),String::New(native_child_process));
-    exports->Set(String::New("constants"),    String::New(native_constants));
-    exports->Set(String::New("dgram"),        String::New(native_dgram));
-    exports->Set(String::New("dns"),          String::New(native_dns));
-    exports->Set(String::New("events"),       String::New(native_events));
-    exports->Set(String::New("file"),         String::New(native_file));
-    exports->Set(String::New("freelist"),     String::New(native_freelist));
-    exports->Set(String::New("fs"),           String::New(native_fs));
-    exports->Set(String::New("http"),         String::New(native_http));
-    exports->Set(String::New("crypto"),       String::New(native_crypto));
-    exports->Set(String::New("net"),          String::New(native_net));
-    exports->Set(String::New("posix"),        String::New(native_posix));
-    exports->Set(String::New("querystring"),  String::New(native_querystring));
-    exports->Set(String::New("repl"),         String::New(native_repl));
-    exports->Set(String::New("readline"),     String::New(native_readline));
-    exports->Set(String::New("sys"),          String::New(native_sys));
-    exports->Set(String::New("tcp"),          String::New(native_tcp));
-    exports->Set(String::New("url"),          String::New(native_url));
-    exports->Set(String::New("utils"),        String::New(native_utils));
-    exports->Set(String::New("path"),         String::New(native_path));
-    exports->Set(String::New("string_decoder"), String::New(native_string_decoder));
+    DefineJavaScript(exports);
     binding_cache->Set(module, exports);
+
   } else {
 
     return ThrowException(Exception::Error(String::New("No such module")));
@@ -1531,6 +1516,80 @@ static void ProcessTitleSetter(Local<String> property,
   HandleScope scope;
   String::Utf8Value title(value->ToString());
   OS::SetProcessTitle(*title);
+}
+
+
+static Handle<Value> EnvGetter(Local<String> property,
+                               const AccessorInfo& info) {
+  String::Utf8Value key(property);
+  const char* val = getenv(*key);
+  if (val) {
+    HandleScope scope;
+    return scope.Close(String::New(val));
+  }
+  return Undefined();
+}
+
+
+static bool ENV_warning = false;
+static Handle<Value> EnvGetterWarn(Local<String> property,
+                                   const AccessorInfo& info) {
+  if (!ENV_warning) {
+    ENV_warning = true;
+    fprintf(stderr, "(node) Use process.env instead of process.ENV\r\n");
+  }
+  return EnvGetter(property, info);
+}
+
+
+static Handle<Value> EnvSetter(Local<String> property,
+                               Local<Value> value,
+                               const AccessorInfo& info) {
+  String::Utf8Value key(property);
+  String::Utf8Value val(value);
+  setenv(*key, *val, 1);
+  return value;
+}
+
+
+static Handle<Integer> EnvQuery(Local<String> property,
+                                const AccessorInfo& info) {
+  String::Utf8Value key(property);
+  if (getenv(*key)) {
+    HandleScope scope;
+    return scope.Close(Integer::New(None));
+  }
+  return Handle<Integer>();
+}
+
+
+static Handle<Boolean> EnvDeleter(Local<String> property,
+                                  const AccessorInfo& info) {
+  String::Utf8Value key(property);
+  if (getenv(*key)) {
+    unsetenv(*key);	// prototyped as `void unsetenv(const char*)` on some platforms
+    return True();
+  }
+  return False();
+}
+
+
+static Handle<Array> EnvEnumerator(const AccessorInfo& info) {
+  HandleScope scope;
+
+  int size = 0;
+  while (environ[size]) size++;
+
+  Local<Array> env = Array::New(size);
+
+  for (int i = 0; i < size; ++i) {
+    const char* var = environ[i];
+    const char* s = strchr(var, '=');
+    const int length = s ? s - var : strlen(var);
+    env->Set(i, String::New(var, length));
+  }
+
+  return scope.Close(env);
 }
 
 
@@ -1566,7 +1625,7 @@ static void Load(int argc, char *argv[]) {
 
 
   // process.platform
-  process->Set(String::NewSymbol("platform"), String::New(PLATFORM));
+  process->Set(String::NewSymbol("platform"), String::New("PLATFORM"));
 
   // process.argv
   int i, j;
@@ -1581,24 +1640,34 @@ static void Load(int argc, char *argv[]) {
   process->Set(String::NewSymbol("argv"), arguments);
 
   // create process.env
-  Local<Object> env = Object::New();
-  for (i = 0; environ[i]; i++) {
-    // skip entries without a '=' character
-    for (j = 0; environ[i][j] && environ[i][j] != '='; j++) { ; }
-    // create the v8 objects
-    Local<String> field = String::New(environ[i], j);
-    Local<String> value = Local<String>();
-    if (environ[i][j] == '=') {
-      value = String::New(environ[i]+j+1);
-    }
-    // assign them
-    env->Set(field, value);
-  }
-  // assign process.ENV
-  process->Set(String::NewSymbol("ENV"), env);
+  Local<ObjectTemplate> envTemplate = ObjectTemplate::New();
+  envTemplate->SetNamedPropertyHandler(EnvGetter,
+                                       EnvSetter,
+                                       EnvQuery,
+                                       EnvDeleter,
+                                       EnvEnumerator,
+                                       Undefined());
+  Local<Object> env = envTemplate->NewInstance();
   process->Set(String::NewSymbol("env"), env);
 
+  // create process.ENV
+  // TODO: remove me at some point.
+  Local<ObjectTemplate> ENVTemplate = ObjectTemplate::New();
+  ENVTemplate->SetNamedPropertyHandler(EnvGetterWarn,
+                                       EnvSetter,
+                                       EnvQuery,
+                                       EnvDeleter,
+                                       EnvEnumerator,
+                                       Undefined());
+  Local<Object> ENV = ENVTemplate->NewInstance();
+  process->Set(String::NewSymbol("ENV"), ENV);
+
   process->Set(String::NewSymbol("pid"), Integer::New(getpid()));
+
+  // -e, --eval
+  if (eval_string) {
+    process->Set(String::NewSymbol("_eval"), String::New(eval_string));
+  }
 
   size_t size = 2*PATH_MAX;
   char execPath[size];
@@ -1606,12 +1675,11 @@ static void Load(int argc, char *argv[]) {
     // as a last ditch effort, fallback on argv[0] ?
     process->Set(String::NewSymbol("execPath"), String::New(argv[0]));
   } else {
-    process->Set(String::NewSymbol("execPath"), String::New(execPath));
+    process->Set(String::NewSymbol("execPath"), String::New(execPath, size));
   }
 
 
   // define various internal methods
-  NODE_SET_METHOD(process, "loop", Loop);
   NODE_SET_METHOD(process, "compile", Compile);
   NODE_SET_METHOD(process, "_needTickCallback", NeedTickCallback);
   NODE_SET_METHOD(process, "reallyExit", Exit);
@@ -1642,7 +1710,7 @@ static void Load(int argc, char *argv[]) {
 
   TryCatch try_catch;
 
-  Local<Value> f_value = ExecuteString(String::New(native_node),
+  Local<Value> f_value = ExecuteString(String::New(MainSource()),
                                        String::New("node.js"));
   if (try_catch.HasCaught())  {
     ReportException(try_catch, true);
@@ -1703,21 +1771,23 @@ static void ParseDebugOpt(const char* arg) {
 static void PrintHelp() {
   printf("Usage: node [options] script.js [arguments] \n"
          "Options:\n"
-         "  -v, --version      print node's version\n"
-         "  --debug[=port]     enable remote debugging via given TCP port\n"
-         "                     without stopping the execution\n"
-         "  --debug-brk[=port] as above, but break in script.js and\n"
-         "                     wait for remote debugger to connect\n"
-         "  --v8-options       print v8 command line options\n"
-         "  --vars             print various compiled-in variables\n"
+         "  -v, --version        print node's version\n"
+         "  --debug[=port]       enable remote debugging via given TCP port\n"
+         "                       without stopping the execution\n"
+         "  --debug-brk[=port]   as above, but break in script.js and\n"
+         "                       wait for remote debugger to connect\n"
+         "  --v8-options         print v8 command line options\n"
+         "  --vars               print various compiled-in variables\n"
+         "  --max-stack-size=val set max v8 stack size (bytes)\n"
          "\n"
          "Enviromental variables:\n"
-         "NODE_PATH            ':'-separated list of directories\n"
-         "                     prefixed to the module search path,\n"
-         "                     require.paths.\n"
-         "NODE_DEBUG           Print additional debugging output.\n"
-         "NODE_MODULE_CONTEXTS Set to 1 to load modules in their own\n"
-         "                     global contexts.\n"
+         "NODE_PATH              ':'-separated list of directories\n"
+         "                       prefixed to the module search path,\n"
+         "                       require.paths.\n"
+         "NODE_DEBUG             Print additional debugging output.\n"
+         "NODE_MODULE_CONTEXTS   Set to 1 to load modules in their own\n"
+         "                       global contexts.\n"
+         "NODE_DISABLE_COLORS  Set to 1 to disable colors in the REPL\n"
          "\n"
          "Documentation can be found at http://nodejs.org/api.html"
          " or with 'man node'\n");
@@ -1740,9 +1810,21 @@ static void ParseArgs(int *argc, char **argv) {
       printf("NODE_PREFIX: %s\n", NODE_PREFIX);
       printf("NODE_CFLAGS: %s\n", NODE_CFLAGS);
       exit(0);
+    } else if (strstr(arg, "--max-stack-size=") == arg) {
+      const char *p = 0;
+      p = 1 + strchr(arg, '=');
+      max_stack_size = atoi(p);
+      argv[i] = const_cast<char*>("");
     } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
       PrintHelp();
       exit(0);
+    } else if (strcmp(arg, "--eval") == 0 || strcmp(arg, "-e") == 0) {
+      if (*argc <= i + 1) {
+        fprintf(stderr, "Error: --eval requires an argument\n");
+        exit(1);
+      }
+      argv[i] = const_cast<char*>("");
+      eval_string = argv[++i];
     } else if (strcmp(arg, "--v8-options") == 0) {
       argv[i] = const_cast<char*>("--help");
     } else if (argv[i][0] != '-') {
@@ -1757,6 +1839,22 @@ static void ParseArgs(int *argc, char **argv) {
 static void AtExit() {
   node::Stdio::Flush();
   node::Stdio::DisableRawMode(STDIN_FILENO);
+}
+
+
+static void SignalExit(int signal) {
+  Stdio::DisableRawMode(STDIN_FILENO);
+  _exit(1);
+}
+
+
+static int RegisterSignalHandler(int signal, void (*handler)(int)) {
+  struct sigaction sa;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handler;
+  sigfillset(&sa.sa_mask);
+  return sigaction(signal, &sa, NULL);
 }
 
 
@@ -1781,19 +1879,32 @@ int Start(int argc, char *argv[]) {
     v8argv[node::option_end_index] = const_cast<char*>("--expose_debug_as");
     v8argv[node::option_end_index + 1] = const_cast<char*>("v8debug");
   }
+
+  // For the normal stack which moves from high to low addresses when frames
+  // are pushed, we can compute the limit as stack_size bytes below the
+  // the address of a stack variable (e.g. &stack_var) as an approximation
+  // of the start of the stack (we're assuming that we haven't pushed a lot
+  // of frames yet).
+  if (node::max_stack_size != 0) {
+    uint32_t stack_var;
+    ResourceConstraints constraints;
+
+    uint32_t *stack_limit = &stack_var - (node::max_stack_size / sizeof(uint32_t));
+    constraints.set_stack_limit(stack_limit);
+    SetResourceConstraints(&constraints); // Must be done before V8::Initialize
+  }
   V8::SetFlagsFromCommandLine(&v8argc, v8argv, false);
 
   // Ignore SIGPIPE
-  struct sigaction sa;
-  bzero(&sa, sizeof(sa));
-  sa.sa_handler = SIG_IGN;
-  sigaction(SIGPIPE, &sa, NULL);
+  RegisterSignalHandler(SIGPIPE, SIG_IGN);
+  RegisterSignalHandler(SIGINT, SignalExit);
+  RegisterSignalHandler(SIGTERM, SignalExit);
 
 
   // Initialize the default ev loop.
 #if defined(__sun)
   // TODO(Ryan) I'm experiencing abnormally high load using Solaris's
-  // EVBACKEND_PORT. Temporarally forcing select() until I debug.
+  // EVBACKEND_PORT. Temporarally forcing poll().
   ev_default_loop(EVBACKEND_POLL);
 #elif defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
   ev_default_loop(EVBACKEND_KQUEUE);
@@ -1808,8 +1919,6 @@ int Start(int argc, char *argv[]) {
   ev_check_init(&node::check_tick_watcher, node::CheckTick);
   ev_check_start(EV_DEFAULT_UC_ &node::check_tick_watcher);
   ev_unref(EV_DEFAULT_UC);
-
-  ev_idle_init(&node::tick_spinner, node::Spin);
 
   ev_check_init(&node::gc_check, node::Check);
   ev_check_start(EV_DEFAULT_UC_ &node::gc_check);
@@ -1884,6 +1993,36 @@ int Start(int argc, char *argv[]) {
   // Create all the objects, load modules, do everything.
   // so your next reading stop should be node::Load()!
   node::Load(argc, argv);
+
+  // TODO Probably don't need to start this each time.
+  // Avoids failing on test/simple/test-eio-race3.js though
+  ev_idle_start(EV_DEFAULT_UC_ &eio_poller);
+
+
+  do {
+    // All our arguments are loaded. We've evaluated all of the scripts. We
+    // might even have created TCP servers. Now we enter the main eventloop. If
+    // there are no watchers on the loop (except for the ones that were
+    // ev_unref'd) then this function exits. As long as there are active
+    // watchers, it blocks.
+    ev_loop(EV_DEFAULT_UC_ 0);
+
+    Tick();
+
+  } while (need_tick_cb || ev_activecnt(EV_DEFAULT_UC) > 0);
+
+
+  // process.emit('exit')
+  Local<Value> emit_v = process->Get(String::New("emit"));
+  assert(emit_v->IsFunction());
+  Local<Function> emit = Local<Function>::Cast(emit_v);
+  Local<Value> args[] = { String::New("exit") };
+  TryCatch try_catch;
+  emit->Call(process, 1, args);
+  if (try_catch.HasCaught()) {
+    FatalException(try_catch);
+  }
+
 
 #ifndef NDEBUG
   // Clean up.

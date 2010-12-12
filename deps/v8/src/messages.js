@@ -438,18 +438,18 @@ Script.prototype.lineCount = function() {
 
 /**
  * Returns the name of script if available, contents of sourceURL comment
- * otherwise. See 
+ * otherwise. See
  * http://fbug.googlecode.com/svn/branches/firebug1.1/docs/ReleaseNotes_1.1.txt
  * for details on using //@ sourceURL comment to identify scritps that don't
  * have name.
- * 
+ *
  * @return {?string} script name if present, value for //@ sourceURL comment
  * otherwise.
  */
 Script.prototype.nameOrSourceURL = function() {
   if (this.name)
     return this.name;
-  // TODO(608): the spaces in a regexp below had to be escaped as \040 
+  // TODO(608): the spaces in a regexp below had to be escaped as \040
   // because this file is being processed by js2c whose handling of spaces
   // in regexps is broken. Also, ['"] are excluded from allowed URLs to
   // avoid matches against sources that invoke evals with sourceURL.
@@ -684,6 +684,11 @@ CallSite.prototype.getEvalOrigin = function () {
   return FormatEvalOrigin(script);
 };
 
+CallSite.prototype.getScriptNameOrSourceURL = function () {
+  var script = %FunctionGetScript(this.fun);
+  return script ? script.nameOrSourceURL() : null;
+};
+
 CallSite.prototype.getFunction = function () {
   return this.fun;
 };
@@ -775,7 +780,11 @@ CallSite.prototype.isConstructor = function () {
 };
 
 function FormatEvalOrigin(script) {
-  var eval_origin = "";
+  var sourceURL = script.nameOrSourceURL();
+  if (sourceURL)
+    return sourceURL;
+
+  var eval_origin = "eval at ";
   if (script.eval_from_function_name) {
     eval_origin += script.eval_from_function_name;
   } else {
@@ -786,9 +795,9 @@ function FormatEvalOrigin(script) {
   if (eval_from_script) {
     if (eval_from_script.compilation_type == COMPILATION_TYPE_EVAL) {
       // eval script originated from another eval.
-      eval_origin += " (eval at " + FormatEvalOrigin(eval_from_script) + ")";
+      eval_origin += " (" + FormatEvalOrigin(eval_from_script) + ")";
     } else {
-      // eval script originated from "real" scource.
+      // eval script originated from "real" source.
       if (eval_from_script.name) {
         eval_origin += " (" + eval_from_script.name;
         var location = eval_from_script.locationFromPosition(script.eval_from_script_position, true);
@@ -807,25 +816,30 @@ function FormatEvalOrigin(script) {
 };
 
 function FormatSourcePosition(frame) {
+  var fileName;
   var fileLocation = "";
   if (frame.isNative()) {
     fileLocation = "native";
   } else if (frame.isEval()) {
-    fileLocation = "eval at " + frame.getEvalOrigin();
+    fileName = frame.getScriptNameOrSourceURL();
+    if (!fileName)
+      fileLocation = frame.getEvalOrigin();
   } else {
-    var fileName = frame.getFileName();
-    if (fileName) {
-      fileLocation += fileName;
-      var lineNumber = frame.getLineNumber();
-      if (lineNumber != null) {
-        fileLocation += ":" + lineNumber;
-        var columnNumber = frame.getColumnNumber();
-        if (columnNumber) {
-          fileLocation += ":" + columnNumber;
-        }
+    fileName = frame.getFileName();
+  }
+
+  if (fileName) {
+    fileLocation += fileName;
+    var lineNumber = frame.getLineNumber();
+    if (lineNumber != null) {
+      fileLocation += ":" + lineNumber;
+      var columnNumber = frame.getColumnNumber();
+      if (columnNumber) {
+        fileLocation += ":" + columnNumber;
       }
     }
   }
+
   if (!fileLocation) {
     fileLocation = "unknown source";
   }
@@ -890,11 +904,12 @@ function FormatStackTrace(error, frames) {
 
 function FormatRawStackTrace(error, raw_stack) {
   var frames = [ ];
-  for (var i = 0; i < raw_stack.length; i += 3) {
+  for (var i = 0; i < raw_stack.length; i += 4) {
     var recv = raw_stack[i];
-    var fun = raw_stack[i+1];
-    var pc = raw_stack[i+2];
-    var pos = %FunctionGetPositionForOffset(fun, pc);
+    var fun = raw_stack[i + 1];
+    var code = raw_stack[i + 2];
+    var pc = raw_stack[i + 3];
+    var pos = %FunctionGetPositionForOffset(code, pc);
     frames.push(new CallSite(recv, fun, pos));
   }
   if (IS_FUNCTION($Error.prepareStackTrace)) {

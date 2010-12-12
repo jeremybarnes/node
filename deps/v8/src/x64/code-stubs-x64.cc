@@ -57,12 +57,14 @@ void FastNewClosureStub::Generate(MacroAssembler* masm) {
   // write barrier because the allocated object is in new space.
   __ LoadRoot(rbx, Heap::kEmptyFixedArrayRootIndex);
   __ LoadRoot(rcx, Heap::kTheHoleValueRootIndex);
+  __ LoadRoot(rdi, Heap::kUndefinedValueRootIndex);
   __ movq(FieldOperand(rax, JSObject::kPropertiesOffset), rbx);
   __ movq(FieldOperand(rax, JSObject::kElementsOffset), rbx);
   __ movq(FieldOperand(rax, JSFunction::kPrototypeOrInitialMapOffset), rcx);
   __ movq(FieldOperand(rax, JSFunction::kSharedFunctionInfoOffset), rdx);
   __ movq(FieldOperand(rax, JSFunction::kContextOffset), rsi);
   __ movq(FieldOperand(rax, JSFunction::kLiteralsOffset), rbx);
+  __ movq(FieldOperand(rax, JSFunction::kNextFunctionLinkOffset), rdi);
 
   // Initialize the code pointer in the function to be the one
   // found in the shared function info object.
@@ -80,8 +82,9 @@ void FastNewClosureStub::Generate(MacroAssembler* masm) {
   __ pop(rdx);
   __ push(rsi);
   __ push(rdx);
+  __ Push(Factory::false_value());
   __ push(rcx);  // Restore return address.
-  __ TailCallRuntime(Runtime::kNewClosure, 2, 1);
+  __ TailCallRuntime(Runtime::kNewClosure, 3, 1);
 }
 
 
@@ -203,7 +206,7 @@ void FastCloneShallowArrayStub::Generate(MacroAssembler* masm) {
 
 
 void ToBooleanStub::Generate(MacroAssembler* masm) {
-  Label false_result, true_result, not_string;
+  NearLabel false_result, true_result, not_string;
   __ movq(rax, Operand(rsp, 1 * kPointerSize));
 
   // 'null' => false.
@@ -982,6 +985,14 @@ Handle<Code> GetBinaryOpStub(int key, BinaryOpIC::TypeInfo type_info) {
 }
 
 
+Handle<Code> GetTypeRecordingBinaryOpStub(int key,
+    TRBinaryOpIC::TypeInfo type_info,
+    TRBinaryOpIC::TypeInfo result_type_info) {
+  UNIMPLEMENTED();
+  return Handle<Code>::null();
+}
+
+
 void TranscendentalCacheStub::Generate(MacroAssembler* masm) {
   // Input on stack:
   // rsp[8]: argument (should be number).
@@ -989,7 +1000,7 @@ void TranscendentalCacheStub::Generate(MacroAssembler* masm) {
   Label runtime_call;
   Label runtime_call_clear_stack;
   Label input_not_smi;
-  Label loaded;
+  NearLabel loaded;
   // Test that rax is a number.
   __ movq(rax, Operand(rsp, kPointerSize));
   __ JumpIfNotSmi(rax, &input_not_smi);
@@ -1069,7 +1080,7 @@ void TranscendentalCacheStub::Generate(MacroAssembler* masm) {
   __ addl(rcx, rcx);
   __ lea(rcx, Operand(rax, rcx, times_8, 0));
   // Check if cache matches: Double value is stored in uint32_t[2] array.
-  Label cache_miss;
+  NearLabel cache_miss;
   __ cmpq(rbx, Operand(rcx, 0));
   __ j(not_equal, &cache_miss);
   // Cache hit!
@@ -1106,6 +1117,7 @@ Runtime::FunctionId TranscendentalCacheStub::RuntimeFunction() {
     // Add more cases when necessary.
     case TranscendentalCache::SIN: return Runtime::kMath_sin;
     case TranscendentalCache::COS: return Runtime::kMath_cos;
+    case TranscendentalCache::LOG: return Runtime::kMath_log;
     default:
       UNIMPLEMENTED();
       return Runtime::kAbort;
@@ -1120,73 +1132,76 @@ void TranscendentalCacheStub::GenerateOperation(MacroAssembler* masm,
   // rcx: Pointer to cache entry. Must be preserved.
   // st(0): Input double
   Label done;
-  ASSERT(type_ == TranscendentalCache::SIN ||
-         type_ == TranscendentalCache::COS);
-  // More transcendental types can be added later.
+  if (type_ == TranscendentalCache::SIN || type_ == TranscendentalCache::COS) {
+    // Both fsin and fcos require arguments in the range +/-2^63 and
+    // return NaN for infinities and NaN. They can share all code except
+    // the actual fsin/fcos operation.
+    Label in_range;
+    // If argument is outside the range -2^63..2^63, fsin/cos doesn't
+    // work. We must reduce it to the appropriate range.
+    __ movq(rdi, rbx);
+    // Move exponent and sign bits to low bits.
+    __ shr(rdi, Immediate(HeapNumber::kMantissaBits));
+    // Remove sign bit.
+    __ andl(rdi, Immediate((1 << HeapNumber::kExponentBits) - 1));
+    int supported_exponent_limit = (63 + HeapNumber::kExponentBias);
+    __ cmpl(rdi, Immediate(supported_exponent_limit));
+    __ j(below, &in_range);
+    // Check for infinity and NaN. Both return NaN for sin.
+    __ cmpl(rdi, Immediate(0x7ff));
+    __ j(equal, on_nan_result);
 
-  // Both fsin and fcos require arguments in the range +/-2^63 and
-  // return NaN for infinities and NaN. They can share all code except
-  // the actual fsin/fcos operation.
-  Label in_range;
-  // If argument is outside the range -2^63..2^63, fsin/cos doesn't
-  // work. We must reduce it to the appropriate range.
-  __ movq(rdi, rbx);
-  // Move exponent and sign bits to low bits.
-  __ shr(rdi, Immediate(HeapNumber::kMantissaBits));
-  // Remove sign bit.
-  __ andl(rdi, Immediate((1 << HeapNumber::kExponentBits) - 1));
-  int supported_exponent_limit = (63 + HeapNumber::kExponentBias);
-  __ cmpl(rdi, Immediate(supported_exponent_limit));
-  __ j(below, &in_range);
-  // Check for infinity and NaN. Both return NaN for sin.
-  __ cmpl(rdi, Immediate(0x7ff));
-  __ j(equal, on_nan_result);
+    // Use fpmod to restrict argument to the range +/-2*PI.
+    __ fldpi();
+    __ fadd(0);
+    __ fld(1);
+    // FPU Stack: input, 2*pi, input.
+    {
+      Label no_exceptions;
+      __ fwait();
+      __ fnstsw_ax();
+      // Clear if Illegal Operand or Zero Division exceptions are set.
+      __ testl(rax, Immediate(5));  // #IO and #ZD flags of FPU status word.
+      __ j(zero, &no_exceptions);
+      __ fnclex();
+      __ bind(&no_exceptions);
+    }
 
-  // Use fpmod to restrict argument to the range +/-2*PI.
-  __ fldpi();
-  __ fadd(0);
-  __ fld(1);
-  // FPU Stack: input, 2*pi, input.
-  {
-    Label no_exceptions;
-    __ fwait();
-    __ fnstsw_ax();
-    // Clear if Illegal Operand or Zero Division exceptions are set.
-    __ testl(rax, Immediate(5));  // #IO and #ZD flags of FPU status word.
-    __ j(zero, &no_exceptions);
-    __ fnclex();
-    __ bind(&no_exceptions);
+    // Compute st(0) % st(1)
+    {
+      NearLabel partial_remainder_loop;
+      __ bind(&partial_remainder_loop);
+      __ fprem1();
+      __ fwait();
+      __ fnstsw_ax();
+      __ testl(rax, Immediate(0x400));  // Check C2 bit of FPU status word.
+      // If C2 is set, computation only has partial result. Loop to
+      // continue computation.
+      __ j(not_zero, &partial_remainder_loop);
   }
-
-  // Compute st(0) % st(1)
-  {
-    Label partial_remainder_loop;
-    __ bind(&partial_remainder_loop);
-    __ fprem1();
-    __ fwait();
-    __ fnstsw_ax();
-    __ testl(rax, Immediate(0x400));  // Check C2 bit of FPU status word.
-    // If C2 is set, computation only has partial result. Loop to
-    // continue computation.
-    __ j(not_zero, &partial_remainder_loop);
+    // FPU Stack: input, 2*pi, input % 2*pi
+    __ fstp(2);
+    // FPU Stack: input % 2*pi, 2*pi,
+    __ fstp(0);
+    // FPU Stack: input % 2*pi
+    __ bind(&in_range);
+    switch (type_) {
+      case TranscendentalCache::SIN:
+        __ fsin();
+        break;
+      case TranscendentalCache::COS:
+        __ fcos();
+        break;
+      default:
+        UNREACHABLE();
+    }
+    __ bind(&done);
+  } else {
+    ASSERT(type_ == TranscendentalCache::LOG);
+    __ fldln2();
+    __ fxch();
+    __ fyl2x();
   }
-  // FPU Stack: input, 2*pi, input % 2*pi
-  __ fstp(2);
-  // FPU Stack: input % 2*pi, 2*pi,
-  __ fstp(0);
-  // FPU Stack: input % 2*pi
-  __ bind(&in_range);
-  switch (type_) {
-    case TranscendentalCache::SIN:
-      __ fsin();
-      break;
-    case TranscendentalCache::COS:
-      __ fcos();
-      break;
-    default:
-      UNREACHABLE();
-  }
-  __ bind(&done);
 }
 
 
@@ -1202,7 +1217,7 @@ void IntegerConvert(MacroAssembler* masm,
   // cvttsd2si (32-bit version) directly.
   Register double_exponent = rbx;
   Register double_value = rdi;
-  Label done, exponent_63_plus;
+  NearLabel done, exponent_63_plus;
   // Get double and extract exponent.
   __ movq(double_value, FieldOperand(source, HeapNumber::kValueOffset));
   // Clear result preemptively, in case we need to return zero.
@@ -1413,20 +1428,8 @@ void GenericUnaryOpStub::Generate(MacroAssembler* masm) {
         __ j(equal, &done);
       }
       __ SmiNeg(rax, rax, &done);
+      __ jmp(&slow);  // zero, if not handled above, and Smi::kMinValue.
 
-      // Either zero or Smi::kMinValue, neither of which become a smi when
-      // negated. We handle negative zero here if required. We always enter
-      // the runtime system if we have Smi::kMinValue.
-      if (negative_zero_ == kStrictNegativeZero) {
-        __ SmiCompare(rax, Smi::FromInt(0));
-        __ j(not_equal, &slow);
-        __ Move(rax, Factory::minus_zero_value());
-        __ jmp(&done);
-      } else  {
-        __ SmiCompare(rax, Smi::FromInt(Smi::kMinValue));
-        __ j(equal, &slow);
-        __ jmp(&done);
-      }
       // Try floating point case.
       __ bind(&try_float);
     } else if (FLAG_debug_code) {
@@ -1771,7 +1774,7 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
 
   // rcx: RegExp data (FixedArray)
   // Check the representation and encoding of the subject string.
-  Label seq_ascii_string, seq_two_byte_string, check_code;
+  NearLabel seq_ascii_string, seq_two_byte_string, check_code;
   __ movq(rax, Operand(rsp, kSubjectOffset));
   __ movq(rbx, FieldOperand(rax, HeapObject::kMapOffset));
   __ movzxbl(rbx, FieldOperand(rbx, Map::kInstanceTypeOffset));
@@ -1896,7 +1899,7 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
 
   // Argument 4: End of string data
   // Argument 3: Start of string data
-  Label setup_two_byte, setup_rest;
+  NearLabel setup_two_byte, setup_rest;
   __ testb(rdi, rdi);
   __ j(zero, &setup_two_byte);
   __ SmiToInteger32(rdi, FieldOperand(rax, String::kLengthOffset));
@@ -1923,10 +1926,10 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
   __ pop(rsi);
 
   // Check the result.
-  Label success;
+  NearLabel success;
   __ cmpl(rax, Immediate(NativeRegExpMacroAssembler::SUCCESS));
   __ j(equal, &success);
-  Label failure;
+  NearLabel failure;
   __ cmpl(rax, Immediate(NativeRegExpMacroAssembler::FAILURE));
   __ j(equal, &failure);
   __ cmpl(rax, Immediate(NativeRegExpMacroAssembler::EXCEPTION));
@@ -1981,7 +1984,7 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
   // rbx: last_match_info backing store (FixedArray)
   // rcx: offsets vector
   // rdx: number of capture registers
-  Label next_capture, done;
+  NearLabel next_capture, done;
   // Capture register counter starts from number of capture registers and
   // counts down until wraping after zero.
   __ bind(&next_capture);
@@ -1989,7 +1992,7 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
   __ j(negative, &done);
   // Read the value from the static offsets vector buffer and make it a smi.
   __ movl(rdi, Operand(rcx, rdx, times_int_size, 0));
-  __ Integer32ToSmi(rdi, rdi, &runtime);
+  __ Integer32ToSmi(rdi, rdi);
   // Store the smi value in the last match info.
   __ movq(FieldOperand(rbx,
                        rdx,
@@ -2007,6 +2010,90 @@ void RegExpExecStub::Generate(MacroAssembler* masm) {
   __ bind(&runtime);
   __ TailCallRuntime(Runtime::kRegExpExec, 4, 1);
 #endif  // V8_INTERPRETED_REGEXP
+}
+
+
+void RegExpConstructResultStub::Generate(MacroAssembler* masm) {
+  const int kMaxInlineLength = 100;
+  Label slowcase;
+  Label done;
+  __ movq(r8, Operand(rsp, kPointerSize * 3));
+  __ JumpIfNotSmi(r8, &slowcase);
+  __ SmiToInteger32(rbx, r8);
+  __ cmpl(rbx, Immediate(kMaxInlineLength));
+  __ j(above, &slowcase);
+  // Smi-tagging is equivalent to multiplying by 2.
+  STATIC_ASSERT(kSmiTag == 0);
+  STATIC_ASSERT(kSmiTagSize == 1);
+  // Allocate RegExpResult followed by FixedArray with size in ebx.
+  // JSArray:   [Map][empty properties][Elements][Length-smi][index][input]
+  // Elements:  [Map][Length][..elements..]
+  __ AllocateInNewSpace(JSRegExpResult::kSize + FixedArray::kHeaderSize,
+                        times_pointer_size,
+                        rbx,  // In: Number of elements.
+                        rax,  // Out: Start of allocation (tagged).
+                        rcx,  // Out: End of allocation.
+                        rdx,  // Scratch register
+                        &slowcase,
+                        TAG_OBJECT);
+  // rax: Start of allocated area, object-tagged.
+  // rbx: Number of array elements as int32.
+  // r8: Number of array elements as smi.
+
+  // Set JSArray map to global.regexp_result_map().
+  __ movq(rdx, ContextOperand(rsi, Context::GLOBAL_INDEX));
+  __ movq(rdx, FieldOperand(rdx, GlobalObject::kGlobalContextOffset));
+  __ movq(rdx, ContextOperand(rdx, Context::REGEXP_RESULT_MAP_INDEX));
+  __ movq(FieldOperand(rax, HeapObject::kMapOffset), rdx);
+
+  // Set empty properties FixedArray.
+  __ Move(FieldOperand(rax, JSObject::kPropertiesOffset),
+          Factory::empty_fixed_array());
+
+  // Set elements to point to FixedArray allocated right after the JSArray.
+  __ lea(rcx, Operand(rax, JSRegExpResult::kSize));
+  __ movq(FieldOperand(rax, JSObject::kElementsOffset), rcx);
+
+  // Set input, index and length fields from arguments.
+  __ movq(r8, Operand(rsp, kPointerSize * 1));
+  __ movq(FieldOperand(rax, JSRegExpResult::kInputOffset), r8);
+  __ movq(r8, Operand(rsp, kPointerSize * 2));
+  __ movq(FieldOperand(rax, JSRegExpResult::kIndexOffset), r8);
+  __ movq(r8, Operand(rsp, kPointerSize * 3));
+  __ movq(FieldOperand(rax, JSArray::kLengthOffset), r8);
+
+  // Fill out the elements FixedArray.
+  // rax: JSArray.
+  // rcx: FixedArray.
+  // rbx: Number of elements in array as int32.
+
+  // Set map.
+  __ Move(FieldOperand(rcx, HeapObject::kMapOffset),
+          Factory::fixed_array_map());
+  // Set length.
+  __ Integer32ToSmi(rdx, rbx);
+  __ movq(FieldOperand(rcx, FixedArray::kLengthOffset), rdx);
+  // Fill contents of fixed-array with the-hole.
+  __ Move(rdx, Factory::the_hole_value());
+  __ lea(rcx, FieldOperand(rcx, FixedArray::kHeaderSize));
+  // Fill fixed array elements with hole.
+  // rax: JSArray.
+  // rbx: Number of elements in array that remains to be filled, as int32.
+  // rcx: Start of elements in FixedArray.
+  // rdx: the hole.
+  Label loop;
+  __ testl(rbx, rbx);
+  __ bind(&loop);
+  __ j(less_equal, &done);  // Jump if ecx is negative or zero.
+  __ subl(rbx, Immediate(1));
+  __ movq(Operand(rcx, rbx, times_pointer_size, 0), rdx);
+  __ jmp(&loop);
+
+  __ bind(&done);
+  __ ret(3 * kPointerSize);
+
+  __ bind(&slowcase);
+  __ TailCallRuntime(Runtime::kRegExpConstructResult, 3, 1);
 }
 
 
@@ -2135,7 +2222,7 @@ void CompareStub::Generate(MacroAssembler* masm) {
     __ JumpIfNotBothSmi(rax, rdx, &non_smi);
     __ subq(rdx, rax);
     __ j(no_overflow, &smi_done);
-    __ neg(rdx);  // Correct sign in case of overflow.
+    __ not_(rdx);  // Correct sign in case of overflow. rdx cannot be 0 here.
     __ bind(&smi_done);
     __ movq(rax, rdx);
     __ ret(0);
@@ -2155,14 +2242,14 @@ void CompareStub::Generate(MacroAssembler* masm) {
 
   // Two identical objects are equal unless they are both NaN or undefined.
   {
-    Label not_identical;
+    NearLabel not_identical;
     __ cmpq(rax, rdx);
     __ j(not_equal, &not_identical);
 
     if (cc_ != equal) {
       // Check for undefined.  undefined OP undefined is false even though
       // undefined == undefined.
-      Label check_for_nan;
+      NearLabel check_for_nan;
       __ CompareRoot(rdx, Heap::kUndefinedValueRootIndex);
       __ j(not_equal, &check_for_nan);
       __ Set(rax, NegativeComparisonResult(cc_));
@@ -2180,7 +2267,7 @@ void CompareStub::Generate(MacroAssembler* masm) {
       __ Set(rax, EQUAL);
       __ ret(0);
     } else {
-      Label heap_number;
+      NearLabel heap_number;
       // If it's not a heap number, then return equal for (in)equality operator.
       __ Cmp(FieldOperand(rdx, HeapObject::kMapOffset),
              Factory::heap_number_map());
@@ -2244,7 +2331,7 @@ void CompareStub::Generate(MacroAssembler* masm) {
 
       // If the first object is a JS object, we have done pointer comparison.
       STATIC_ASSERT(LAST_TYPE == JS_FUNCTION_TYPE);
-      Label first_non_object;
+      NearLabel first_non_object;
       __ CmpObjectType(rax, FIRST_JS_OBJECT_TYPE, rcx);
       __ j(below, &first_non_object);
       // Return non-zero (eax (not rax) is not zero)
@@ -2273,7 +2360,7 @@ void CompareStub::Generate(MacroAssembler* masm) {
   // Generate the number comparison code.
   if (include_number_compare_) {
     Label non_number_comparison;
-    Label unordered;
+    NearLabel unordered;
     FloatingPointHelper::LoadSSE2UnknownOperands(masm, &non_number_comparison);
     __ xorl(rax, rax);
     __ xorl(rcx, rcx);
@@ -2337,7 +2424,7 @@ void CompareStub::Generate(MacroAssembler* masm) {
     // Not strict equality.  Objects are unequal if
     // they are both JSObjects and not undetectable,
     // and their pointers are different.
-    Label not_both_objects, return_unequal;
+    NearLabel not_both_objects, return_unequal;
     // At most one is a smi, so we can test for smi by adding the two.
     // A smi plus a heap object has the low bit set, a heap object plus
     // a heap object has the low bit clear.
@@ -2406,16 +2493,7 @@ void CompareStub::BranchIfNonSymbol(MacroAssembler* masm,
 
 
 void StackCheckStub::Generate(MacroAssembler* masm) {
-  // Because builtins always remove the receiver from the stack, we
-  // have to fake one to avoid underflowing the stack. The receiver
-  // must be inserted below the return address on the stack so we
-  // temporarily store that in a register.
-  __ pop(rax);
-  __ Push(Smi::FromInt(0));
-  __ push(rax);
-
-  // Do tail-call to runtime routine.
-  __ TailCallRuntime(Runtime::kStackGuard, 1, 1);
+  __ TailCallRuntime(Runtime::kStackGuard, 0, 1);
 }
 
 
@@ -2495,58 +2573,12 @@ void CEntryStub::GenerateThrowTOS(MacroAssembler* masm) {
   // Before returning we restore the context from the frame pointer if not NULL.
   // The frame pointer is NULL in the exception handler of a JS entry frame.
   __ xor_(rsi, rsi);  // tentatively set context pointer to NULL
-  Label skip;
+  NearLabel skip;
   __ cmpq(rbp, Immediate(0));
   __ j(equal, &skip);
   __ movq(rsi, Operand(rbp, StandardFrameConstants::kContextOffset));
   __ bind(&skip);
   __ ret(0);
-}
-
-
-void ApiGetterEntryStub::Generate(MacroAssembler* masm) {
-  Label empty_result;
-  Label prologue;
-  Label promote_scheduled_exception;
-  __ EnterApiExitFrame(kStackSpace, 0);
-  ASSERT_EQ(kArgc, 4);
-#ifdef _WIN64
-  // All the parameters should be set up by a caller.
-#else
-  // Set 1st parameter register with property name.
-  __ movq(rsi, rdx);
-  // Second parameter register rdi should be set with pointer to AccessorInfo
-  // by a caller.
-#endif
-  // Call the api function!
-  __ movq(rax,
-          reinterpret_cast<int64_t>(fun()->address()),
-          RelocInfo::RUNTIME_ENTRY);
-  __ call(rax);
-  // Check if the function scheduled an exception.
-  ExternalReference scheduled_exception_address =
-      ExternalReference::scheduled_exception_address();
-  __ movq(rsi, scheduled_exception_address);
-  __ Cmp(Operand(rsi, 0), Factory::the_hole_value());
-  __ j(not_equal, &promote_scheduled_exception);
-#ifdef _WIN64
-  // rax keeps a pointer to v8::Handle, unpack it.
-  __ movq(rax, Operand(rax, 0));
-#endif
-  // Check if the result handle holds 0.
-  __ testq(rax, rax);
-  __ j(zero, &empty_result);
-  // It was non-zero.  Dereference to get the result value.
-  __ movq(rax, Operand(rax, 0));
-  __ bind(&prologue);
-  __ LeaveExitFrame();
-  __ ret(0);
-  __ bind(&promote_scheduled_exception);
-  __ TailCallRuntime(Runtime::kPromoteScheduledException, 0, 1);
-  __ bind(&empty_result);
-  // It was zero; the result is undefined.
-  __ Move(rax, Factory::undefined_value());
-  __ jmp(&prologue);
 }
 
 
@@ -2602,18 +2634,18 @@ void CEntryStub::GenerateCore(MacroAssembler* masm,
 #ifdef _WIN64
   // Windows 64-bit ABI passes arguments in rcx, rdx, r8, r9
   // Store Arguments object on stack, below the 4 WIN64 ABI parameter slots.
-  __ movq(Operand(rsp, 4 * kPointerSize), r14);  // argc.
-  __ movq(Operand(rsp, 5 * kPointerSize), r12);  // argv.
+  __ movq(StackSpaceOperand(0), r14);  // argc.
+  __ movq(StackSpaceOperand(1), r12);  // argv.
   if (result_size_ < 2) {
     // Pass a pointer to the Arguments object as the first argument.
     // Return result in single register (rax).
-    __ lea(rcx, Operand(rsp, 4 * kPointerSize));
+    __ lea(rcx, StackSpaceOperand(0));
   } else {
     ASSERT_EQ(2, result_size_);
     // Pass a pointer to the result location as the first argument.
-    __ lea(rcx, Operand(rsp, 6 * kPointerSize));
+    __ lea(rcx, StackSpaceOperand(2));
     // Pass a pointer to the Arguments object as the second argument.
-    __ lea(rdx, Operand(rsp, 4 * kPointerSize));
+    __ lea(rdx, StackSpaceOperand(0));
   }
 
 #else  // _WIN64
@@ -2649,13 +2681,13 @@ void CEntryStub::GenerateCore(MacroAssembler* masm,
   __ j(zero, &failure_returned);
 
   // Exit the JavaScript to C++ exit frame.
-  __ LeaveExitFrame(result_size_);
+  __ LeaveExitFrame();
   __ ret(0);
 
   // Handling of failure.
   __ bind(&failure_returned);
 
-  Label retry;
+  NearLabel retry;
   // If the returned exception is RETRY_AFTER_GC continue at retry label
   STATIC_ASSERT(Failure::RETRY_AFTER_GC == 0);
   __ testl(rax, Immediate(((1 << kFailureTypeTagSize) - 1) << kFailureTagSize));
@@ -2695,7 +2727,7 @@ void CEntryStub::GenerateThrowUncatchable(MacroAssembler* masm,
   __ movq(rsp, Operand(kScratchRegister, 0));
 
   // Unwind the handlers until the ENTRY handler is found.
-  Label loop, done;
+  NearLabel loop, done;
   __ bind(&loop);
   // Load the type of the current stack handler.
   const int kStateOffset = StackHandlerConstants::kStateOffset;
@@ -2753,7 +2785,12 @@ void CEntryStub::Generate(MacroAssembler* masm) {
   // builtin once.
 
   // Enter the exit frame that transitions from JavaScript to C++.
-  __ EnterExitFrame(result_size_);
+#ifdef _WIN64
+  int arg_stack_space = (result_size_ < 2 ? 2 : 4);
+#else
+  int arg_stack_space = 0;
+#endif
+  __ EnterExitFrame(arg_stack_space);
 
   // rax: Holds the context at this point, but should not be used.
   //      On entry to code generated by GenerateCore, it must hold
@@ -2965,7 +3002,7 @@ void InstanceofStub::Generate(MacroAssembler* masm) {
   // rdx is function, rax is map.
 
   // Look up the function and the map in the instanceof cache.
-  Label miss;
+  NearLabel miss;
   __ CompareRoot(rdx, Heap::kInstanceofCacheFunctionRootIndex);
   __ j(not_equal, &miss);
   __ CompareRoot(rax, Heap::kInstanceofCacheMapRootIndex);
@@ -2993,7 +3030,7 @@ void InstanceofStub::Generate(MacroAssembler* masm) {
   __ movq(rcx, FieldOperand(rax, Map::kPrototypeOffset));
 
   // Loop through the prototype chain looking for the function prototype.
-  Label loop, is_instance, is_not_instance;
+  NearLabel loop, is_instance, is_not_instance;
   __ LoadRoot(kScratchRegister, Heap::kNullValueRootIndex);
   __ bind(&loop);
   __ cmpq(rcx, rbx);
@@ -3305,7 +3342,7 @@ void StringAddStub::Generate(MacroAssembler* masm) {
   // rax: first string
   // rdx: second string
   // Check if either of the strings are empty. In that case return the other.
-  Label second_not_zero_length, both_not_zero_length;
+  NearLabel second_not_zero_length, both_not_zero_length;
   __ movq(rcx, FieldOperand(rdx, String::kLengthOffset));
   __ SmiTest(rcx);
   __ j(not_zero, &second_not_zero_length);
@@ -3343,7 +3380,7 @@ void StringAddStub::Generate(MacroAssembler* masm) {
 
   // Look at the length of the result of adding the two strings.
   STATIC_ASSERT(String::kMaxLength <= Smi::kMaxValue / 2);
-  __ SmiAdd(rbx, rbx, rcx, NULL);
+  __ SmiAdd(rbx, rbx, rcx);
   // Use the runtime system when adding two one character strings, as it
   // contains optimizations for this specific case using the symbol table.
   __ SmiCompare(rbx, Smi::FromInt(2));
@@ -3561,7 +3598,7 @@ void StringHelper::GenerateCopyCharactersREP(MacroAssembler* masm,
   ASSERT(count.is(rcx));  // rep movs count
 
   // Nothing to do for zero characters.
-  Label done;
+  NearLabel done;
   __ testl(count, count);
   __ j(zero, &done);
 
@@ -3572,7 +3609,7 @@ void StringHelper::GenerateCopyCharactersREP(MacroAssembler* masm,
   }
 
   // Don't enter the rep movs if there are less than 4 bytes to copy.
-  Label last_bytes;
+  NearLabel last_bytes;
   __ testl(count, Immediate(~7));
   __ j(zero, &last_bytes);
 
@@ -3616,7 +3653,7 @@ void StringHelper::GenerateTwoCharacterSymbolTableProbe(MacroAssembler* masm,
 
   // Make sure that both characters are not digits as such strings has a
   // different hash algorithm. Don't try to look for these in the symbol table.
-  Label not_array_index;
+  NearLabel not_array_index;
   __ leal(scratch, Operand(c1, -'0'));
   __ cmpl(scratch, Immediate(static_cast<int>('9' - '0')));
   __ j(above, &not_array_index);
@@ -3801,9 +3838,9 @@ void SubStringStub::Generate(MacroAssembler* masm) {
   Label result_longer_than_two;
   __ movq(rcx, Operand(rsp, kToOffset));
   __ movq(rdx, Operand(rsp, kFromOffset));
-  __ JumpIfNotBothPositiveSmi(rcx, rdx, &runtime);
+  __ JumpUnlessBothNonNegativeSmi(rcx, rdx, &runtime);
 
-  __ SmiSub(rcx, rcx, rdx, NULL);  // Overflow doesn't happen.
+  __ SmiSub(rcx, rcx, rdx);  // Overflow doesn't happen.
   __ cmpq(FieldOperand(rax, String::kLengthOffset), rcx);
   Label return_rax;
   __ j(equal, &return_rax);
@@ -3936,21 +3973,20 @@ void StringCompareStub::GenerateCompareFlatAsciiStrings(MacroAssembler* masm,
   __ movq(scratch4, scratch1);
   __ SmiSub(scratch4,
             scratch4,
-            FieldOperand(right, String::kLengthOffset),
-            NULL);
+            FieldOperand(right, String::kLengthOffset));
   // Register scratch4 now holds left.length - right.length.
   const Register length_difference = scratch4;
-  Label left_shorter;
+  NearLabel left_shorter;
   __ j(less, &left_shorter);
   // The right string isn't longer that the left one.
   // Get the right string's length by subtracting the (non-negative) difference
   // from the left string's length.
-  __ SmiSub(scratch1, scratch1, length_difference, NULL);
+  __ SmiSub(scratch1, scratch1, length_difference);
   __ bind(&left_shorter);
   // Register scratch1 now holds Min(left.length, right.length).
   const Register min_length = scratch1;
 
-  Label compare_lengths;
+  NearLabel compare_lengths;
   // If min-length is zero, go directly to comparing lengths.
   __ SmiTest(min_length);
   __ j(zero, &compare_lengths);
@@ -3958,7 +3994,7 @@ void StringCompareStub::GenerateCompareFlatAsciiStrings(MacroAssembler* masm,
   __ SmiToInteger32(min_length, min_length);
 
   // Registers scratch2 and scratch3 are free.
-  Label result_not_equal;
+  NearLabel result_not_equal;
   Label loop;
   {
     // Check characters 0 .. min_length - 1 in a loop.
@@ -3994,7 +4030,7 @@ void StringCompareStub::GenerateCompareFlatAsciiStrings(MacroAssembler* masm,
   __ Move(rax, Smi::FromInt(EQUAL));
   __ ret(0);
 
-  Label result_greater;
+  NearLabel result_greater;
   __ bind(&result_not_equal);
   // Unequal comparison of left to right, either character or length.
   __ j(greater, &result_greater);
@@ -4022,7 +4058,7 @@ void StringCompareStub::Generate(MacroAssembler* masm) {
   __ movq(rax, Operand(rsp, 1 * kPointerSize));  // right
 
   // Check for identity.
-  Label not_same;
+  NearLabel not_same;
   __ cmpq(rdx, rax);
   __ j(not_equal, &not_same);
   __ Move(rax, Smi::FromInt(EQUAL));
@@ -4046,6 +4082,25 @@ void StringCompareStub::Generate(MacroAssembler* masm) {
   // tagged as a small integer.
   __ bind(&runtime);
   __ TailCallRuntime(Runtime::kStringCompare, 2, 1);
+}
+
+void ICCompareStub::GenerateSmis(MacroAssembler* masm) {
+  UNIMPLEMENTED();
+}
+
+
+void ICCompareStub::GenerateHeapNumbers(MacroAssembler* masm) {
+  UNIMPLEMENTED();
+}
+
+
+void ICCompareStub::GenerateObjects(MacroAssembler* masm) {
+  UNIMPLEMENTED();
+}
+
+
+void ICCompareStub::GenerateMiss(MacroAssembler* masm) {
+  UNIMPLEMENTED();
 }
 
 #undef __

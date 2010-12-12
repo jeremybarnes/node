@@ -1,4 +1,4 @@
-// Copyright 2006-2009 the V8 project authors. All rights reserved.
+// Copyright 2010 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -33,16 +33,19 @@
 #include "api.h"
 #include "arguments.h"
 #include "codegen.h"
+#include "compilation-cache.h"
 #include "compiler.h"
 #include "cpu.h"
 #include "dateparser-inl.h"
 #include "debug.h"
+#include "deoptimizer.h"
 #include "execution.h"
 #include "jsregexp.h"
 #include "liveedit.h"
 #include "parser.h"
 #include "platform.h"
 #include "runtime.h"
+#include "runtime-profiler.h"
 #include "scopeinfo.h"
 #include "smart-pointer.h"
 #include "stub-cache.h"
@@ -99,12 +102,14 @@ namespace internal {
 static StaticResource<StringInputBuffer> runtime_string_input_buffer;
 
 
-MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
+MUST_USE_RESULT static MaybeObject* DeepCopyBoilerplate(JSObject* boilerplate) {
   StackLimitCheck check;
   if (check.HasOverflowed()) return Top::StackOverflow();
 
-  Object* result = Heap::CopyJSObject(boilerplate);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result = Heap::CopyJSObject(boilerplate);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
   JSObject* copy = JSObject::cast(result);
 
   // Deep copy local properties.
@@ -114,8 +119,9 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
       Object* value = properties->get(i);
       if (value->IsJSObject()) {
         JSObject* js_object = JSObject::cast(value);
-        result = DeepCopyBoilerplate(js_object);
-        if (result->IsFailure()) return result;
+        { MaybeObject* maybe_result = DeepCopyBoilerplate(js_object);
+          if (!maybe_result->ToObject(&result)) return maybe_result;
+        }
         properties->set(i, result);
       }
     }
@@ -124,14 +130,17 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
       Object* value = copy->InObjectPropertyAt(i);
       if (value->IsJSObject()) {
         JSObject* js_object = JSObject::cast(value);
-        result = DeepCopyBoilerplate(js_object);
-        if (result->IsFailure()) return result;
+        { MaybeObject* maybe_result = DeepCopyBoilerplate(js_object);
+          if (!maybe_result->ToObject(&result)) return maybe_result;
+        }
         copy->InObjectPropertyAtPut(i, result);
       }
     }
   } else {
-    result = Heap::AllocateFixedArray(copy->NumberOfLocalProperties(NONE));
-    if (result->IsFailure()) return result;
+    { MaybeObject* maybe_result =
+          Heap::AllocateFixedArray(copy->NumberOfLocalProperties(NONE));
+      if (!maybe_result->ToObject(&result)) return maybe_result;
+    }
     FixedArray* names = FixedArray::cast(result);
     copy->GetLocalPropertyNames(names, 0);
     for (int i = 0; i < names->length(); i++) {
@@ -143,14 +152,17 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
       // In particular, don't try to copy the length attribute of
       // an array.
       if (attributes != NONE) continue;
-      Object* value = copy->GetProperty(key_string, &attributes);
-      ASSERT(!value->IsFailure());
+      Object* value =
+          copy->GetProperty(key_string, &attributes)->ToObjectUnchecked();
       if (value->IsJSObject()) {
         JSObject* js_object = JSObject::cast(value);
-        result = DeepCopyBoilerplate(js_object);
-        if (result->IsFailure()) return result;
-        result = copy->SetProperty(key_string, result, NONE);
-        if (result->IsFailure()) return result;
+        { MaybeObject* maybe_result = DeepCopyBoilerplate(js_object);
+          if (!maybe_result->ToObject(&result)) return maybe_result;
+        }
+        { MaybeObject* maybe_result =
+              copy->SetProperty(key_string, result, NONE);
+          if (!maybe_result->ToObject(&result)) return maybe_result;
+        }
       }
     }
   }
@@ -173,8 +185,9 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
           Object* value = elements->get(i);
           if (value->IsJSObject()) {
             JSObject* js_object = JSObject::cast(value);
-            result = DeepCopyBoilerplate(js_object);
-            if (result->IsFailure()) return result;
+            { MaybeObject* maybe_result = DeepCopyBoilerplate(js_object);
+              if (!maybe_result->ToObject(&result)) return maybe_result;
+            }
             elements->set(i, result);
           }
         }
@@ -190,8 +203,9 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
           Object* value = element_dictionary->ValueAt(i);
           if (value->IsJSObject()) {
             JSObject* js_object = JSObject::cast(value);
-            result = DeepCopyBoilerplate(js_object);
-            if (result->IsFailure()) return result;
+            { MaybeObject* maybe_result = DeepCopyBoilerplate(js_object);
+              if (!maybe_result->ToObject(&result)) return maybe_result;
+            }
             element_dictionary->ValueAtPut(i, result);
           }
         }
@@ -206,13 +220,13 @@ MUST_USE_RESULT static Object* DeepCopyBoilerplate(JSObject* boilerplate) {
 }
 
 
-static Object* Runtime_CloneLiteralBoilerplate(Arguments args) {
+static MaybeObject* Runtime_CloneLiteralBoilerplate(Arguments args) {
   CONVERT_CHECKED(JSObject, boilerplate, args[0]);
   return DeepCopyBoilerplate(boilerplate);
 }
 
 
-static Object* Runtime_CloneShallowLiteralBoilerplate(Arguments args) {
+static MaybeObject* Runtime_CloneShallowLiteralBoilerplate(Arguments args) {
   CONVERT_CHECKED(JSObject, boilerplate, args[0]);
   return Heap::CopyJSObject(boilerplate);
 }
@@ -403,7 +417,7 @@ static Handle<Object> CreateLiteralBoilerplate(
 }
 
 
-static Object* Runtime_CreateArrayLiteralBoilerplate(Arguments args) {
+static MaybeObject* Runtime_CreateArrayLiteralBoilerplate(Arguments args) {
   // Takes a FixedArray of elements containing the literal elements of
   // the array literal and produces JSArray with those elements.
   // Additionally takes the literals array of the surrounding function
@@ -424,7 +438,7 @@ static Object* Runtime_CreateArrayLiteralBoilerplate(Arguments args) {
 }
 
 
-static Object* Runtime_CreateObjectLiteral(Arguments args) {
+static MaybeObject* Runtime_CreateObjectLiteral(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
   CONVERT_ARG_CHECKED(FixedArray, literals, 0);
@@ -447,7 +461,7 @@ static Object* Runtime_CreateObjectLiteral(Arguments args) {
 }
 
 
-static Object* Runtime_CreateObjectLiteralShallow(Arguments args) {
+static MaybeObject* Runtime_CreateObjectLiteralShallow(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
   CONVERT_ARG_CHECKED(FixedArray, literals, 0);
@@ -470,7 +484,7 @@ static Object* Runtime_CreateObjectLiteralShallow(Arguments args) {
 }
 
 
-static Object* Runtime_CreateArrayLiteral(Arguments args) {
+static MaybeObject* Runtime_CreateArrayLiteral(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(FixedArray, literals, 0);
@@ -489,7 +503,7 @@ static Object* Runtime_CreateArrayLiteral(Arguments args) {
 }
 
 
-static Object* Runtime_CreateArrayLiteralShallow(Arguments args) {
+static MaybeObject* Runtime_CreateArrayLiteralShallow(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(FixedArray, literals, 0);
@@ -512,24 +526,28 @@ static Object* Runtime_CreateArrayLiteralShallow(Arguments args) {
 }
 
 
-static Object* Runtime_CreateCatchExtensionObject(Arguments args) {
+static MaybeObject* Runtime_CreateCatchExtensionObject(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(String, key, args[0]);
   Object* value = args[1];
   // Create a catch context extension object.
   JSFunction* constructor =
       Top::context()->global_context()->context_extension_function();
-  Object* object = Heap::AllocateJSObject(constructor);
-  if (object->IsFailure()) return object;
+  Object* object;
+  { MaybeObject* maybe_object = Heap::AllocateJSObject(constructor);
+    if (!maybe_object->ToObject(&object)) return maybe_object;
+  }
   // Assign the exception value to the catch variable and make sure
   // that the catch variable is DontDelete.
-  value = JSObject::cast(object)->SetProperty(key, value, DONT_DELETE);
-  if (value->IsFailure()) return value;
+  { MaybeObject* maybe_value =
+        JSObject::cast(object)->SetProperty(key, value, DONT_DELETE);
+    if (!maybe_value->ToObject(&value)) return maybe_value;
+  }
   return object;
 }
 
 
-static Object* Runtime_ClassOf(Arguments args) {
+static MaybeObject* Runtime_ClassOf(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Object* obj = args[0];
@@ -538,7 +556,7 @@ static Object* Runtime_ClassOf(Arguments args) {
 }
 
 
-static Object* Runtime_IsInPrototypeChain(Arguments args) {
+static MaybeObject* Runtime_IsInPrototypeChain(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   // See ECMA-262, section 15.3.5.3, page 88 (steps 5 - 8).
@@ -554,7 +572,7 @@ static Object* Runtime_IsInPrototypeChain(Arguments args) {
 
 
 // Inserts an object as the hidden prototype of another object.
-static Object* Runtime_SetHiddenPrototype(Arguments args) {
+static MaybeObject* Runtime_SetHiddenPrototype(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(JSObject, jsobject, args[0]);
@@ -568,12 +586,19 @@ static Object* Runtime_SetHiddenPrototype(Arguments args) {
   RUNTIME_ASSERT(!proto->map()->is_hidden_prototype());
 
   // Allocate up front before we start altering state in case we get a GC.
-  Object* map_or_failure = proto->map()->CopyDropTransitions();
-  if (map_or_failure->IsFailure()) return map_or_failure;
+  Object* map_or_failure;
+  { MaybeObject* maybe_map_or_failure = proto->map()->CopyDropTransitions();
+    if (!maybe_map_or_failure->ToObject(&map_or_failure)) {
+      return maybe_map_or_failure;
+    }
+  }
   Map* new_proto_map = Map::cast(map_or_failure);
 
-  map_or_failure = jsobject->map()->CopyDropTransitions();
-  if (map_or_failure->IsFailure()) return map_or_failure;
+  { MaybeObject* maybe_map_or_failure = jsobject->map()->CopyDropTransitions();
+    if (!maybe_map_or_failure->ToObject(&map_or_failure)) {
+      return maybe_map_or_failure;
+    }
+  }
   Map* new_map = Map::cast(map_or_failure);
 
   // Set proto's prototype to be the old prototype of the object.
@@ -589,7 +614,23 @@ static Object* Runtime_SetHiddenPrototype(Arguments args) {
 }
 
 
-static Object* Runtime_IsConstructCall(Arguments args) {
+// Sets the magic number that identifies a function as one of the special
+// math functions that can be inlined.
+static MaybeObject* Runtime_SetMathFunctionId(Arguments args) {
+  NoHandleAllocation ha;
+  ASSERT(args.length() == 2);
+  CONVERT_CHECKED(JSFunction, function, args[0]);
+  CONVERT_CHECKED(Smi, id, args[1]);
+  RUNTIME_ASSERT(id->value() >= 0);
+  RUNTIME_ASSERT(id->value() < SharedFunctionInfo::max_math_id_number());
+
+  function->shared()->set_math_function_id(id->value());
+
+  return Heap::undefined_value();
+}
+
+
+static MaybeObject* Runtime_IsConstructCall(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 0);
   JavaScriptFrameIterator it;
@@ -632,62 +673,84 @@ enum PropertyDescriptorIndices {
 //         [false, value, Writeable, Enumerable, Configurable]
 //  if args[1] is an accessor on args[0]
 //         [true, GetFunction, SetFunction, Enumerable, Configurable]
-static Object* Runtime_GetOwnProperty(Arguments args) {
+static MaybeObject* Runtime_GetOwnProperty(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   Handle<FixedArray> elms = Factory::NewFixedArray(DESCRIPTOR_SIZE);
   Handle<JSArray> desc = Factory::NewJSArrayWithElements(elms);
   LookupResult result;
-  CONVERT_CHECKED(JSObject, obj, args[0]);
-  CONVERT_CHECKED(String, name, args[1]);
+  CONVERT_ARG_CHECKED(JSObject, obj, 0);
+  CONVERT_ARG_CHECKED(String, name, 1);
 
   // This could be an element.
   uint32_t index;
   if (name->AsArrayIndex(&index)) {
-    if (!obj->HasLocalElement(index)) {
-      return Heap::undefined_value();
-    }
+    switch (obj->HasLocalElement(index)) {
+      case JSObject::UNDEFINED_ELEMENT:
+        return Heap::undefined_value();
 
-    // Special handling of string objects according to ECMAScript 5 15.5.5.2.
-    // Note that this might be a string object with elements other than the
-    // actual string value. This is covered by the subsequent cases.
-    if (obj->IsStringObjectWithCharacterAt(index)) {
-      JSValue* js_value = JSValue::cast(obj);
-      String* str = String::cast(js_value->value());
-      elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
-      elms->set(VALUE_INDEX, str->SubString(index, index+1));
-      elms->set(WRITABLE_INDEX, Heap::false_value());
-      elms->set(ENUMERABLE_INDEX,  Heap::false_value());
-      elms->set(CONFIGURABLE_INDEX, Heap::false_value());
-      return *desc;
-    }
+      case JSObject::STRING_CHARACTER_ELEMENT: {
+        // Special handling of string objects according to ECMAScript 5
+        // 15.5.5.2. Note that this might be a string object with elements
+        // other than the actual string value. This is covered by the
+        // subsequent cases.
+        Handle<JSValue> js_value = Handle<JSValue>::cast(obj);
+        Handle<String> str(String::cast(js_value->value()));
+        Handle<String> substr = SubString(str, index, index+1, NOT_TENURED);
 
-    // This can potentially be an element in the elements dictionary or
-    // a fast element.
-    if (obj->HasDictionaryElements()) {
-      NumberDictionary* dictionary = obj->element_dictionary();
-      int entry = dictionary->FindEntry(index);
-      PropertyDetails details = dictionary->DetailsAt(entry);
-      elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
-      elms->set(VALUE_INDEX, dictionary->ValueAt(entry));
-      elms->set(WRITABLE_INDEX, Heap::ToBoolean(!details.IsReadOnly()));
-      elms->set(ENUMERABLE_INDEX, Heap::ToBoolean(!details.IsDontEnum()));
-      elms->set(CONFIGURABLE_INDEX, Heap::ToBoolean(!details.IsDontDelete()));
-      return *desc;
-    } else {
-      // Elements that are stored as array elements always has:
-      // writable: true, configurable: true, enumerable: true.
-      elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
-      elms->set(VALUE_INDEX, obj->GetElement(index));
-      elms->set(WRITABLE_INDEX, Heap::true_value());
-      elms->set(ENUMERABLE_INDEX,  Heap::true_value());
-      elms->set(CONFIGURABLE_INDEX, Heap::true_value());
-      return *desc;
+        elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
+        elms->set(VALUE_INDEX, *substr);
+        elms->set(WRITABLE_INDEX, Heap::false_value());
+        elms->set(ENUMERABLE_INDEX,  Heap::false_value());
+        elms->set(CONFIGURABLE_INDEX, Heap::false_value());
+        return *desc;
+      }
+
+      case JSObject::INTERCEPTED_ELEMENT:
+      case JSObject::FAST_ELEMENT: {
+        elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
+        Handle<Object> element = GetElement(Handle<Object>(obj), index);
+        elms->set(VALUE_INDEX, *element);
+        elms->set(WRITABLE_INDEX, Heap::true_value());
+        elms->set(ENUMERABLE_INDEX,  Heap::true_value());
+        elms->set(CONFIGURABLE_INDEX, Heap::true_value());
+        return *desc;
+      }
+
+      case JSObject::DICTIONARY_ELEMENT: {
+        NumberDictionary* dictionary = obj->element_dictionary();
+        int entry = dictionary->FindEntry(index);
+        ASSERT(entry != NumberDictionary::kNotFound);
+        PropertyDetails details = dictionary->DetailsAt(entry);
+        switch (details.type()) {
+          case CALLBACKS: {
+            // This is an accessor property with getter and/or setter.
+            FixedArray* callbacks =
+                FixedArray::cast(dictionary->ValueAt(entry));
+            elms->set(IS_ACCESSOR_INDEX, Heap::true_value());
+            elms->set(GETTER_INDEX, callbacks->get(0));
+            elms->set(SETTER_INDEX, callbacks->get(1));
+            break;
+          }
+          case NORMAL:
+            // This is a data property.
+            elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
+            elms->set(VALUE_INDEX, dictionary->ValueAt(entry));
+            elms->set(WRITABLE_INDEX, Heap::ToBoolean(!details.IsReadOnly()));
+            break;
+          default:
+            UNREACHABLE();
+            break;
+        }
+        elms->set(ENUMERABLE_INDEX, Heap::ToBoolean(!details.IsDontEnum()));
+        elms->set(CONFIGURABLE_INDEX, Heap::ToBoolean(!details.IsDontDelete()));
+        return *desc;
+      }
     }
   }
 
   // Use recursive implementation to also traverse hidden prototypes
-  GetOwnPropertyImplementation(obj, name, &result);
+  GetOwnPropertyImplementation(*obj, *name, &result);
 
   if (!result.IsProperty()) {
     return Heap::undefined_value();
@@ -697,8 +760,11 @@ static Object* Runtime_GetOwnProperty(Arguments args) {
     if (structure->IsProxy() || structure->IsAccessorInfo()) {
       // Property that is internally implemented as a callback or
       // an API defined callback.
-      Object* value = obj->GetPropertyWithCallback(
-          obj, structure, name, result.holder());
+      Object* value;
+      { MaybeObject* maybe_value = obj->GetPropertyWithCallback(
+            *obj, structure, *name, result.holder());
+        if (!maybe_value->ToObject(&value)) return maybe_value;
+      }
       elms->set(IS_ACCESSOR_INDEX, Heap::false_value());
       elms->set(VALUE_INDEX, value);
       elms->set(WRITABLE_INDEX, Heap::ToBoolean(!result.IsReadOnly()));
@@ -722,13 +788,13 @@ static Object* Runtime_GetOwnProperty(Arguments args) {
 }
 
 
-static Object* Runtime_PreventExtensions(Arguments args) {
+static MaybeObject* Runtime_PreventExtensions(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(JSObject, obj, args[0]);
   return obj->PreventExtensions();
 }
 
-static Object* Runtime_IsExtensible(Arguments args) {
+static MaybeObject* Runtime_IsExtensible(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(JSObject, obj, args[0]);
   return obj->map()->is_extensible() ?  Heap::true_value()
@@ -736,7 +802,7 @@ static Object* Runtime_IsExtensible(Arguments args) {
 }
 
 
-static Object* Runtime_RegExpCompile(Arguments args) {
+static MaybeObject* Runtime_RegExpCompile(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(JSRegExp, re, 0);
@@ -748,7 +814,7 @@ static Object* Runtime_RegExpCompile(Arguments args) {
 }
 
 
-static Object* Runtime_CreateApiFunction(Arguments args) {
+static MaybeObject* Runtime_CreateApiFunction(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(FunctionTemplateInfo, data, 0);
@@ -756,7 +822,7 @@ static Object* Runtime_CreateApiFunction(Arguments args) {
 }
 
 
-static Object* Runtime_IsTemplate(Arguments args) {
+static MaybeObject* Runtime_IsTemplate(Arguments args) {
   ASSERT(args.length() == 1);
   Object* arg = args[0];
   bool result = arg->IsObjectTemplateInfo() || arg->IsFunctionTemplateInfo();
@@ -764,7 +830,7 @@ static Object* Runtime_IsTemplate(Arguments args) {
 }
 
 
-static Object* Runtime_GetTemplateField(Arguments args) {
+static MaybeObject* Runtime_GetTemplateField(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(HeapObject, templ, args[0]);
   CONVERT_CHECKED(Smi, field, args[1]);
@@ -783,15 +849,17 @@ static Object* Runtime_GetTemplateField(Arguments args) {
 }
 
 
-static Object* Runtime_DisableAccessChecks(Arguments args) {
+static MaybeObject* Runtime_DisableAccessChecks(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(HeapObject, object, args[0]);
   Map* old_map = object->map();
   bool needs_access_checks = old_map->is_access_check_needed();
   if (needs_access_checks) {
     // Copy map so it won't interfere constructor's initial map.
-    Object* new_map = old_map->CopyDropTransitions();
-    if (new_map->IsFailure()) return new_map;
+    Object* new_map;
+    { MaybeObject* maybe_new_map = old_map->CopyDropTransitions();
+      if (!maybe_new_map->ToObject(&new_map)) return maybe_new_map;
+    }
 
     Map::cast(new_map)->set_is_access_check_needed(false);
     object->set_map(Map::cast(new_map));
@@ -800,14 +868,16 @@ static Object* Runtime_DisableAccessChecks(Arguments args) {
 }
 
 
-static Object* Runtime_EnableAccessChecks(Arguments args) {
+static MaybeObject* Runtime_EnableAccessChecks(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(HeapObject, object, args[0]);
   Map* old_map = object->map();
   if (!old_map->is_access_check_needed()) {
     // Copy map so it won't interfere constructor's initial map.
-    Object* new_map = old_map->CopyDropTransitions();
-    if (new_map->IsFailure()) return new_map;
+    Object* new_map;
+    { MaybeObject* maybe_new_map = old_map->CopyDropTransitions();
+      if (!maybe_new_map->ToObject(&new_map)) return maybe_new_map;
+    }
 
     Map::cast(new_map)->set_is_access_check_needed(true);
     object->set_map(Map::cast(new_map));
@@ -816,7 +886,7 @@ static Object* Runtime_EnableAccessChecks(Arguments args) {
 }
 
 
-static Object* ThrowRedeclarationError(const char* type, Handle<String> name) {
+static Failure* ThrowRedeclarationError(const char* type, Handle<String> name) {
   HandleScope scope;
   Handle<Object> type_handle = Factory::NewStringFromAscii(CStrVector(type));
   Handle<Object> args[2] = { type_handle, name };
@@ -826,7 +896,7 @@ static Object* ThrowRedeclarationError(const char* type, Handle<String> name) {
 }
 
 
-static Object* Runtime_DeclareGlobals(Arguments args) {
+static MaybeObject* Runtime_DeclareGlobals(Arguments args) {
   HandleScope scope;
   Handle<GlobalObject> global = Handle<GlobalObject>(Top::context()->global());
 
@@ -938,7 +1008,7 @@ static Object* Runtime_DeclareGlobals(Arguments args) {
 }
 
 
-static Object* Runtime_DeclareContextSlot(Arguments args) {
+static MaybeObject* Runtime_DeclareContextSlot(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
 
@@ -946,7 +1016,7 @@ static Object* Runtime_DeclareContextSlot(Arguments args) {
   Handle<String> name(String::cast(args[1]));
   PropertyAttributes mode =
       static_cast<PropertyAttributes>(Smi::cast(args[2])->value());
-  ASSERT(mode == READ_ONLY || mode == NONE);
+  RUNTIME_ASSERT(mode == READ_ONLY || mode == NONE);
   Handle<Object> initial_value(args[3]);
 
   // Declarations are always done in the function context.
@@ -1023,7 +1093,7 @@ static Object* Runtime_DeclareContextSlot(Arguments args) {
 }
 
 
-static Object* Runtime_InitializeVarGlobal(Arguments args) {
+static MaybeObject* Runtime_InitializeVarGlobal(Arguments args) {
   NoHandleAllocation nha;
 
   // Determine if we need to assign to the variable if it already
@@ -1116,7 +1186,7 @@ static Object* Runtime_InitializeVarGlobal(Arguments args) {
 }
 
 
-static Object* Runtime_InitializeConstGlobal(Arguments args) {
+static MaybeObject* Runtime_InitializeConstGlobal(Arguments args) {
   // All constants are declared with an initial value. The name
   // of the constant is the first argument and the initial value
   // is the second.
@@ -1164,12 +1234,13 @@ static Object* Runtime_InitializeConstGlobal(Arguments args) {
     // Restore global object from context (in case of GC) and continue
     // with setting the value because the property is either absent or
     // read-only. We also have to do redo the lookup.
-    global = Top::context()->global();
+    HandleScope handle_scope;
+    Handle<GlobalObject>global(Top::context()->global());
 
     // BUG 1213579: Handle the case where we have to set a read-only
     // property through an interceptor and only do it if it's
     // uninitialized, e.g. the hole. Nirk...
-    global->SetProperty(*name, *value, attributes);
+    SetProperty(global, name, value, attributes);
     return *value;
   }
 
@@ -1198,7 +1269,7 @@ static Object* Runtime_InitializeConstGlobal(Arguments args) {
 }
 
 
-static Object* Runtime_InitializeConstContextSlot(Arguments args) {
+static MaybeObject* Runtime_InitializeConstContextSlot(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
 
@@ -1303,7 +1374,7 @@ static Object* Runtime_InitializeConstContextSlot(Arguments args) {
 }
 
 
-static Object* Runtime_OptimizeObjectForAddingMultipleProperties(
+static MaybeObject* Runtime_OptimizeObjectForAddingMultipleProperties(
     Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
@@ -1316,7 +1387,7 @@ static Object* Runtime_OptimizeObjectForAddingMultipleProperties(
 }
 
 
-static Object* Runtime_RegExpExec(Arguments args) {
+static MaybeObject* Runtime_RegExpExec(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
   CONVERT_ARG_CHECKED(JSRegExp, regexp, 0);
@@ -1338,19 +1409,23 @@ static Object* Runtime_RegExpExec(Arguments args) {
 }
 
 
-static Object* Runtime_RegExpConstructResult(Arguments args) {
+static MaybeObject* Runtime_RegExpConstructResult(Arguments args) {
   ASSERT(args.length() == 3);
   CONVERT_SMI_CHECKED(elements_count, args[0]);
   if (elements_count > JSArray::kMaxFastElementsLength) {
     return Top::ThrowIllegalOperation();
   }
-  Object* new_object = Heap::AllocateFixedArrayWithHoles(elements_count);
-  if (new_object->IsFailure()) return new_object;
+  Object* new_object;
+  { MaybeObject* maybe_new_object =
+        Heap::AllocateFixedArrayWithHoles(elements_count);
+    if (!maybe_new_object->ToObject(&new_object)) return maybe_new_object;
+  }
   FixedArray* elements = FixedArray::cast(new_object);
-  new_object = Heap::AllocateRaw(JSRegExpResult::kSize,
-                                 NEW_SPACE,
-                                 OLD_POINTER_SPACE);
-  if (new_object->IsFailure()) return new_object;
+  { MaybeObject* maybe_new_object = Heap::AllocateRaw(JSRegExpResult::kSize,
+                                                      NEW_SPACE,
+                                                      OLD_POINTER_SPACE);
+    if (!maybe_new_object->ToObject(&new_object)) return maybe_new_object;
+  }
   {
     AssertNoAllocation no_gc;
     HandleScope scope;
@@ -1368,64 +1443,7 @@ static Object* Runtime_RegExpConstructResult(Arguments args) {
 }
 
 
-static Object* Runtime_RegExpCloneResult(Arguments args) {
-  ASSERT(args.length() == 1);
-  Map* regexp_result_map;
-  {
-    AssertNoAllocation no_gc;
-    HandleScope handles;
-    regexp_result_map = Top::global_context()->regexp_result_map();
-  }
-  if (!args[0]->IsJSArray()) return args[0];
-
-  JSArray* result = JSArray::cast(args[0]);
-  // Arguments to RegExpCloneResult should always be fresh RegExp exec call
-  // results (either a fresh JSRegExpResult or null).
-  // If the argument is not a JSRegExpResult, or isn't unmodified, just return
-  // the argument uncloned.
-  if (result->map() != regexp_result_map) return result;
-
-  // Having the original JSRegExpResult map guarantees that we have
-  // fast elements and no properties except the two in-object properties.
-  ASSERT(result->HasFastElements());
-  ASSERT(result->properties() == Heap::empty_fixed_array());
-  ASSERT_EQ(2, regexp_result_map->inobject_properties());
-
-  Object* new_array_alloc = Heap::AllocateRaw(JSRegExpResult::kSize,
-                                              NEW_SPACE,
-                                              OLD_POINTER_SPACE);
-  if (new_array_alloc->IsFailure()) return new_array_alloc;
-
-  // Set HeapObject map to JSRegExpResult map.
-  reinterpret_cast<HeapObject*>(new_array_alloc)->set_map(regexp_result_map);
-
-  JSArray* new_array = JSArray::cast(new_array_alloc);
-
-  // Copy JSObject properties.
-  new_array->set_properties(result->properties());  // Empty FixedArray.
-
-  // Copy JSObject elements as copy-on-write.
-  FixedArray* elements = FixedArray::cast(result->elements());
-  if (elements != Heap::empty_fixed_array()) {
-    elements->set_map(Heap::fixed_cow_array_map());
-  }
-  new_array->set_elements(elements);
-
-  // Copy JSArray length.
-  new_array->set_length(result->length());
-
-  // Copy JSRegExpResult in-object property fields input and index.
-  new_array->FastPropertyAtPut(JSRegExpResult::kIndexIndex,
-                               result->FastPropertyAt(
-                                   JSRegExpResult::kIndexIndex));
-  new_array->FastPropertyAtPut(JSRegExpResult::kInputIndex,
-                               result->FastPropertyAt(
-                                   JSRegExpResult::kInputIndex));
-  return new_array;
-}
-
-
-static Object* Runtime_RegExpInitializeObject(Arguments args) {
+static MaybeObject* Runtime_RegExpInitializeObject(Arguments args) {
   AssertNoAllocation no_alloc;
   ASSERT(args.length() == 5);
   CONVERT_CHECKED(JSRegExp, regexp, args[0]);
@@ -1457,31 +1475,42 @@ static Object* Runtime_RegExpInitializeObject(Arguments args) {
     return regexp;
   }
 
-  // Map has changed, so use generic, but slower, method.
+  // Map has changed, so use generic, but slower, method.  Since these
+  // properties were all added as DONT_DELETE they must be present and
+  // normal so no failures can be expected.
   PropertyAttributes final =
       static_cast<PropertyAttributes>(READ_ONLY | DONT_ENUM | DONT_DELETE);
   PropertyAttributes writable =
       static_cast<PropertyAttributes>(DONT_ENUM | DONT_DELETE);
-  regexp->IgnoreAttributesAndSetLocalProperty(Heap::source_symbol(),
-                                              source,
-                                              final);
-  regexp->IgnoreAttributesAndSetLocalProperty(Heap::global_symbol(),
-                                              global,
-                                              final);
-  regexp->IgnoreAttributesAndSetLocalProperty(Heap::ignore_case_symbol(),
-                                              ignoreCase,
-                                              final);
-  regexp->IgnoreAttributesAndSetLocalProperty(Heap::multiline_symbol(),
-                                              multiline,
-                                              final);
-  regexp->IgnoreAttributesAndSetLocalProperty(Heap::last_index_symbol(),
-                                              Smi::FromInt(0),
-                                              writable);
+  MaybeObject* result;
+  result = regexp->IgnoreAttributesAndSetLocalProperty(Heap::source_symbol(),
+                                                       source,
+                                                       final);
+  ASSERT(!result->IsFailure());
+  result = regexp->IgnoreAttributesAndSetLocalProperty(Heap::global_symbol(),
+                                                       global,
+                                                       final);
+  ASSERT(!result->IsFailure());
+  result =
+      regexp->IgnoreAttributesAndSetLocalProperty(Heap::ignore_case_symbol(),
+                                                  ignoreCase,
+                                                  final);
+  ASSERT(!result->IsFailure());
+  result = regexp->IgnoreAttributesAndSetLocalProperty(Heap::multiline_symbol(),
+                                                       multiline,
+                                                       final);
+  ASSERT(!result->IsFailure());
+  result =
+      regexp->IgnoreAttributesAndSetLocalProperty(Heap::last_index_symbol(),
+                                                  Smi::FromInt(0),
+                                                  writable);
+  ASSERT(!result->IsFailure());
+  USE(result);
   return regexp;
 }
 
 
-static Object* Runtime_FinishArrayPrototypeSetup(Arguments args) {
+static MaybeObject* Runtime_FinishArrayPrototypeSetup(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(JSArray, prototype, 0);
@@ -1508,7 +1537,7 @@ static Handle<JSFunction> InstallBuiltin(Handle<JSObject> holder,
 }
 
 
-static Object* Runtime_SpecialArrayFunctions(Arguments args) {
+static MaybeObject* Runtime_SpecialArrayFunctions(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(JSObject, holder, 0);
@@ -1525,14 +1554,14 @@ static Object* Runtime_SpecialArrayFunctions(Arguments args) {
 }
 
 
-static Object* Runtime_GetGlobalReceiver(Arguments args) {
+static MaybeObject* Runtime_GetGlobalReceiver(Arguments args) {
   // Returns a real global receiver, not one of builtins object.
   Context* global_context = Top::context()->global()->global_context();
   return global_context->global()->global_receiver();
 }
 
 
-static Object* Runtime_MaterializeRegExpLiteral(Arguments args) {
+static MaybeObject* Runtime_MaterializeRegExpLiteral(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
   CONVERT_ARG_CHECKED(FixedArray, literals, 0);
@@ -1562,7 +1591,7 @@ static Object* Runtime_MaterializeRegExpLiteral(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionGetName(Arguments args) {
+static MaybeObject* Runtime_FunctionGetName(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -1571,7 +1600,7 @@ static Object* Runtime_FunctionGetName(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionSetName(Arguments args) {
+static MaybeObject* Runtime_FunctionSetName(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -1582,19 +1611,21 @@ static Object* Runtime_FunctionSetName(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionRemovePrototype(Arguments args) {
+static MaybeObject* Runtime_FunctionRemovePrototype(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
   CONVERT_CHECKED(JSFunction, f, args[0]);
-  Object* obj = f->RemovePrototype();
-  if (obj->IsFailure()) return obj;
+  Object* obj;
+  { MaybeObject* maybe_obj = f->RemovePrototype();
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
 
   return Heap::undefined_value();
 }
 
 
-static Object* Runtime_FunctionGetScript(Arguments args) {
+static MaybeObject* Runtime_FunctionGetScript(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -1606,7 +1637,7 @@ static Object* Runtime_FunctionGetScript(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionGetSourceCode(Arguments args) {
+static MaybeObject* Runtime_FunctionGetSourceCode(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -1615,7 +1646,7 @@ static Object* Runtime_FunctionGetSourceCode(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionGetScriptSourcePosition(Arguments args) {
+static MaybeObject* Runtime_FunctionGetScriptSourcePosition(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -1625,22 +1656,21 @@ static Object* Runtime_FunctionGetScriptSourcePosition(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionGetPositionForOffset(Arguments args) {
+static MaybeObject* Runtime_FunctionGetPositionForOffset(Arguments args) {
   ASSERT(args.length() == 2);
 
-  CONVERT_CHECKED(JSFunction, fun, args[0]);
+  CONVERT_CHECKED(Code, code, args[0]);
   CONVERT_NUMBER_CHECKED(int, offset, Int32, args[1]);
 
-  Code* code = fun->code();
   RUNTIME_ASSERT(0 <= offset && offset < code->Size());
 
   Address pc = code->address() + offset;
-  return Smi::FromInt(fun->code()->SourcePosition(pc));
+  return Smi::FromInt(code->SourcePosition(pc));
 }
 
 
 
-static Object* Runtime_FunctionSetInstanceClassName(Arguments args) {
+static MaybeObject* Runtime_FunctionSetInstanceClassName(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -1651,7 +1681,7 @@ static Object* Runtime_FunctionSetInstanceClassName(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionSetLength(Arguments args) {
+static MaybeObject* Runtime_FunctionSetLength(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -1662,19 +1692,22 @@ static Object* Runtime_FunctionSetLength(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionSetPrototype(Arguments args) {
+static MaybeObject* Runtime_FunctionSetPrototype(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
   CONVERT_CHECKED(JSFunction, fun, args[0]);
   ASSERT(fun->should_have_prototype());
-  Object* obj = Accessors::FunctionSetPrototype(fun, args[1], NULL);
-  if (obj->IsFailure()) return obj;
+  Object* obj;
+  { MaybeObject* maybe_obj =
+        Accessors::FunctionSetPrototype(fun, args[1], NULL);
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
   return args[0];  // return TOS
 }
 
 
-static Object* Runtime_FunctionIsAPIFunction(Arguments args) {
+static MaybeObject* Runtime_FunctionIsAPIFunction(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -1683,7 +1716,7 @@ static Object* Runtime_FunctionIsAPIFunction(Arguments args) {
                                       : Heap::false_value();
 }
 
-static Object* Runtime_FunctionIsBuiltin(Arguments args) {
+static MaybeObject* Runtime_FunctionIsBuiltin(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -1692,7 +1725,7 @@ static Object* Runtime_FunctionIsBuiltin(Arguments args) {
 }
 
 
-static Object* Runtime_SetCode(Arguments args) {
+static MaybeObject* Runtime_SetCode(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
@@ -1709,10 +1742,14 @@ static Object* Runtime_SetCode(Arguments args) {
     if (!EnsureCompiled(shared, KEEP_EXCEPTION)) {
       return Failure::Exception();
     }
+    // Since we don't store the source for this we should never
+    // optimize this.
+    shared->code()->set_optimizable(false);
+
     // Set the code, scope info, formal parameter count,
     // and the length of the target function.
     target->shared()->set_code(shared->code());
-    target->set_code(shared->code());
+    target->ReplaceCode(shared->code());
     target->shared()->set_scope_info(shared->scope_info());
     target->shared()->set_length(shared->length());
     target->shared()->set_formal_parameter_count(
@@ -1742,6 +1779,7 @@ static Object* Runtime_SetCode(Arguments args) {
     // It's okay to skip the write barrier here because the literals
     // are guaranteed to be in old space.
     target->set_literals(*literals, SKIP_WRITE_BARRIER);
+    target->set_next_function_link(Heap::undefined_value());
   }
 
   target->set_context(*context);
@@ -1749,7 +1787,7 @@ static Object* Runtime_SetCode(Arguments args) {
 }
 
 
-static Object* Runtime_SetExpectedNumberOfProperties(Arguments args) {
+static MaybeObject* Runtime_SetExpectedNumberOfProperties(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(JSFunction, function, 0);
@@ -1760,7 +1798,7 @@ static Object* Runtime_SetExpectedNumberOfProperties(Arguments args) {
 }
 
 
-static Object* CharFromCode(Object* char_code) {
+MUST_USE_RESULT static MaybeObject* CharFromCode(Object* char_code) {
   uint32_t code;
   if (char_code->ToArrayIndex(&code)) {
     if (code <= 0xffff) {
@@ -1771,7 +1809,7 @@ static Object* CharFromCode(Object* char_code) {
 }
 
 
-static Object* Runtime_StringCharCodeAt(Arguments args) {
+static MaybeObject* Runtime_StringCharCodeAt(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -1793,8 +1831,10 @@ static Object* Runtime_StringCharCodeAt(Arguments args) {
   // Flatten the string.  If someone wants to get a char at an index
   // in a cons string, it is likely that more indices will be
   // accessed.
-  Object* flat = subject->TryFlatten();
-  if (flat->IsFailure()) return flat;
+  Object* flat;
+  { MaybeObject* maybe_flat = subject->TryFlatten();
+    if (!maybe_flat->ToObject(&flat)) return maybe_flat;
+  }
   subject = String::cast(flat);
 
   if (i >= static_cast<uint32_t>(subject->length())) {
@@ -1805,7 +1845,7 @@ static Object* Runtime_StringCharCodeAt(Arguments args) {
 }
 
 
-static Object* Runtime_CharFromCode(Arguments args) {
+static MaybeObject* Runtime_CharFromCode(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   return CharFromCode(args[0]);
@@ -2002,10 +2042,7 @@ class ReplacementStringBuilder {
   }
 
   Handle<JSArray> GetParts() {
-    Handle<JSArray> result =
-        Factory::NewJSArrayWithElements(array_builder_.array());
-    result->set_length(Smi::FromInt(array_builder_.length()));
-    return result;
+    return array_builder_.ToJSArray();
   }
 
  private:
@@ -2294,10 +2331,11 @@ void CompiledReplacement::Apply(ReplacementStringBuilder* builder,
 
 
 
-static Object* StringReplaceRegExpWithString(String* subject,
-                                             JSRegExp* regexp,
-                                             String* replacement,
-                                             JSArray* last_match_info) {
+MUST_USE_RESULT static MaybeObject* StringReplaceRegExpWithString(
+    String* subject,
+    JSRegExp* regexp,
+    String* replacement,
+    JSArray* last_match_info) {
   ASSERT(subject->IsFlat());
   ASSERT(replacement->IsFlat());
 
@@ -2402,9 +2440,10 @@ static Object* StringReplaceRegExpWithString(String* subject,
 
 
 template <typename ResultSeqString>
-static Object* StringReplaceRegExpWithEmptyString(String* subject,
-                                                  JSRegExp* regexp,
-                                                  JSArray* last_match_info) {
+MUST_USE_RESULT static MaybeObject* StringReplaceRegExpWithEmptyString(
+    String* subject,
+    JSRegExp* regexp,
+    JSArray* last_match_info) {
   ASSERT(subject->IsFlat());
 
   HandleScope handles;
@@ -2529,23 +2568,27 @@ static Object* StringReplaceRegExpWithEmptyString(String* subject,
 }
 
 
-static Object* Runtime_StringReplaceRegExpWithString(Arguments args) {
+static MaybeObject* Runtime_StringReplaceRegExpWithString(Arguments args) {
   ASSERT(args.length() == 4);
 
   CONVERT_CHECKED(String, subject, args[0]);
   if (!subject->IsFlat()) {
-    Object* flat_subject = subject->TryFlatten();
-    if (flat_subject->IsFailure()) {
-      return flat_subject;
+    Object* flat_subject;
+    { MaybeObject* maybe_flat_subject = subject->TryFlatten();
+      if (!maybe_flat_subject->ToObject(&flat_subject)) {
+        return maybe_flat_subject;
+      }
     }
     subject = String::cast(flat_subject);
   }
 
   CONVERT_CHECKED(String, replacement, args[2]);
   if (!replacement->IsFlat()) {
-    Object* flat_replacement = replacement->TryFlatten();
-    if (flat_replacement->IsFailure()) {
-      return flat_replacement;
+    Object* flat_replacement;
+    { MaybeObject* maybe_flat_replacement = replacement->TryFlatten();
+      if (!maybe_flat_replacement->ToObject(&flat_replacement)) {
+        return maybe_flat_replacement;
+      }
     }
     replacement = String::cast(flat_replacement);
   }
@@ -2574,7 +2617,7 @@ static Object* Runtime_StringReplaceRegExpWithString(Arguments args) {
 
 // Perform string match of pattern on subject, starting at start index.
 // Caller must ensure that 0 <= start_index <= sub->length(),
-// and should check that pat->length() + start_index <= sub->length()
+// and should check that pat->length() + start_index <= sub->length().
 int Runtime::StringMatch(Handle<String> sub,
                          Handle<String> pat,
                          int start_index) {
@@ -2601,19 +2644,19 @@ int Runtime::StringMatch(Handle<String> sub,
   if (seq_pat->IsAsciiRepresentation()) {
     Vector<const char> pat_vector = seq_pat->ToAsciiVector();
     if (seq_sub->IsAsciiRepresentation()) {
-      return StringSearch(seq_sub->ToAsciiVector(), pat_vector, start_index);
+      return SearchString(seq_sub->ToAsciiVector(), pat_vector, start_index);
     }
-    return StringSearch(seq_sub->ToUC16Vector(), pat_vector, start_index);
+    return SearchString(seq_sub->ToUC16Vector(), pat_vector, start_index);
   }
   Vector<const uc16> pat_vector = seq_pat->ToUC16Vector();
   if (seq_sub->IsAsciiRepresentation()) {
-    return StringSearch(seq_sub->ToAsciiVector(), pat_vector, start_index);
+    return SearchString(seq_sub->ToAsciiVector(), pat_vector, start_index);
   }
-  return StringSearch(seq_sub->ToUC16Vector(), pat_vector, start_index);
+  return SearchString(seq_sub->ToUC16Vector(), pat_vector, start_index);
 }
 
 
-static Object* Runtime_StringIndexOf(Arguments args) {
+static MaybeObject* Runtime_StringIndexOf(Arguments args) {
   HandleScope scope;  // create a new handle scope
   ASSERT(args.length() == 3);
 
@@ -2664,7 +2707,7 @@ static int StringMatchBackwards(Vector<const schar> subject,
   return -1;
 }
 
-static Object* Runtime_StringLastIndexOf(Arguments args) {
+static MaybeObject* Runtime_StringLastIndexOf(Arguments args) {
   HandleScope scope;  // create a new handle scope
   ASSERT(args.length() == 3);
 
@@ -2721,7 +2764,7 @@ static Object* Runtime_StringLastIndexOf(Arguments args) {
 }
 
 
-static Object* Runtime_StringLocaleCompare(Arguments args) {
+static MaybeObject* Runtime_StringLocaleCompare(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -2767,7 +2810,7 @@ static Object* Runtime_StringLocaleCompare(Arguments args) {
 }
 
 
-static Object* Runtime_SubString(Arguments args) {
+static MaybeObject* Runtime_SubString(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
 
@@ -2794,7 +2837,7 @@ static Object* Runtime_SubString(Arguments args) {
 }
 
 
-static Object* Runtime_StringMatch(Arguments args) {
+static MaybeObject* Runtime_StringMatch(Arguments args) {
   ASSERT_EQ(3, args.length());
 
   CONVERT_ARG_CHECKED(String, subject, 0);
@@ -2837,7 +2880,8 @@ static Object* Runtime_StringMatch(Arguments args) {
   for (int i = 0; i < matches ; i++) {
     int from = offsets.at(i * 2);
     int to = offsets.at(i * 2 + 1);
-    elements->set(i, *Factory::NewSubString(subject, from, to));
+    Handle<String> match = Factory::NewSubString(subject, from, to);
+    elements->set(i, *match);
   }
   Handle<JSArray> result = Factory::NewJSArrayWithElements(elements);
   result->set_length(Smi::FromInt(matches));
@@ -2865,67 +2909,39 @@ static void SetLastMatchInfoNoCaptures(Handle<String> subject,
 }
 
 
-template <typename schar, typename pchar>
-static bool SearchStringMultiple(Vector<schar> subject,
-                                 String* pattern,
-                                 Vector<pchar> pattern_string,
+template <typename SubjectChar, typename PatternChar>
+static bool SearchStringMultiple(Vector<const SubjectChar> subject,
+                                 Vector<const PatternChar> pattern,
+                                 String* pattern_string,
                                  FixedArrayBuilder* builder,
                                  int* match_pos) {
   int pos = *match_pos;
   int subject_length = subject.length();
-  int pattern_length = pattern_string.length();
+  int pattern_length = pattern.length();
   int max_search_start = subject_length - pattern_length;
-  bool is_ascii = (sizeof(schar) == 1);
-  StringSearchStrategy strategy =
-      InitializeStringSearch(pattern_string, is_ascii);
-  switch (strategy) {
-    case SEARCH_FAIL: break;
-    case SEARCH_SHORT:
-      while (pos <= max_search_start) {
-        if (!builder->HasCapacity(kMaxBuilderEntriesPerRegExpMatch)) {
-          *match_pos = pos;
-          return false;
-        }
-        // Position of end of previous match.
-        int match_end = pos + pattern_length;
-        int new_pos = SimpleIndexOf(subject, pattern_string, match_end);
-        if (new_pos >= 0) {
-          // A match.
-          if (new_pos > match_end) {
-            ReplacementStringBuilder::AddSubjectSlice(builder,
-                                                      match_end,
-                                                      new_pos);
-          }
-          pos = new_pos;
-          builder->Add(pattern);
-        } else {
-          break;
-        }
+  StringSearch<PatternChar, SubjectChar> search(pattern);
+  while (pos <= max_search_start) {
+    if (!builder->HasCapacity(kMaxBuilderEntriesPerRegExpMatch)) {
+      *match_pos = pos;
+      return false;
+    }
+    // Position of end of previous match.
+    int match_end = pos + pattern_length;
+    int new_pos = search.Search(subject, match_end);
+    if (new_pos >= 0) {
+      // A match.
+      if (new_pos > match_end) {
+        ReplacementStringBuilder::AddSubjectSlice(builder,
+            match_end,
+            new_pos);
       }
+      pos = new_pos;
+      builder->Add(pattern_string);
+    } else {
       break;
-    case SEARCH_LONG:
-      while (pos  <= max_search_start) {
-        if (!builder->HasCapacity(kMaxBuilderEntriesPerRegExpMatch)) {
-          *match_pos = pos;
-          return false;
-        }
-        int match_end = pos + pattern_length;
-        int new_pos = ComplexIndexOf(subject, pattern_string, match_end);
-        if (new_pos >= 0) {
-          // A match has been found.
-          if (new_pos > match_end) {
-            ReplacementStringBuilder::AddSubjectSlice(builder,
-                                                      match_end,
-                                                      new_pos);
-          }
-          pos = new_pos;
-          builder->Add(pattern);
-        } else {
-         break;
-        }
-      }
-      break;
+    }
   }
+
   if (pos < max_search_start) {
     ReplacementStringBuilder::AddSubjectSlice(builder,
                                               pos + pattern_length,
@@ -2953,14 +2969,14 @@ static bool SearchStringMultiple(Handle<String> subject,
       Vector<const char> subject_vector = subject->ToAsciiVector();
       if (pattern->IsAsciiRepresentation()) {
         if (SearchStringMultiple(subject_vector,
-                                 *pattern,
                                  pattern->ToAsciiVector(),
+                                 *pattern,
                                  builder,
                                  &match_pos)) break;
       } else {
         if (SearchStringMultiple(subject_vector,
-                                 *pattern,
                                  pattern->ToUC16Vector(),
+                                 *pattern,
                                  builder,
                                  &match_pos)) break;
       }
@@ -2968,14 +2984,14 @@ static bool SearchStringMultiple(Handle<String> subject,
       Vector<const uc16> subject_vector = subject->ToUC16Vector();
       if (pattern->IsAsciiRepresentation()) {
         if (SearchStringMultiple(subject_vector,
-                                 *pattern,
                                  pattern->ToAsciiVector(),
+                                 *pattern,
                                  builder,
                                  &match_pos)) break;
       } else {
         if (SearchStringMultiple(subject_vector,
-                                 *pattern,
                                  pattern->ToUC16Vector(),
+                                 *pattern,
                                  builder,
                                  &match_pos)) break;
       }
@@ -3105,9 +3121,10 @@ static RegExpImpl::IrregexpResult SearchRegExpMultiple(
         // Arguments array to replace function is match, captures, index and
         // subject, i.e., 3 + capture count in total.
         Handle<FixedArray> elements = Factory::NewFixedArray(3 + capture_count);
-        elements->set(0, *Factory::NewSubString(subject,
-                                                match_start,
-                                                match_end));
+        Handle<String> match = Factory::NewSubString(subject,
+                                                     match_start,
+                                                     match_end);
+        elements->set(0, *match);
         for (int i = 1; i <= capture_count; i++) {
           int start = register_vector[i * 2];
           if (start >= 0) {
@@ -3175,7 +3192,7 @@ static RegExpImpl::IrregexpResult SearchRegExpMultiple(
 }
 
 
-static Object* Runtime_RegExpExecMultiple(Arguments args) {
+static MaybeObject* Runtime_RegExpExecMultiple(Arguments args) {
   ASSERT(args.length() == 4);
   HandleScope handles;
 
@@ -3199,7 +3216,7 @@ static Object* Runtime_RegExpExecMultiple(Arguments args) {
   if (regexp->TypeTag() == JSRegExp::ATOM) {
     Handle<String> pattern(
         String::cast(regexp->DataAt(JSRegExp::kAtomPatternIndex)));
-    if (!pattern->IsFlat()) FlattenString(pattern);
+    ASSERT(pattern->IsFlat());
     if (SearchStringMultiple(subject, pattern, last_match_info, &builder)) {
       return *builder.ToJSArray(result_array);
     }
@@ -3224,7 +3241,7 @@ static Object* Runtime_RegExpExecMultiple(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToRadixString(Arguments args) {
+static MaybeObject* Runtime_NumberToRadixString(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3255,13 +3272,13 @@ static Object* Runtime_NumberToRadixString(Arguments args) {
   int radix = FastD2I(radix_number);
   RUNTIME_ASSERT(2 <= radix && radix <= 36);
   char* str = DoubleToRadixCString(value, radix);
-  Object* result = Heap::AllocateStringFromAscii(CStrVector(str));
+  MaybeObject* result = Heap::AllocateStringFromAscii(CStrVector(str));
   DeleteArray(str);
   return result;
 }
 
 
-static Object* Runtime_NumberToFixed(Arguments args) {
+static MaybeObject* Runtime_NumberToFixed(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3279,13 +3296,13 @@ static Object* Runtime_NumberToFixed(Arguments args) {
   int f = FastD2I(f_number);
   RUNTIME_ASSERT(f >= 0);
   char* str = DoubleToFixedCString(value, f);
-  Object* res = Heap::AllocateStringFromAscii(CStrVector(str));
+  MaybeObject* result = Heap::AllocateStringFromAscii(CStrVector(str));
   DeleteArray(str);
-  return res;
+  return result;
 }
 
 
-static Object* Runtime_NumberToExponential(Arguments args) {
+static MaybeObject* Runtime_NumberToExponential(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3303,13 +3320,13 @@ static Object* Runtime_NumberToExponential(Arguments args) {
   int f = FastD2I(f_number);
   RUNTIME_ASSERT(f >= -1 && f <= 20);
   char* str = DoubleToExponentialCString(value, f);
-  Object* res = Heap::AllocateStringFromAscii(CStrVector(str));
+  MaybeObject* result = Heap::AllocateStringFromAscii(CStrVector(str));
   DeleteArray(str);
-  return res;
+  return result;
 }
 
 
-static Object* Runtime_NumberToPrecision(Arguments args) {
+static MaybeObject* Runtime_NumberToPrecision(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3327,9 +3344,9 @@ static Object* Runtime_NumberToPrecision(Arguments args) {
   int f = FastD2I(f_number);
   RUNTIME_ASSERT(f >= 1 && f <= 21);
   char* str = DoubleToPrecisionCString(value, f);
-  Object* res = Heap::AllocateStringFromAscii(CStrVector(str));
+  MaybeObject* result = Heap::AllocateStringFromAscii(CStrVector(str));
   DeleteArray(str);
-  return res;
+  return result;
 }
 
 
@@ -3345,7 +3362,8 @@ static Handle<Object> GetCharAt(Handle<String> string, uint32_t index) {
 }
 
 
-Object* Runtime::GetElementOrCharAt(Handle<Object> object, uint32_t index) {
+MaybeObject* Runtime::GetElementOrCharAt(Handle<Object> object,
+                                         uint32_t index) {
   // Handle [] indexing on Strings
   if (object->IsString()) {
     Handle<Object> result = GetCharAt(Handle<String>::cast(object), index);
@@ -3369,12 +3387,13 @@ Object* Runtime::GetElementOrCharAt(Handle<Object> object, uint32_t index) {
 }
 
 
-Object* Runtime::GetElement(Handle<Object> object, uint32_t index) {
+MaybeObject* Runtime::GetElement(Handle<Object> object, uint32_t index) {
   return object->GetElement(index);
 }
 
 
-Object* Runtime::GetObjectProperty(Handle<Object> object, Handle<Object> key) {
+MaybeObject* Runtime::GetObjectProperty(Handle<Object> object,
+                                        Handle<Object> key) {
   HandleScope scope;
 
   if (object->IsUndefined() || object->IsNull()) {
@@ -3414,7 +3433,7 @@ Object* Runtime::GetObjectProperty(Handle<Object> object, Handle<Object> key) {
 }
 
 
-static Object* Runtime_GetProperty(Arguments args) {
+static MaybeObject* Runtime_GetProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3426,7 +3445,7 @@ static Object* Runtime_GetProperty(Arguments args) {
 
 
 // KeyedStringGetProperty is called from KeyedLoadIC::GenerateGeneric.
-static Object* Runtime_KeyedGetProperty(Arguments args) {
+static MaybeObject* Runtime_KeyedGetProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3491,7 +3510,7 @@ static Object* Runtime_KeyedGetProperty(Arguments args) {
 }
 
 
-static Object* Runtime_DefineOrRedefineAccessorProperty(Arguments args) {
+static MaybeObject* Runtime_DefineOrRedefineAccessorProperty(Arguments args) {
   ASSERT(args.length() == 5);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSObject, obj, 0);
@@ -3512,13 +3531,16 @@ static Object* Runtime_DefineOrRedefineAccessorProperty(Arguments args) {
   if (result.IsProperty() &&
       (result.type() == FIELD || result.type() == NORMAL
        || result.type() == CONSTANT_FUNCTION)) {
-    Object* ok = obj->DeleteProperty(name, JSObject::NORMAL_DELETION);
-    if (ok->IsFailure()) return ok;
+    Object* ok;
+    { MaybeObject* maybe_ok =
+          obj->DeleteProperty(name, JSObject::NORMAL_DELETION);
+      if (!maybe_ok->ToObject(&ok)) return maybe_ok;
+    }
   }
   return obj->DefineAccessor(name, flag_setter->value() == 0, fun, attr);
 }
 
-static Object* Runtime_DefineOrRedefineDataProperty(Arguments args) {
+static MaybeObject* Runtime_DefineOrRedefineDataProperty(Arguments args) {
   ASSERT(args.length() == 4);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSObject, js_object, 0);
@@ -3541,12 +3563,12 @@ static Object* Runtime_DefineOrRedefineDataProperty(Arguments args) {
   if (((unchecked & (DONT_DELETE | DONT_ENUM | READ_ONLY)) != 0) &&
       is_element) {
     // Normalize the elements to enable attributes on the property.
-    js_object->NormalizeElements();
-    NumberDictionary* dictionary = js_object->element_dictionary();
+    NormalizeElements(js_object);
+    Handle<NumberDictionary> dictionary(js_object->element_dictionary());
     // Make sure that we never go back to fast case.
     dictionary->set_requires_slow_elements();
     PropertyDetails details = PropertyDetails(attr, NORMAL);
-    dictionary->Set(index, *obj_value, details);
+    NumberDictionarySet(dictionary, index, obj_value, details);
   }
 
   LookupResult result;
@@ -3560,7 +3582,7 @@ static Object* Runtime_DefineOrRedefineDataProperty(Arguments args) {
   // new attributes.
   if (result.IsProperty() && attr != result.GetAttributes()) {
     // New attributes - normalize to avoid writing to instance descriptor
-    js_object->NormalizeProperties(CLEAR_INOBJECT_PROPERTIES, 0);
+    NormalizeProperties(js_object, CLEAR_INOBJECT_PROPERTIES, 0);
     // Use IgnoreAttributes version since a readonly property may be
     // overridden and SetProperty does not allow this.
     return js_object->IgnoreAttributesAndSetLocalProperty(*name,
@@ -3572,10 +3594,10 @@ static Object* Runtime_DefineOrRedefineDataProperty(Arguments args) {
 }
 
 
-Object* Runtime::SetObjectProperty(Handle<Object> object,
-                                   Handle<Object> key,
-                                   Handle<Object> value,
-                                   PropertyAttributes attr) {
+MaybeObject* Runtime::SetObjectProperty(Handle<Object> object,
+                                        Handle<Object> key,
+                                        Handle<Object> value,
+                                        PropertyAttributes attr) {
   HandleScope scope;
 
   if (object->IsUndefined() || object->IsNull()) {
@@ -3637,10 +3659,10 @@ Object* Runtime::SetObjectProperty(Handle<Object> object,
 }
 
 
-Object* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
-                                        Handle<Object> key,
-                                        Handle<Object> value,
-                                        PropertyAttributes attr) {
+MaybeObject* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
+                                             Handle<Object> key,
+                                             Handle<Object> value,
+                                             PropertyAttributes attr) {
   HandleScope scope;
 
   // Check if the given key is an array index.
@@ -3686,8 +3708,8 @@ Object* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
 }
 
 
-Object* Runtime::ForceDeleteObjectProperty(Handle<JSObject> js_object,
-                                           Handle<Object> key) {
+MaybeObject* Runtime::ForceDeleteObjectProperty(Handle<JSObject> js_object,
+                                                Handle<Object> key) {
   HandleScope scope;
 
   // Check if the given key is an array index.
@@ -3722,7 +3744,7 @@ Object* Runtime::ForceDeleteObjectProperty(Handle<JSObject> js_object,
 }
 
 
-static Object* Runtime_SetProperty(Arguments args) {
+static MaybeObject* Runtime_SetProperty(Arguments args) {
   NoHandleAllocation ha;
   RUNTIME_ASSERT(args.length() == 3 || args.length() == 4);
 
@@ -3746,7 +3768,7 @@ static Object* Runtime_SetProperty(Arguments args) {
 
 // Set a local property, even if it is READ_ONLY.  If the property does not
 // exist, it will be added with attributes NONE.
-static Object* Runtime_IgnoreAttributesAndSetProperty(Arguments args) {
+static MaybeObject* Runtime_IgnoreAttributesAndSetProperty(Arguments args) {
   NoHandleAllocation ha;
   RUNTIME_ASSERT(args.length() == 3 || args.length() == 4);
   CONVERT_CHECKED(JSObject, object, args[0]);
@@ -3767,7 +3789,7 @@ static Object* Runtime_IgnoreAttributesAndSetProperty(Arguments args) {
 }
 
 
-static Object* Runtime_DeleteProperty(Arguments args) {
+static MaybeObject* Runtime_DeleteProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3792,7 +3814,7 @@ static Object* HasLocalPropertyImplementation(Handle<JSObject> object,
 }
 
 
-static Object* Runtime_HasLocalProperty(Arguments args) {
+static MaybeObject* Runtime_HasLocalProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(String, key, args[1]);
@@ -3821,7 +3843,7 @@ static Object* Runtime_HasLocalProperty(Arguments args) {
 }
 
 
-static Object* Runtime_HasProperty(Arguments args) {
+static MaybeObject* Runtime_HasProperty(Arguments args) {
   NoHandleAllocation na;
   ASSERT(args.length() == 2);
 
@@ -3835,7 +3857,7 @@ static Object* Runtime_HasProperty(Arguments args) {
 }
 
 
-static Object* Runtime_HasElement(Arguments args) {
+static MaybeObject* Runtime_HasElement(Arguments args) {
   NoHandleAllocation na;
   ASSERT(args.length() == 2);
 
@@ -3850,7 +3872,7 @@ static Object* Runtime_HasElement(Arguments args) {
 }
 
 
-static Object* Runtime_IsPropertyEnumerable(Arguments args) {
+static MaybeObject* Runtime_IsPropertyEnumerable(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -3867,7 +3889,7 @@ static Object* Runtime_IsPropertyEnumerable(Arguments args) {
 }
 
 
-static Object* Runtime_GetPropertyNames(Arguments args) {
+static MaybeObject* Runtime_GetPropertyNames(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(JSObject, object, 0);
@@ -3880,7 +3902,7 @@ static Object* Runtime_GetPropertyNames(Arguments args) {
 // all enumerable properties of the object and its prototypes
 // have none, the map of the object. This is used to speed up
 // the check for deletions during a for-in.
-static Object* Runtime_GetPropertyNamesFast(Arguments args) {
+static MaybeObject* Runtime_GetPropertyNamesFast(Arguments args) {
   ASSERT(args.length() == 1);
 
   CONVERT_CHECKED(JSObject, raw_object, args[0]);
@@ -3916,7 +3938,7 @@ static int LocalPrototypeChainLength(JSObject* obj) {
 
 // Return the names of the local named properties.
 // args[0]: object
-static Object* Runtime_GetLocalPropertyNames(Arguments args) {
+static MaybeObject* Runtime_GetLocalPropertyNames(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   if (!args[0]->IsJSObject()) {
@@ -3999,7 +4021,7 @@ static Object* Runtime_GetLocalPropertyNames(Arguments args) {
 
 // Return the names of the local indexed properties.
 // args[0]: object
-static Object* Runtime_GetLocalElementNames(Arguments args) {
+static MaybeObject* Runtime_GetLocalElementNames(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   if (!args[0]->IsJSObject()) {
@@ -4016,7 +4038,7 @@ static Object* Runtime_GetLocalElementNames(Arguments args) {
 
 // Return information on whether an object has a named or indexed interceptor.
 // args[0]: object
-static Object* Runtime_GetInterceptorInfo(Arguments args) {
+static MaybeObject* Runtime_GetInterceptorInfo(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   if (!args[0]->IsJSObject()) {
@@ -4034,7 +4056,7 @@ static Object* Runtime_GetInterceptorInfo(Arguments args) {
 
 // Return property names from named interceptor.
 // args[0]: object
-static Object* Runtime_GetNamedInterceptorPropertyNames(Arguments args) {
+static MaybeObject* Runtime_GetNamedInterceptorPropertyNames(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(JSObject, obj, 0);
@@ -4049,7 +4071,7 @@ static Object* Runtime_GetNamedInterceptorPropertyNames(Arguments args) {
 
 // Return element names from indexed interceptor.
 // args[0]: object
-static Object* Runtime_GetIndexedInterceptorElementNames(Arguments args) {
+static MaybeObject* Runtime_GetIndexedInterceptorElementNames(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_ARG_CHECKED(JSObject, obj, 0);
@@ -4062,7 +4084,7 @@ static Object* Runtime_GetIndexedInterceptorElementNames(Arguments args) {
 }
 
 
-static Object* Runtime_LocalKeys(Arguments args) {
+static MaybeObject* Runtime_LocalKeys(Arguments args) {
   ASSERT_EQ(args.length(), 1);
   CONVERT_CHECKED(JSObject, raw_object, args[0]);
   HandleScope scope;
@@ -4090,7 +4112,7 @@ static Object* Runtime_LocalKeys(Arguments args) {
 }
 
 
-static Object* Runtime_GetArgumentsProperty(Arguments args) {
+static MaybeObject* Runtime_GetArgumentsProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -4135,7 +4157,7 @@ static Object* Runtime_GetArgumentsProperty(Arguments args) {
 }
 
 
-static Object* Runtime_ToFastProperties(Arguments args) {
+static MaybeObject* Runtime_ToFastProperties(Arguments args) {
   HandleScope scope;
 
   ASSERT(args.length() == 1);
@@ -4143,27 +4165,28 @@ static Object* Runtime_ToFastProperties(Arguments args) {
   if (object->IsJSObject()) {
     Handle<JSObject> js_object = Handle<JSObject>::cast(object);
     if (!js_object->HasFastProperties() && !js_object->IsGlobalObject()) {
-      js_object->TransformToFastProperties(0);
+      MaybeObject* ok = js_object->TransformToFastProperties(0);
+      if (ok->IsRetryAfterGC()) return ok;
     }
   }
   return *object;
 }
 
 
-static Object* Runtime_ToSlowProperties(Arguments args) {
+static MaybeObject* Runtime_ToSlowProperties(Arguments args) {
   HandleScope scope;
 
   ASSERT(args.length() == 1);
   Handle<Object> object = args.at<Object>(0);
   if (object->IsJSObject()) {
     Handle<JSObject> js_object = Handle<JSObject>::cast(object);
-    js_object->NormalizeProperties(CLEAR_INOBJECT_PROPERTIES, 0);
+    NormalizeProperties(js_object, CLEAR_INOBJECT_PROPERTIES, 0);
   }
   return *object;
 }
 
 
-static Object* Runtime_ToBool(Arguments args) {
+static MaybeObject* Runtime_ToBool(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -4173,7 +4196,7 @@ static Object* Runtime_ToBool(Arguments args) {
 
 // Returns the type string of a value; see ECMA-262, 11.4.3 (p 47).
 // Possible optimizations: put the type string into the oddballs.
-static Object* Runtime_Typeof(Arguments args) {
+static MaybeObject* Runtime_Typeof(Arguments args) {
   NoHandleAllocation ha;
 
   Object* obj = args[0];
@@ -4230,7 +4253,7 @@ static int ParseDecimalInteger(const char*s, int from, int to) {
 }
 
 
-static Object* Runtime_StringToNumber(Arguments args) {
+static MaybeObject* Runtime_StringToNumber(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, subject, args[0]);
@@ -4284,7 +4307,7 @@ static Object* Runtime_StringToNumber(Arguments args) {
 }
 
 
-static Object* Runtime_StringFromCharCodeArray(Arguments args) {
+static MaybeObject* Runtime_StringFromCharCodeArray(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -4294,23 +4317,32 @@ static Object* Runtime_StringFromCharCodeArray(Arguments args) {
   // Check if the string can be ASCII.
   int i;
   for (i = 0; i < length; i++) {
-    Object* element = codes->GetElement(i);
+    Object* element;
+    { MaybeObject* maybe_element = codes->GetElement(i);
+      // We probably can't get an exception here, but just in order to enforce
+      // the checking of inputs in the runtime calls we check here.
+      if (!maybe_element->ToObject(&element)) return maybe_element;
+    }
     CONVERT_NUMBER_CHECKED(int, chr, Int32, element);
     if ((chr & 0xffff) > String::kMaxAsciiCharCode)
       break;
   }
 
-  Object* object = NULL;
+  MaybeObject* maybe_object = NULL;
   if (i == length) {  // The string is ASCII.
-    object = Heap::AllocateRawAsciiString(length);
+    maybe_object = Heap::AllocateRawAsciiString(length);
   } else {  // The string is not ASCII.
-    object = Heap::AllocateRawTwoByteString(length);
+    maybe_object = Heap::AllocateRawTwoByteString(length);
   }
 
-  if (object->IsFailure()) return object;
+  Object* object = NULL;
+  if (!maybe_object->ToObject(&object)) return maybe_object;
   String* result = String::cast(object);
   for (int i = 0; i < length; i++) {
-    Object* element = codes->GetElement(i);
+    Object* element;
+    { MaybeObject* maybe_element = codes->GetElement(i);
+      if (!maybe_element->ToObject(&element)) return maybe_element;
+    }
     CONVERT_NUMBER_CHECKED(int, chr, Int32, element);
     result->Set(i, chr & 0xffff);
   }
@@ -4355,7 +4387,7 @@ static bool IsNotEscaped(uint16_t character) {
 }
 
 
-static Object* Runtime_URIEscape(Arguments args) {
+static MaybeObject* Runtime_URIEscape(Arguments args) {
   const char hex_chars[] = "0123456789ABCDEF";
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
@@ -4389,8 +4421,10 @@ static Object* Runtime_URIEscape(Arguments args) {
   if (escaped_length == length) {
     return source;
   }
-  Object* o = Heap::AllocateRawAsciiString(escaped_length);
-  if (o->IsFailure()) return o;
+  Object* o;
+  { MaybeObject* maybe_o = Heap::AllocateRawAsciiString(escaped_length);
+    if (!maybe_o->ToObject(&o)) return maybe_o;
+  }
   String* destination = String::cast(o);
   int dest_position = 0;
 
@@ -4469,7 +4503,7 @@ static inline int Unescape(String* source,
 }
 
 
-static Object* Runtime_URIUnescape(Arguments args) {
+static MaybeObject* Runtime_URIUnescape(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, source, args[0]);
@@ -4492,10 +4526,12 @@ static Object* Runtime_URIUnescape(Arguments args) {
   if (unescaped_length == length)
     return source;
 
-  Object* o = ascii ?
-              Heap::AllocateRawAsciiString(unescaped_length) :
-              Heap::AllocateRawTwoByteString(unescaped_length);
-  if (o->IsFailure()) return o;
+  Object* o;
+  { MaybeObject* maybe_o = ascii ?
+                           Heap::AllocateRawAsciiString(unescaped_length) :
+                           Heap::AllocateRawTwoByteString(unescaped_length);
+    if (!maybe_o->ToObject(&o)) return maybe_o;
+  }
   String* destination = String::cast(o);
 
   int dest_position = 0;
@@ -4508,7 +4544,216 @@ static Object* Runtime_URIUnescape(Arguments args) {
 }
 
 
-static Object* Runtime_StringParseInt(Arguments args) {
+static const unsigned int kQuoteTableLength = 128u;
+
+static const int kJsonQuotesCharactersPerEntry = 8;
+static const char* const JsonQuotes =
+    "\\u0000  \\u0001  \\u0002  \\u0003  "
+    "\\u0004  \\u0005  \\u0006  \\u0007  "
+    "\\b      \\t      \\n      \\u000b  "
+    "\\f      \\r      \\u000e  \\u000f  "
+    "\\u0010  \\u0011  \\u0012  \\u0013  "
+    "\\u0014  \\u0015  \\u0016  \\u0017  "
+    "\\u0018  \\u0019  \\u001a  \\u001b  "
+    "\\u001c  \\u001d  \\u001e  \\u001f  "
+    "        !       \\\"      #       "
+    "$       %       &       '       "
+    "(       )       *       +       "
+    ",       -       .       /       "
+    "0       1       2       3       "
+    "4       5       6       7       "
+    "8       9       :       ;       "
+    "<       =       >       ?       "
+    "@       A       B       C       "
+    "D       E       F       G       "
+    "H       I       J       K       "
+    "L       M       N       O       "
+    "P       Q       R       S       "
+    "T       U       V       W       "
+    "X       Y       Z       [       "
+    "\\\\      ]       ^       _       "
+    "`       a       b       c       "
+    "d       e       f       g       "
+    "h       i       j       k       "
+    "l       m       n       o       "
+    "p       q       r       s       "
+    "t       u       v       w       "
+    "x       y       z       {       "
+    "|       }       ~       \177       ";
+
+
+// For a string that is less than 32k characters it should always be
+// possible to allocate it in new space.
+static const int kMaxGuaranteedNewSpaceString = 32 * 1024;
+
+
+// Doing JSON quoting cannot make the string more than this many times larger.
+static const int kJsonQuoteWorstCaseBlowup = 6;
+
+
+// Covers the entire ASCII range (all other characters are unchanged by JSON
+// quoting).
+static const byte JsonQuoteLengths[kQuoteTableLength] = {
+    6, 6, 6, 6, 6, 6, 6, 6,
+    2, 2, 2, 6, 2, 2, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6,
+    1, 1, 2, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 2, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+
+template <typename StringType>
+MaybeObject* AllocateRawString(int length);
+
+
+template <>
+MaybeObject* AllocateRawString<SeqTwoByteString>(int length) {
+  return Heap::AllocateRawTwoByteString(length);
+}
+
+
+template <>
+MaybeObject* AllocateRawString<SeqAsciiString>(int length) {
+  return Heap::AllocateRawAsciiString(length);
+}
+
+
+template <typename Char, typename StringType>
+static MaybeObject* SlowQuoteJsonString(Vector<const Char> characters) {
+  int length = characters.length();
+  const Char* read_cursor = characters.start();
+  const Char* end = read_cursor + length;
+  const int kSpaceForQuotes = 2;
+  int quoted_length = kSpaceForQuotes;
+  while (read_cursor < end) {
+    Char c = *(read_cursor++);
+    if (sizeof(Char) > 1u && static_cast<unsigned>(c) >= kQuoteTableLength) {
+      quoted_length++;
+    } else {
+      quoted_length += JsonQuoteLengths[static_cast<unsigned>(c)];
+    }
+  }
+  MaybeObject* new_alloc = AllocateRawString<StringType>(quoted_length);
+  Object* new_object;
+  if (!new_alloc->ToObject(&new_object)) {
+    return new_alloc;
+  }
+  StringType* new_string = StringType::cast(new_object);
+
+  Char* write_cursor = reinterpret_cast<Char*>(
+      new_string->address() + SeqAsciiString::kHeaderSize);
+  *(write_cursor++) = '"';
+
+  read_cursor = characters.start();
+  while (read_cursor < end) {
+    Char c = *(read_cursor++);
+    if (sizeof(Char) > 1u && static_cast<unsigned>(c) >= kQuoteTableLength) {
+      *(write_cursor++) = c;
+    } else {
+      int len = JsonQuoteLengths[static_cast<unsigned>(c)];
+      const char* replacement = JsonQuotes +
+          static_cast<unsigned>(c) * kJsonQuotesCharactersPerEntry;
+      for (int i = 0; i < len; i++) {
+        *write_cursor++ = *replacement++;
+      }
+    }
+  }
+  *(write_cursor++) = '"';
+  return new_string;
+}
+
+
+template <typename Char, typename StringType>
+static MaybeObject* QuoteJsonString(Vector<const Char> characters) {
+  int length = characters.length();
+  Counters::quote_json_char_count.Increment(length);
+  const int kSpaceForQuotes = 2;
+  int worst_case_length = length * kJsonQuoteWorstCaseBlowup + kSpaceForQuotes;
+  if (worst_case_length > kMaxGuaranteedNewSpaceString) {
+    return SlowQuoteJsonString<Char, StringType>(characters);
+  }
+
+  MaybeObject* new_alloc = AllocateRawString<StringType>(worst_case_length);
+  Object* new_object;
+  if (!new_alloc->ToObject(&new_object)) {
+    return new_alloc;
+  }
+  StringType* new_string = StringType::cast(new_object);
+  ASSERT(Heap::new_space()->Contains(new_string));
+
+  STATIC_ASSERT(SeqTwoByteString::kHeaderSize == SeqAsciiString::kHeaderSize);
+  Char* write_cursor = reinterpret_cast<Char*>(
+      new_string->address() + SeqAsciiString::kHeaderSize);
+  *(write_cursor++) = '"';
+
+  const Char* read_cursor = characters.start();
+  const Char* end = read_cursor + length;
+  while (read_cursor < end) {
+    Char c = *(read_cursor++);
+    if (sizeof(Char) > 1u && static_cast<unsigned>(c) >= kQuoteTableLength) {
+      *(write_cursor++) = c;
+    } else {
+      int len = JsonQuoteLengths[static_cast<unsigned>(c)];
+      const char* replacement = JsonQuotes +
+          static_cast<unsigned>(c) * kJsonQuotesCharactersPerEntry;
+      write_cursor[0] = replacement[0];
+      if (len > 1) {
+        write_cursor[1] = replacement[1];
+        if (len > 2) {
+          ASSERT(len == 6);
+          write_cursor[2] = replacement[2];
+          write_cursor[3] = replacement[3];
+          write_cursor[4] = replacement[4];
+          write_cursor[5] = replacement[5];
+        }
+      }
+      write_cursor += len;
+    }
+  }
+  *(write_cursor++) = '"';
+
+  int final_length =
+      write_cursor - reinterpret_cast<Char*>(
+          new_string->address() + SeqAsciiString::kHeaderSize);
+  Heap::new_space()->ShrinkStringAtAllocationBoundary<StringType>(new_string,
+                                                                  final_length);
+  return new_string;
+}
+
+
+static MaybeObject* Runtime_QuoteJSONString(Arguments args) {
+  NoHandleAllocation ha;
+  CONVERT_CHECKED(String, str, args[0]);
+  if (!str->IsFlat()) {
+    MaybeObject* try_flatten = str->TryFlatten();
+    Object* flat;
+    if (!try_flatten->ToObject(&flat)) {
+      return try_flatten;
+    }
+    str = String::cast(flat);
+    ASSERT(str->IsFlat());
+  }
+  if (str->IsTwoByteRepresentation()) {
+    return QuoteJsonString<uc16, SeqTwoByteString>(str->ToUC16Vector());
+  } else {
+    return QuoteJsonString<char, SeqAsciiString>(str->ToAsciiVector());
+  }
+}
+
+
+
+static MaybeObject* Runtime_StringParseInt(Arguments args) {
   NoHandleAllocation ha;
 
   CONVERT_CHECKED(String, s, args[0]);
@@ -4522,7 +4767,7 @@ static Object* Runtime_StringParseInt(Arguments args) {
 }
 
 
-static Object* Runtime_StringParseFloat(Arguments args) {
+static MaybeObject* Runtime_StringParseFloat(Arguments args) {
   NoHandleAllocation ha;
   CONVERT_CHECKED(String, str, args[0]);
 
@@ -4539,10 +4784,11 @@ static unibrow::Mapping<unibrow::ToLowercase, 128> to_lower_mapping;
 
 
 template <class Converter>
-static Object* ConvertCaseHelper(String* s,
-                                 int length,
-                                 int input_string_length,
-                                 unibrow::Mapping<Converter, 128>* mapping) {
+MUST_USE_RESULT static MaybeObject* ConvertCaseHelper(
+    String* s,
+    int length,
+    int input_string_length,
+    unibrow::Mapping<Converter, 128>* mapping) {
   // We try this twice, once with the assumption that the result is no longer
   // than the input and, if that assumption breaks, again with the exact
   // length.  This may not be pretty, but it is nicer than what was here before
@@ -4554,10 +4800,12 @@ static Object* ConvertCaseHelper(String* s,
   // character is also ascii.  This is currently the case, but it
   // might break in the future if we implement more context and locale
   // dependent upper/lower conversions.
-  Object* o = s->IsAsciiRepresentation()
-      ? Heap::AllocateRawAsciiString(length)
-      : Heap::AllocateRawTwoByteString(length);
-  if (o->IsFailure()) return o;
+  Object* o;
+  { MaybeObject* maybe_o = s->IsAsciiRepresentation()
+                   ? Heap::AllocateRawAsciiString(length)
+                   : Heap::AllocateRawTwoByteString(length);
+    if (!maybe_o->ToObject(&o)) return maybe_o;
+  }
   String* result = String::cast(o);
   bool has_changed_character = false;
 
@@ -4639,46 +4887,134 @@ static Object* ConvertCaseHelper(String* s,
 
 namespace {
 
+static const uintptr_t kOneInEveryByte = kUintptrAllBitsSet / 0xFF;
+
+
+// Given a word and two range boundaries returns a word with high bit
+// set in every byte iff the corresponding input byte was strictly in
+// the range (m, n). All the other bits in the result are cleared.
+// This function is only useful when it can be inlined and the
+// boundaries are statically known.
+// Requires: all bytes in the input word and the boundaries must be
+// ascii (less than 0x7F).
+static inline uintptr_t AsciiRangeMask(uintptr_t w, char m, char n) {
+  // Every byte in an ascii string is less than or equal to 0x7F.
+  ASSERT((w & (kOneInEveryByte * 0x7F)) == w);
+  // Use strict inequalities since in edge cases the function could be
+  // further simplified.
+  ASSERT(0 < m && m < n && n < 0x7F);
+  // Has high bit set in every w byte less than n.
+  uintptr_t tmp1 = kOneInEveryByte * (0x7F + n) - w;
+  // Has high bit set in every w byte greater than m.
+  uintptr_t tmp2 = w + kOneInEveryByte * (0x7F - m);
+  return (tmp1 & tmp2 & (kOneInEveryByte * 0x80));
+}
+
+
+enum AsciiCaseConversion {
+  ASCII_TO_LOWER,
+  ASCII_TO_UPPER
+};
+
+
+template <AsciiCaseConversion dir>
+struct FastAsciiConverter {
+  static bool Convert(char* dst, char* src, int length) {
+#ifdef DEBUG
+    char* saved_dst = dst;
+    char* saved_src = src;
+#endif
+    // We rely on the distance between upper and lower case letters
+    // being a known power of 2.
+    ASSERT('a' - 'A' == (1 << 5));
+    // Boundaries for the range of input characters than require conversion.
+    const char lo = (dir == ASCII_TO_LOWER) ? 'A' - 1 : 'a' - 1;
+    const char hi = (dir == ASCII_TO_LOWER) ? 'Z' + 1 : 'z' + 1;
+    bool changed = false;
+    char* const limit = src + length;
+#ifdef V8_HOST_CAN_READ_UNALIGNED
+    // Process the prefix of the input that requires no conversion one
+    // (machine) word at a time.
+    while (src <= limit - sizeof(uintptr_t)) {
+      uintptr_t w = *reinterpret_cast<uintptr_t*>(src);
+      if (AsciiRangeMask(w, lo, hi) != 0) {
+        changed = true;
+        break;
+      }
+      *reinterpret_cast<uintptr_t*>(dst) = w;
+      src += sizeof(uintptr_t);
+      dst += sizeof(uintptr_t);
+    }
+    // Process the remainder of the input performing conversion when
+    // required one word at a time.
+    while (src <= limit - sizeof(uintptr_t)) {
+      uintptr_t w = *reinterpret_cast<uintptr_t*>(src);
+      uintptr_t m = AsciiRangeMask(w, lo, hi);
+      // The mask has high (7th) bit set in every byte that needs
+      // conversion and we know that the distance between cases is
+      // 1 << 5.
+      *reinterpret_cast<uintptr_t*>(dst) = w ^ (m >> 2);
+      src += sizeof(uintptr_t);
+      dst += sizeof(uintptr_t);
+    }
+#endif
+    // Process the last few bytes of the input (or the whole input if
+    // unaligned access is not supported).
+    while (src < limit) {
+      char c = *src;
+      if (lo < c && c < hi) {
+        c ^= (1 << 5);
+        changed = true;
+      }
+      *dst = c;
+      ++src;
+      ++dst;
+    }
+#ifdef DEBUG
+    CheckConvert(saved_dst, saved_src, length, changed);
+#endif
+    return changed;
+  }
+
+#ifdef DEBUG
+  static void CheckConvert(char* dst, char* src, int length, bool changed) {
+    bool expected_changed = false;
+    for (int i = 0; i < length; i++) {
+      if (dst[i] == src[i]) continue;
+      expected_changed = true;
+      if (dir == ASCII_TO_LOWER) {
+        ASSERT('A' <= src[i] && src[i] <= 'Z');
+        ASSERT(dst[i] == src[i] + ('a' - 'A'));
+      } else {
+        ASSERT(dir == ASCII_TO_UPPER);
+        ASSERT('a' <= src[i] && src[i] <= 'z');
+        ASSERT(dst[i] == src[i] - ('a' - 'A'));
+      }
+    }
+    ASSERT(expected_changed == changed);
+  }
+#endif
+};
+
+
 struct ToLowerTraits {
   typedef unibrow::ToLowercase UnibrowConverter;
 
-  static bool ConvertAscii(char* dst, char* src, int length) {
-    bool changed = false;
-    for (int i = 0; i < length; ++i) {
-      char c = src[i];
-      if ('A' <= c && c <= 'Z') {
-        c += ('a' - 'A');
-        changed = true;
-      }
-      dst[i] = c;
-    }
-    return changed;
-  }
+  typedef FastAsciiConverter<ASCII_TO_LOWER> AsciiConverter;
 };
 
 
 struct ToUpperTraits {
   typedef unibrow::ToUppercase UnibrowConverter;
 
-  static bool ConvertAscii(char* dst, char* src, int length) {
-    bool changed = false;
-    for (int i = 0; i < length; ++i) {
-      char c = src[i];
-      if ('a' <= c && c <= 'z') {
-        c -= ('a' - 'A');
-        changed = true;
-      }
-      dst[i] = c;
-    }
-    return changed;
-  }
+  typedef FastAsciiConverter<ASCII_TO_UPPER> AsciiConverter;
 };
 
 }  // namespace
 
 
 template <typename ConvertTraits>
-static Object* ConvertCase(
+MUST_USE_RESULT static MaybeObject* ConvertCase(
     Arguments args,
     unibrow::Mapping<typename ConvertTraits::UnibrowConverter, 128>* mapping) {
   NoHandleAllocation ha;
@@ -4696,29 +5032,37 @@ static Object* ConvertCase(
   // might break in the future if we implement more context and locale
   // dependent upper/lower conversions.
   if (s->IsSeqAsciiString()) {
-    Object* o = Heap::AllocateRawAsciiString(length);
-    if (o->IsFailure()) return o;
+    Object* o;
+    { MaybeObject* maybe_o = Heap::AllocateRawAsciiString(length);
+      if (!maybe_o->ToObject(&o)) return maybe_o;
+    }
     SeqAsciiString* result = SeqAsciiString::cast(o);
-    bool has_changed_character = ConvertTraits::ConvertAscii(
+    bool has_changed_character = ConvertTraits::AsciiConverter::Convert(
         result->GetChars(), SeqAsciiString::cast(s)->GetChars(), length);
     return has_changed_character ? result : s;
   }
 
-  Object* answer = ConvertCaseHelper(s, length, length, mapping);
+  Object* answer;
+  { MaybeObject* maybe_answer = ConvertCaseHelper(s, length, length, mapping);
+    if (!maybe_answer->ToObject(&answer)) return maybe_answer;
+  }
   if (answer->IsSmi()) {
     // Retry with correct length.
-    answer = ConvertCaseHelper(s, Smi::cast(answer)->value(), length, mapping);
+    { MaybeObject* maybe_answer =
+          ConvertCaseHelper(s, Smi::cast(answer)->value(), length, mapping);
+      if (!maybe_answer->ToObject(&answer)) return maybe_answer;
+    }
   }
-  return answer;  // This may be a failure.
+  return answer;
 }
 
 
-static Object* Runtime_StringToLowerCase(Arguments args) {
+static MaybeObject* Runtime_StringToLowerCase(Arguments args) {
   return ConvertCase<ToLowerTraits>(args, &to_lower_mapping);
 }
 
 
-static Object* Runtime_StringToUpperCase(Arguments args) {
+static MaybeObject* Runtime_StringToUpperCase(Arguments args) {
   return ConvertCase<ToUpperTraits>(args, &to_upper_mapping);
 }
 
@@ -4728,7 +5072,7 @@ static inline bool IsTrimWhiteSpace(unibrow::uchar c) {
 }
 
 
-static Object* Runtime_StringTrim(Arguments args) {
+static MaybeObject* Runtime_StringTrim(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
 
@@ -4756,56 +5100,28 @@ static Object* Runtime_StringTrim(Arguments args) {
 }
 
 
-// Define storage for buffers declared in header file.
-// TODO(lrn): Remove these when rewriting search code.
-int BMBuffers::bad_char_occurrence[kBMAlphabetSize];
-BMGoodSuffixBuffers BMBuffers::bmgs_buffers;
-
-
-template <typename schar, typename pchar>
-void FindStringIndices(Vector<const schar> subject,
-                       Vector<const pchar> pattern,
+template <typename SubjectChar, typename PatternChar>
+void FindStringIndices(Vector<const SubjectChar> subject,
+                       Vector<const PatternChar> pattern,
                        ZoneList<int>* indices,
                        unsigned int limit) {
   ASSERT(limit > 0);
   // Collect indices of pattern in subject, and the end-of-string index.
   // Stop after finding at most limit values.
-  StringSearchStrategy strategy =
-      InitializeStringSearch(pattern, sizeof(schar) == 1);
-  switch (strategy) {
-    case SEARCH_FAIL: return;
-    case SEARCH_SHORT: {
-      int pattern_length = pattern.length();
-      int index = 0;
-      while (limit > 0) {
-        index = SimpleIndexOf(subject, pattern, index);
-        if (index < 0) return;
-        indices->Add(index);
-        index += pattern_length;
-        limit--;
-      }
-      return;
-    }
-    case SEARCH_LONG: {
-      int pattern_length = pattern.length();
-      int index = 0;
-      while (limit > 0) {
-        index = ComplexIndexOf(subject, pattern, index);
-        if (index < 0) return;
-        indices->Add(index);
-        index += pattern_length;
-        limit--;
-      }
-      return;
-    }
-    default:
-      UNREACHABLE();
-      return;
+  StringSearch<PatternChar, SubjectChar> search(pattern);
+  int pattern_length = pattern.length();
+  int index = 0;
+  while (limit > 0) {
+    index = search.Search(subject, index);
+    if (index < 0) return;
+    indices->Add(index);
+    index += pattern_length;
+    limit--;
   }
 }
 
 
-static Object* Runtime_StringSplit(Arguments args) {
+static MaybeObject* Runtime_StringSplit(Arguments args) {
   ASSERT(args.length() == 3);
   HandleScope handle_scope;
   CONVERT_ARG_CHECKED(String, subject, 0);
@@ -4931,18 +5247,21 @@ static int CopyCachedAsciiCharsToArray(const char* chars,
 
 // Converts a String to JSArray.
 // For example, "foo" => ["f", "o", "o"].
-static Object* Runtime_StringToArray(Arguments args) {
+static MaybeObject* Runtime_StringToArray(Arguments args) {
   HandleScope scope;
-  ASSERT(args.length() == 1);
+  ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(String, s, 0);
+  CONVERT_NUMBER_CHECKED(uint32_t, limit, Uint32, args[1]);
 
   s->TryFlatten();
-  const int length = s->length();
+  const int length = static_cast<int>(Min<uint32_t>(s->length(), limit));
 
   Handle<FixedArray> elements;
   if (s->IsFlat() && s->IsAsciiRepresentation()) {
-    Object* obj = Heap::AllocateUninitializedFixedArray(length);
-    if (obj->IsFailure()) return obj;
+    Object* obj;
+    { MaybeObject* maybe_obj = Heap::AllocateUninitializedFixedArray(length);
+      if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+    }
     elements = Handle<FixedArray>(FixedArray::cast(obj));
 
     Vector<const char> chars = s->ToAsciiVector();
@@ -4953,12 +5272,14 @@ static Object* Runtime_StringToArray(Arguments args) {
                                                             length);
 
     for (int i = num_copied_from_cache; i < length; ++i) {
-      elements->set(i, *LookupSingleCharacterStringFromCode(chars[i]));
+      Handle<Object> str = LookupSingleCharacterStringFromCode(chars[i]);
+      elements->set(i, *str);
     }
   } else {
     elements = Factory::NewFixedArray(length);
     for (int i = 0; i < length; ++i) {
-      elements->set(i, *LookupSingleCharacterStringFromCode(s->Get(i)));
+      Handle<Object> str = LookupSingleCharacterStringFromCode(s->Get(i));
+      elements->set(i, *str);
     }
   }
 
@@ -4972,7 +5293,7 @@ static Object* Runtime_StringToArray(Arguments args) {
 }
 
 
-static Object* Runtime_NewStringWrapper(Arguments args) {
+static MaybeObject* Runtime_NewStringWrapper(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, value, args[0]);
@@ -4987,7 +5308,7 @@ bool Runtime::IsUpperCaseChar(uint16_t ch) {
 }
 
 
-static Object* Runtime_NumberToString(Arguments args) {
+static MaybeObject* Runtime_NumberToString(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -4998,7 +5319,7 @@ static Object* Runtime_NumberToString(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToStringSkipCache(Arguments args) {
+static MaybeObject* Runtime_NumberToStringSkipCache(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5009,7 +5330,7 @@ static Object* Runtime_NumberToStringSkipCache(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToInteger(Arguments args) {
+static MaybeObject* Runtime_NumberToInteger(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5023,7 +5344,7 @@ static Object* Runtime_NumberToInteger(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToIntegerMapMinusZero(Arguments args) {
+static MaybeObject* Runtime_NumberToIntegerMapMinusZero(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5042,7 +5363,7 @@ static Object* Runtime_NumberToIntegerMapMinusZero(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToJSUint32(Arguments args) {
+static MaybeObject* Runtime_NumberToJSUint32(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5051,7 +5372,7 @@ static Object* Runtime_NumberToJSUint32(Arguments args) {
 }
 
 
-static Object* Runtime_NumberToJSInt32(Arguments args) {
+static MaybeObject* Runtime_NumberToJSInt32(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5067,7 +5388,7 @@ static Object* Runtime_NumberToJSInt32(Arguments args) {
 
 // Converts a Number to a Smi, if possible. Returns NaN if the number is not
 // a small integer.
-static Object* Runtime_NumberToSmi(Arguments args) {
+static MaybeObject* Runtime_NumberToSmi(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5086,7 +5407,14 @@ static Object* Runtime_NumberToSmi(Arguments args) {
 }
 
 
-static Object* Runtime_NumberAdd(Arguments args) {
+static MaybeObject* Runtime_AllocateHeapNumber(Arguments args) {
+  NoHandleAllocation ha;
+  ASSERT(args.length() == 0);
+  return Heap::AllocateHeapNumber(0);
+}
+
+
+static MaybeObject* Runtime_NumberAdd(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5096,7 +5424,7 @@ static Object* Runtime_NumberAdd(Arguments args) {
 }
 
 
-static Object* Runtime_NumberSub(Arguments args) {
+static MaybeObject* Runtime_NumberSub(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5106,7 +5434,7 @@ static Object* Runtime_NumberSub(Arguments args) {
 }
 
 
-static Object* Runtime_NumberMul(Arguments args) {
+static MaybeObject* Runtime_NumberMul(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5116,7 +5444,7 @@ static Object* Runtime_NumberMul(Arguments args) {
 }
 
 
-static Object* Runtime_NumberUnaryMinus(Arguments args) {
+static MaybeObject* Runtime_NumberUnaryMinus(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5125,7 +5453,7 @@ static Object* Runtime_NumberUnaryMinus(Arguments args) {
 }
 
 
-static Object* Runtime_NumberAlloc(Arguments args) {
+static MaybeObject* Runtime_NumberAlloc(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 0);
 
@@ -5133,7 +5461,7 @@ static Object* Runtime_NumberAlloc(Arguments args) {
 }
 
 
-static Object* Runtime_NumberDiv(Arguments args) {
+static MaybeObject* Runtime_NumberDiv(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5143,7 +5471,7 @@ static Object* Runtime_NumberDiv(Arguments args) {
 }
 
 
-static Object* Runtime_NumberMod(Arguments args) {
+static MaybeObject* Runtime_NumberMod(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5156,7 +5484,7 @@ static Object* Runtime_NumberMod(Arguments args) {
 }
 
 
-static Object* Runtime_StringAdd(Arguments args) {
+static MaybeObject* Runtime_StringAdd(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(String, str1, args[0]);
@@ -5205,7 +5533,7 @@ static inline void StringBuilderConcatHelper(String* special,
 }
 
 
-static Object* Runtime_StringBuilderConcat(Arguments args) {
+static MaybeObject* Runtime_StringBuilderConcat(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
   CONVERT_CHECKED(JSArray, array, args[0]);
@@ -5293,8 +5621,9 @@ static Object* Runtime_StringBuilderConcat(Arguments args) {
   Object* object;
 
   if (ascii) {
-    object = Heap::AllocateRawAsciiString(length);
-    if (object->IsFailure()) return object;
+    { MaybeObject* maybe_object = Heap::AllocateRawAsciiString(length);
+      if (!maybe_object->ToObject(&object)) return maybe_object;
+    }
     SeqAsciiString* answer = SeqAsciiString::cast(object);
     StringBuilderConcatHelper(special,
                               answer->GetChars(),
@@ -5302,8 +5631,9 @@ static Object* Runtime_StringBuilderConcat(Arguments args) {
                               array_length);
     return answer;
   } else {
-    object = Heap::AllocateRawTwoByteString(length);
-    if (object->IsFailure()) return object;
+    { MaybeObject* maybe_object = Heap::AllocateRawTwoByteString(length);
+      if (!maybe_object->ToObject(&object)) return maybe_object;
+    }
     SeqTwoByteString* answer = SeqTwoByteString::cast(object);
     StringBuilderConcatHelper(special,
                               answer->GetChars(),
@@ -5314,7 +5644,7 @@ static Object* Runtime_StringBuilderConcat(Arguments args) {
 }
 
 
-static Object* Runtime_NumberOr(Arguments args) {
+static MaybeObject* Runtime_NumberOr(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5324,7 +5654,7 @@ static Object* Runtime_NumberOr(Arguments args) {
 }
 
 
-static Object* Runtime_NumberAnd(Arguments args) {
+static MaybeObject* Runtime_NumberAnd(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5334,7 +5664,7 @@ static Object* Runtime_NumberAnd(Arguments args) {
 }
 
 
-static Object* Runtime_NumberXor(Arguments args) {
+static MaybeObject* Runtime_NumberXor(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5344,7 +5674,7 @@ static Object* Runtime_NumberXor(Arguments args) {
 }
 
 
-static Object* Runtime_NumberNot(Arguments args) {
+static MaybeObject* Runtime_NumberNot(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -5353,7 +5683,7 @@ static Object* Runtime_NumberNot(Arguments args) {
 }
 
 
-static Object* Runtime_NumberShl(Arguments args) {
+static MaybeObject* Runtime_NumberShl(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5363,7 +5693,7 @@ static Object* Runtime_NumberShl(Arguments args) {
 }
 
 
-static Object* Runtime_NumberShr(Arguments args) {
+static MaybeObject* Runtime_NumberShr(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5373,7 +5703,7 @@ static Object* Runtime_NumberShr(Arguments args) {
 }
 
 
-static Object* Runtime_NumberSar(Arguments args) {
+static MaybeObject* Runtime_NumberSar(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5383,7 +5713,7 @@ static Object* Runtime_NumberSar(Arguments args) {
 }
 
 
-static Object* Runtime_NumberEquals(Arguments args) {
+static MaybeObject* Runtime_NumberEquals(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5402,7 +5732,7 @@ static Object* Runtime_NumberEquals(Arguments args) {
 }
 
 
-static Object* Runtime_StringEquals(Arguments args) {
+static MaybeObject* Runtime_StringEquals(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5420,7 +5750,7 @@ static Object* Runtime_StringEquals(Arguments args) {
 }
 
 
-static Object* Runtime_NumberCompare(Arguments args) {
+static MaybeObject* Runtime_NumberCompare(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
 
@@ -5435,7 +5765,7 @@ static Object* Runtime_NumberCompare(Arguments args) {
 
 // Compare two Smis as if they were converted to strings and then
 // compared lexicographically.
-static Object* Runtime_SmiLexicographicCompare(Arguments args) {
+static MaybeObject* Runtime_SmiLexicographicCompare(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5553,7 +5883,7 @@ static Object* FlatStringCompare(String* x, String* y) {
 }
 
 
-static Object* Runtime_StringCompare(Arguments args) {
+static MaybeObject* Runtime_StringCompare(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -5575,17 +5905,20 @@ static Object* Runtime_StringCompare(Arguments args) {
   if (d < 0) return Smi::FromInt(LESS);
   else if (d > 0) return Smi::FromInt(GREATER);
 
-  Object* obj = Heap::PrepareForCompare(x);
-  if (obj->IsFailure()) return obj;
-  obj = Heap::PrepareForCompare(y);
-  if (obj->IsFailure()) return obj;
+  Object* obj;
+  { MaybeObject* maybe_obj = Heap::PrepareForCompare(x);
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
+  { MaybeObject* maybe_obj = Heap::PrepareForCompare(y);
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
 
   return (x->IsFlat() && y->IsFlat()) ? FlatStringCompare(x, y)
                                       : StringInputBufferCompare(x, y);
 }
 
 
-static Object* Runtime_Math_acos(Arguments args) {
+static MaybeObject* Runtime_Math_acos(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_acos.Increment();
@@ -5595,7 +5928,7 @@ static Object* Runtime_Math_acos(Arguments args) {
 }
 
 
-static Object* Runtime_Math_asin(Arguments args) {
+static MaybeObject* Runtime_Math_asin(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_asin.Increment();
@@ -5605,7 +5938,7 @@ static Object* Runtime_Math_asin(Arguments args) {
 }
 
 
-static Object* Runtime_Math_atan(Arguments args) {
+static MaybeObject* Runtime_Math_atan(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_atan.Increment();
@@ -5615,7 +5948,7 @@ static Object* Runtime_Math_atan(Arguments args) {
 }
 
 
-static Object* Runtime_Math_atan2(Arguments args) {
+static MaybeObject* Runtime_Math_atan2(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   Counters::math_atan2.Increment();
@@ -5639,7 +5972,7 @@ static Object* Runtime_Math_atan2(Arguments args) {
 }
 
 
-static Object* Runtime_Math_ceil(Arguments args) {
+static MaybeObject* Runtime_Math_ceil(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_ceil.Increment();
@@ -5649,7 +5982,7 @@ static Object* Runtime_Math_ceil(Arguments args) {
 }
 
 
-static Object* Runtime_Math_cos(Arguments args) {
+static MaybeObject* Runtime_Math_cos(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_cos.Increment();
@@ -5659,7 +5992,7 @@ static Object* Runtime_Math_cos(Arguments args) {
 }
 
 
-static Object* Runtime_Math_exp(Arguments args) {
+static MaybeObject* Runtime_Math_exp(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_exp.Increment();
@@ -5669,7 +6002,7 @@ static Object* Runtime_Math_exp(Arguments args) {
 }
 
 
-static Object* Runtime_Math_floor(Arguments args) {
+static MaybeObject* Runtime_Math_floor(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_floor.Increment();
@@ -5679,7 +6012,7 @@ static Object* Runtime_Math_floor(Arguments args) {
 }
 
 
-static Object* Runtime_Math_log(Arguments args) {
+static MaybeObject* Runtime_Math_log(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_log.Increment();
@@ -5720,7 +6053,7 @@ static double powi(double x, int y) {
 }
 
 
-static Object* Runtime_Math_pow(Arguments args) {
+static MaybeObject* Runtime_Math_pow(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   Counters::math_pow.Increment();
@@ -5760,7 +6093,7 @@ static Object* Runtime_Math_pow(Arguments args) {
 
 // Fast version of Math.pow if we know that y is not an integer and
 // y is not -0.5 or 0.5. Used as slowcase from codegen.
-static Object* Runtime_Math_pow_cfunction(Arguments args) {
+static MaybeObject* Runtime_Math_pow_cfunction(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
   CONVERT_DOUBLE_CHECKED(x, args[0]);
@@ -5775,7 +6108,7 @@ static Object* Runtime_Math_pow_cfunction(Arguments args) {
 }
 
 
-static Object* Runtime_RoundNumber(Arguments args) {
+static MaybeObject* Runtime_RoundNumber(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_round.Increment();
@@ -5811,7 +6144,7 @@ static Object* Runtime_RoundNumber(Arguments args) {
 }
 
 
-static Object* Runtime_Math_sin(Arguments args) {
+static MaybeObject* Runtime_Math_sin(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_sin.Increment();
@@ -5821,7 +6154,7 @@ static Object* Runtime_Math_sin(Arguments args) {
 }
 
 
-static Object* Runtime_Math_sqrt(Arguments args) {
+static MaybeObject* Runtime_Math_sqrt(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_sqrt.Increment();
@@ -5831,7 +6164,7 @@ static Object* Runtime_Math_sqrt(Arguments args) {
 }
 
 
-static Object* Runtime_Math_tan(Arguments args) {
+static MaybeObject* Runtime_Math_tan(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Counters::math_tan.Increment();
@@ -5886,7 +6219,7 @@ static int MakeDay(int year, int month, int day) {
 }
 
 
-static Object* Runtime_DateMakeDay(Arguments args) {
+static MaybeObject* Runtime_DateMakeDay(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
 
@@ -6185,7 +6518,7 @@ static inline void DateYMDFromTime(int date,
 }
 
 
-static Object* Runtime_DateYMDFromTime(Arguments args) {
+static MaybeObject* Runtime_DateYMDFromTime(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -6207,7 +6540,7 @@ static Object* Runtime_DateYMDFromTime(Arguments args) {
 }
 
 
-static Object* Runtime_NewArgumentsFast(Arguments args) {
+static MaybeObject* Runtime_NewArgumentsFast(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 3);
 
@@ -6215,13 +6548,17 @@ static Object* Runtime_NewArgumentsFast(Arguments args) {
   Object** parameters = reinterpret_cast<Object**>(args[1]);
   const int length = Smi::cast(args[2])->value();
 
-  Object* result = Heap::AllocateArgumentsObject(callee, length);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result = Heap::AllocateArgumentsObject(callee, length);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
   // Allocate the elements if needed.
   if (length > 0) {
     // Allocate the fixed array.
-    Object* obj = Heap::AllocateRawFixedArray(length);
-    if (obj->IsFailure()) return obj;
+    Object* obj;
+    { MaybeObject* maybe_obj = Heap::AllocateRawFixedArray(length);
+      if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+    }
 
     AssertNoAllocation no_gc;
     FixedArray* array = reinterpret_cast<FixedArray*>(obj);
@@ -6238,21 +6575,26 @@ static Object* Runtime_NewArgumentsFast(Arguments args) {
 }
 
 
-static Object* Runtime_NewClosure(Arguments args) {
+static MaybeObject* Runtime_NewClosure(Arguments args) {
   HandleScope scope;
-  ASSERT(args.length() == 2);
+  ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(Context, context, 0);
   CONVERT_ARG_CHECKED(SharedFunctionInfo, shared, 1);
+  CONVERT_BOOLEAN_CHECKED(pretenure, args[2]);
 
-  PretenureFlag pretenure = (context->global_context() == *context)
-      ? TENURED       // Allocate global closures in old space.
-      : NOT_TENURED;  // Allocate local closures in new space.
+  // Allocate global closures in old space and allocate local closures
+  // in new space. Additionally pretenure closures that are assigned
+  // directly to properties.
+  pretenure = pretenure || (context->global_context() == *context);
+  PretenureFlag pretenure_flag = pretenure ? TENURED : NOT_TENURED;
   Handle<JSFunction> result =
-      Factory::NewFunctionFromSharedFunctionInfo(shared, context, pretenure);
+      Factory::NewFunctionFromSharedFunctionInfo(shared,
+                                                 context,
+                                                 pretenure_flag);
   return *result;
 }
 
-static Object* Runtime_NewObjectFromBound(Arguments args) {
+static MaybeObject* Runtime_NewObjectFromBound(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(JSFunction, function, 0);
@@ -6279,25 +6621,23 @@ static Object* Runtime_NewObjectFromBound(Arguments args) {
 }
 
 
-static Code* ComputeConstructStub(Handle<JSFunction> function) {
+static void TrySettingInlineConstructStub(Handle<JSFunction> function) {
   Handle<Object> prototype = Factory::null_value();
   if (function->has_instance_prototype()) {
     prototype = Handle<Object>(function->instance_prototype());
   }
   if (function->shared()->CanGenerateInlineConstructor(*prototype)) {
     ConstructStubCompiler compiler;
-    Object* code = compiler.CompileConstructStub(function->shared());
-    if (code->IsFailure()) {
-      return Builtins::builtin(Builtins::JSConstructStubGeneric);
+    MaybeObject* code = compiler.CompileConstructStub(*function);
+    if (!code->IsFailure()) {
+      function->shared()->set_construct_stub(
+          Code::cast(code->ToObjectUnchecked()));
     }
-    return Code::cast(code);
   }
-
-  return function->shared()->construct_stub();
 }
 
 
-static Object* Runtime_NewObject(Arguments args) {
+static MaybeObject* Runtime_NewObject(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -6346,16 +6686,26 @@ static Object* Runtime_NewObject(Arguments args) {
     }
   }
 
-  // The function should be compiled for the optimization hints to be available.
+  // The function should be compiled for the optimization hints to be
+  // available. We cannot use EnsureCompiled because that forces a
+  // compilation through the shared function info which makes it
+  // impossible for us to optimize.
   Handle<SharedFunctionInfo> shared(function->shared());
-  EnsureCompiled(shared, CLEAR_EXCEPTION);
+  if (!function->is_compiled()) CompileLazy(function, CLEAR_EXCEPTION);
 
-  bool first_allocation = !function->has_initial_map();
+  if (!function->has_initial_map() &&
+      shared->IsInobjectSlackTrackingInProgress()) {
+    // The tracking is already in progress for another function. We can only
+    // track one initial_map at a time, so we force the completion before the
+    // function is called as a constructor for the first time.
+    shared->CompleteInobjectSlackTracking();
+  }
+
+  bool first_allocation = !shared->live_objects_may_exist();
   Handle<JSObject> result = Factory::NewJSObject(function);
-  if (first_allocation) {
-    Handle<Code> stub = Handle<Code>(
-        ComputeConstructStub(Handle<JSFunction>(function)));
-    shared->set_construct_stub(*stub);
+  // Delay setting the stub if inobject slack tracking is in progress.
+  if (first_allocation && !shared->IsInobjectSlackTrackingInProgress()) {
+    TrySettingInlineConstructStub(function);
   }
 
   Counters::constructed_objects.Increment();
@@ -6365,7 +6715,19 @@ static Object* Runtime_NewObject(Arguments args) {
 }
 
 
-static Object* Runtime_LazyCompile(Arguments args) {
+static MaybeObject* Runtime_FinalizeInstanceSize(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+
+  CONVERT_ARG_CHECKED(JSFunction, function, 0);
+  function->shared()->CompleteInobjectSlackTracking();
+  TrySettingInlineConstructStub(function);
+
+  return Heap::undefined_value();
+}
+
+
+static MaybeObject* Runtime_LazyCompile(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -6373,7 +6735,7 @@ static Object* Runtime_LazyCompile(Arguments args) {
 #ifdef DEBUG
   if (FLAG_trace_lazy && !function->shared()->is_compiled()) {
     PrintF("[lazy: ");
-    function->shared()->name()->Print();
+    function->PrintName();
     PrintF("]\n");
   }
 #endif
@@ -6386,15 +6748,241 @@ static Object* Runtime_LazyCompile(Arguments args) {
   // this means that things called through constructors are never known to
   // be in loops.  We compile them as if they are in loops here just in case.
   ASSERT(!function->is_compiled());
-  if (!CompileLazyInLoop(function, Handle<Object>::null(), KEEP_EXCEPTION)) {
+  if (!CompileLazyInLoop(function, KEEP_EXCEPTION)) {
     return Failure::Exception();
   }
 
+  // All done. Return the compiled code.
+  ASSERT(function->is_compiled());
   return function->code();
 }
 
 
-static Object* Runtime_GetFunctionDelegate(Arguments args) {
+static MaybeObject* Runtime_LazyRecompile(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  Handle<JSFunction> function = args.at<JSFunction>(0);
+  // If the function is not optimizable or debugger is active continue using the
+  // code from the full compiler.
+  if (!function->shared()->code()->optimizable() ||
+      Debug::has_break_points()) {
+    function->ReplaceCode(function->shared()->code());
+    return function->code();
+  }
+  if (CompileOptimized(function, AstNode::kNoNumber)) {
+    return function->code();
+  }
+  function->ReplaceCode(function->shared()->code());
+  return Failure::Exception();
+}
+
+
+static MaybeObject* Runtime_NotifyDeoptimized(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  RUNTIME_ASSERT(args[0]->IsSmi());
+  Deoptimizer::BailoutType type =
+      static_cast<Deoptimizer::BailoutType>(Smi::cast(args[0])->value());
+  Deoptimizer* deoptimizer = Deoptimizer::Grab();
+  ASSERT(Heap::IsAllocationAllowed());
+  int frames = deoptimizer->output_count();
+
+  JavaScriptFrameIterator it;
+  JavaScriptFrame* frame = NULL;
+  for (int i = 0; i < frames; i++) {
+    if (i != 0) it.Advance();
+    frame = it.frame();
+    deoptimizer->InsertHeapNumberValues(frames - i - 1, frame);
+  }
+  delete deoptimizer;
+
+  RUNTIME_ASSERT(frame->function()->IsJSFunction());
+  Handle<JSFunction> function(JSFunction::cast(frame->function()));
+  Handle<Object> arguments;
+  for (int i = frame->ComputeExpressionsCount() - 1; i >= 0; --i) {
+    if (frame->GetExpression(i) == Heap::the_hole_value()) {
+      if (arguments.is_null()) {
+        // FunctionGetArguments can't throw an exception, so cast away the
+        // doubt with an assert.
+        arguments = Handle<Object>(
+            Accessors::FunctionGetArguments(*function,
+                                            NULL)->ToObjectUnchecked());
+        ASSERT(*arguments != Heap::null_value());
+        ASSERT(*arguments != Heap::undefined_value());
+      }
+      frame->SetExpression(i, *arguments);
+    }
+  }
+
+  CompilationCache::MarkForLazyOptimizing(function);
+  if (type == Deoptimizer::EAGER) {
+    RUNTIME_ASSERT(function->IsOptimized());
+  } else {
+    RUNTIME_ASSERT(!function->IsOptimized());
+  }
+
+  // Avoid doing too much work when running with --always-opt and keep
+  // the optimized code around.
+  if (FLAG_always_opt || type == Deoptimizer::LAZY) {
+    return Heap::undefined_value();
+  }
+
+  // Count the number of optimized activations of the function.
+  int activations = 0;
+  while (!it.done()) {
+    JavaScriptFrame* frame = it.frame();
+    if (frame->is_optimized() && frame->function() == *function) {
+      activations++;
+    }
+    it.Advance();
+  }
+
+  // TODO(kasperl): For now, we cannot support removing the optimized
+  // code when we have recursive invocations of the same function.
+  if (activations == 0) {
+    if (FLAG_trace_deopt) {
+      PrintF("[removing optimized code for: ");
+      function->PrintName();
+      PrintF("]\n");
+    }
+    function->ReplaceCode(function->shared()->code());
+  }
+  return Heap::undefined_value();
+}
+
+
+static MaybeObject* Runtime_NotifyOSR(Arguments args) {
+  Deoptimizer* deoptimizer = Deoptimizer::Grab();
+  delete deoptimizer;
+  return Heap::undefined_value();
+}
+
+
+static MaybeObject* Runtime_DeoptimizeFunction(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  CONVERT_ARG_CHECKED(JSFunction, function, 0);
+  if (!function->IsOptimized()) return Heap::undefined_value();
+
+  Deoptimizer::DeoptimizeFunction(*function);
+
+  return Heap::undefined_value();
+}
+
+
+static MaybeObject* Runtime_CompileForOnStackReplacement(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  CONVERT_ARG_CHECKED(JSFunction, function, 0);
+
+  // We're not prepared to handle a function with arguments object.
+  ASSERT(!function->shared()->scope_info()->HasArgumentsShadow());
+
+  // We have hit a back edge in an unoptimized frame for a function that was
+  // selected for on-stack replacement.  Find the unoptimized code object.
+  Handle<Code> unoptimized(function->shared()->code());
+  // Keep track of whether we've succeeded in optimizing.
+  bool succeeded = unoptimized->optimizable();
+  if (succeeded) {
+    // If we are trying to do OSR when there are already optimized
+    // activations of the function, it means (a) the function is directly or
+    // indirectly recursive and (b) an optimized invocation has been
+    // deoptimized so that we are currently in an unoptimized activation.
+    // Check for optimized activations of this function.
+    JavaScriptFrameIterator it;
+    while (succeeded && !it.done()) {
+      JavaScriptFrame* frame = it.frame();
+      succeeded = !frame->is_optimized() || frame->function() != *function;
+      it.Advance();
+    }
+  }
+
+  int ast_id = AstNode::kNoNumber;
+  if (succeeded) {
+    // The top JS function is this one, the PC is somewhere in the
+    // unoptimized code.
+    JavaScriptFrameIterator it;
+    JavaScriptFrame* frame = it.frame();
+    ASSERT(frame->function() == *function);
+    ASSERT(frame->code() == *unoptimized);
+    ASSERT(unoptimized->contains(frame->pc()));
+
+    // Use linear search of the unoptimized code's stack check table to find
+    // the AST id matching the PC.
+    Address start = unoptimized->instruction_start();
+    unsigned target_pc_offset = static_cast<unsigned>(frame->pc() - start);
+    Address table_cursor = start + unoptimized->stack_check_table_start();
+    uint32_t table_length = Memory::uint32_at(table_cursor);
+    table_cursor += kIntSize;
+    for (unsigned i = 0; i < table_length; ++i) {
+      // Table entries are (AST id, pc offset) pairs.
+      uint32_t pc_offset = Memory::uint32_at(table_cursor + kIntSize);
+      if (pc_offset == target_pc_offset) {
+        ast_id = static_cast<int>(Memory::uint32_at(table_cursor));
+        break;
+      }
+      table_cursor += 2 * kIntSize;
+    }
+    ASSERT(ast_id != AstNode::kNoNumber);
+    if (FLAG_trace_osr) {
+      PrintF("[replacing on-stack at AST id %d in ", ast_id);
+      function->PrintName();
+      PrintF("]\n");
+    }
+
+    // Try to compile the optimized code.  A true return value from
+    // CompileOptimized means that compilation succeeded, not necessarily
+    // that optimization succeeded.
+    if (CompileOptimized(function, ast_id) && function->IsOptimized()) {
+      DeoptimizationInputData* data = DeoptimizationInputData::cast(
+          function->code()->deoptimization_data());
+      if (FLAG_trace_osr) {
+        PrintF("[on-stack replacement offset %d in optimized code]\n",
+               data->OsrPcOffset()->value());
+      }
+      ASSERT(data->OsrAstId()->value() == ast_id);
+      ASSERT(data->OsrPcOffset()->value() >= 0);
+    } else {
+      succeeded = false;
+    }
+  }
+
+  // Revert to the original stack checks in the original unoptimized code.
+  if (FLAG_trace_osr) {
+    PrintF("[restoring original stack checks in ");
+    function->PrintName();
+    PrintF("]\n");
+  }
+  StackCheckStub check_stub;
+  Handle<Code> check_code = check_stub.GetCode();
+  Handle<Code> replacement_code(
+      Builtins::builtin(Builtins::OnStackReplacement));
+  // Iterate the unoptimized code and revert all the patched stack checks.
+  for (RelocIterator it(*unoptimized, RelocInfo::kCodeTargetMask);
+       !it.done();
+       it.next()) {
+    RelocInfo* rinfo = it.rinfo();
+    if (rinfo->target_address() == replacement_code->entry()) {
+      Deoptimizer::RevertStackCheckCode(rinfo, *check_code);
+    }
+  }
+
+  // Allow OSR only at nesting level zero again.
+  unoptimized->set_allow_osr_at_loop_nesting_level(0);
+
+  // If the optimization attempt succeeded, return the AST id tagged as a
+  // smi. This tells the builtin that we need to translate the unoptimized
+  // frame to an optimized one.
+  if (succeeded) {
+    ASSERT(function->code()->kind() == Code::OPTIMIZED_FUNCTION);
+    return Smi::FromInt(ast_id);
+  } else {
+    return Smi::FromInt(-1);
+  }
+}
+
+
+static MaybeObject* Runtime_GetFunctionDelegate(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   RUNTIME_ASSERT(!args[0]->IsJSFunction());
@@ -6402,7 +6990,7 @@ static Object* Runtime_GetFunctionDelegate(Arguments args) {
 }
 
 
-static Object* Runtime_GetConstructorDelegate(Arguments args) {
+static MaybeObject* Runtime_GetConstructorDelegate(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   RUNTIME_ASSERT(!args[0]->IsJSFunction());
@@ -6410,27 +6998,33 @@ static Object* Runtime_GetConstructorDelegate(Arguments args) {
 }
 
 
-static Object* Runtime_NewContext(Arguments args) {
+static MaybeObject* Runtime_NewContext(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
   CONVERT_CHECKED(JSFunction, function, args[0]);
   int length = function->shared()->scope_info()->NumberOfContextSlots();
-  Object* result = Heap::AllocateFunctionContext(length, function);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result = Heap::AllocateFunctionContext(length, function);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
 
   Top::set_context(Context::cast(result));
 
   return result;  // non-failure
 }
 
-static Object* PushContextHelper(Object* object, bool is_catch_context) {
+
+MUST_USE_RESULT static MaybeObject* PushContextHelper(Object* object,
+                                                      bool is_catch_context) {
   // Convert the object to a proper JavaScript object.
   Object* js_object = object;
   if (!js_object->IsJSObject()) {
-    js_object = js_object->ToObject();
-    if (js_object->IsFailure()) {
-      if (!Failure::cast(js_object)->IsInternalError()) return js_object;
+    MaybeObject* maybe_js_object = js_object->ToObject();
+    if (!maybe_js_object->ToObject(&js_object)) {
+      if (!Failure::cast(maybe_js_object)->IsInternalError()) {
+        return maybe_js_object;
+      }
       HandleScope scope;
       Handle<Object> handle(object);
       Handle<Object> result =
@@ -6439,11 +7033,13 @@ static Object* PushContextHelper(Object* object, bool is_catch_context) {
     }
   }
 
-  Object* result =
-      Heap::AllocateWithContext(Top::context(),
-                                JSObject::cast(js_object),
-                                is_catch_context);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result =
+        Heap::AllocateWithContext(Top::context(),
+                                  JSObject::cast(js_object),
+                                  is_catch_context);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
 
   Context* context = Context::cast(result);
   Top::set_context(context);
@@ -6452,21 +7048,21 @@ static Object* PushContextHelper(Object* object, bool is_catch_context) {
 }
 
 
-static Object* Runtime_PushContext(Arguments args) {
+static MaybeObject* Runtime_PushContext(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   return PushContextHelper(args[0], false);
 }
 
 
-static Object* Runtime_PushCatchContext(Arguments args) {
+static MaybeObject* Runtime_PushCatchContext(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   return PushContextHelper(args[0], true);
 }
 
 
-static Object* Runtime_LookupContext(Arguments args) {
+static MaybeObject* Runtime_LookupContext(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
@@ -6499,11 +7095,11 @@ static Object* Runtime_LookupContext(Arguments args) {
 // allocated by the caller, and passed as a pointer in a hidden first parameter.
 #ifdef V8_HOST_ARCH_64_BIT
 struct ObjectPair {
-  Object* x;
-  Object* y;
+  MaybeObject* x;
+  MaybeObject* y;
 };
 
-static inline ObjectPair MakePair(Object* x, Object* y) {
+static inline ObjectPair MakePair(MaybeObject* x, MaybeObject* y) {
   ObjectPair result = {x, y};
   // Pointers x and y returned in rax and rdx, in AMD-x64-abi.
   // In Win64 they are assigned to a hidden first argument.
@@ -6511,14 +7107,15 @@ static inline ObjectPair MakePair(Object* x, Object* y) {
 }
 #else
 typedef uint64_t ObjectPair;
-static inline ObjectPair MakePair(Object* x, Object* y) {
+static inline ObjectPair MakePair(MaybeObject* x, MaybeObject* y) {
   return reinterpret_cast<uint32_t>(x) |
       (reinterpret_cast<ObjectPair>(y) << 32);
 }
 #endif
 
 
-static inline Object* Unhole(Object* x, PropertyAttributes attributes) {
+static inline MaybeObject* Unhole(MaybeObject* x,
+                                  PropertyAttributes attributes) {
   ASSERT(!x->IsTheHole() || (attributes & READ_ONLY) != 0);
   USE(attributes);
   return x->IsTheHole() ? Heap::undefined_value() : x;
@@ -6568,7 +7165,7 @@ static ObjectPair LoadContextSlotHelper(Arguments args, bool throw_error) {
     // argument in a context, the receiver is the global object; see
     // ECMA-262, 3rd., 10.1.6 and 10.2.3.
     JSObject* receiver = Top::context()->global()->global_receiver();
-    Object* value = (holder->IsContext())
+    MaybeObject* value = (holder->IsContext())
         ? Context::cast(*holder)->get(index)
         : JSObject::cast(*holder)->GetElement(index);
     return MakePair(Unhole(value, attributes), receiver);
@@ -6588,7 +7185,7 @@ static ObjectPair LoadContextSlotHelper(Arguments args, bool throw_error) {
     }
     // No need to unhole the value here. This is taken care of by the
     // GetProperty function.
-    Object* value = object->GetProperty(*name);
+    MaybeObject* value = object->GetProperty(*name);
     return MakePair(value, receiver);
   }
 
@@ -6614,7 +7211,7 @@ static ObjectPair Runtime_LoadContextSlotNoReferenceError(Arguments args) {
 }
 
 
-static Object* Runtime_StoreContextSlot(Arguments args) {
+static MaybeObject* Runtime_StoreContextSlot(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
 
@@ -6636,10 +7233,8 @@ static Object* Runtime_StoreContextSlot(Arguments args) {
       }
     } else {
       ASSERT((attributes & READ_ONLY) == 0);
-      Object* result =
-          Handle<JSObject>::cast(holder)->SetElement(index, *value);
-      USE(result);
-      ASSERT(!result->IsFailure());
+      Handle<JSObject>::cast(holder)->SetElement(index, *value)->
+          ToObjectUnchecked();
     }
     return *value;
   }
@@ -6675,7 +7270,7 @@ static Object* Runtime_StoreContextSlot(Arguments args) {
 }
 
 
-static Object* Runtime_Throw(Arguments args) {
+static MaybeObject* Runtime_Throw(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -6683,7 +7278,7 @@ static Object* Runtime_Throw(Arguments args) {
 }
 
 
-static Object* Runtime_ReThrow(Arguments args) {
+static MaybeObject* Runtime_ReThrow(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -6691,13 +7286,13 @@ static Object* Runtime_ReThrow(Arguments args) {
 }
 
 
-static Object* Runtime_PromoteScheduledException(Arguments args) {
+static MaybeObject* Runtime_PromoteScheduledException(Arguments args) {
   ASSERT_EQ(0, args.length());
   return Top::PromoteScheduledException();
 }
 
 
-static Object* Runtime_ThrowReferenceError(Arguments args) {
+static MaybeObject* Runtime_ThrowReferenceError(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -6708,14 +7303,14 @@ static Object* Runtime_ThrowReferenceError(Arguments args) {
 }
 
 
-static Object* Runtime_StackOverflow(Arguments args) {
+static MaybeObject* Runtime_StackOverflow(Arguments args) {
   NoHandleAllocation na;
   return Top::StackOverflow();
 }
 
 
-static Object* Runtime_StackGuard(Arguments args) {
-  ASSERT(args.length() == 1);
+static MaybeObject* Runtime_StackGuard(Arguments args) {
+  ASSERT(args.length() == 0);
 
   // First check if this is a real stack overflow.
   if (StackGuard::IsStackOverflow()) {
@@ -6757,7 +7352,7 @@ static void PrintObject(Object* obj) {
   } else if (obj->IsFalse()) {
     PrintF("<false>");
   } else {
-    PrintF("%p", obj);
+    PrintF("%p", reinterpret_cast<void*>(obj));
   }
 }
 
@@ -6812,7 +7407,7 @@ static void PrintTransition(Object* result) {
 }
 
 
-static Object* Runtime_TraceEnter(Arguments args) {
+static MaybeObject* Runtime_TraceEnter(Arguments args) {
   ASSERT(args.length() == 0);
   NoHandleAllocation ha;
   PrintTransition(NULL);
@@ -6820,14 +7415,14 @@ static Object* Runtime_TraceEnter(Arguments args) {
 }
 
 
-static Object* Runtime_TraceExit(Arguments args) {
+static MaybeObject* Runtime_TraceExit(Arguments args) {
   NoHandleAllocation ha;
   PrintTransition(args[0]);
   return args[0];  // return TOS
 }
 
 
-static Object* Runtime_DebugPrint(Arguments args) {
+static MaybeObject* Runtime_DebugPrint(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -6858,7 +7453,7 @@ static Object* Runtime_DebugPrint(Arguments args) {
 }
 
 
-static Object* Runtime_DebugTrace(Arguments args) {
+static MaybeObject* Runtime_DebugTrace(Arguments args) {
   ASSERT(args.length() == 0);
   NoHandleAllocation ha;
   Top::PrintStack();
@@ -6866,7 +7461,7 @@ static Object* Runtime_DebugTrace(Arguments args) {
 }
 
 
-static Object* Runtime_DateCurrentTime(Arguments args) {
+static MaybeObject* Runtime_DateCurrentTime(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 0);
 
@@ -6879,7 +7474,7 @@ static Object* Runtime_DateCurrentTime(Arguments args) {
 }
 
 
-static Object* Runtime_DateParseString(Arguments args) {
+static MaybeObject* Runtime_DateParseString(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
@@ -6909,7 +7504,7 @@ static Object* Runtime_DateParseString(Arguments args) {
 }
 
 
-static Object* Runtime_DateLocalTimezone(Arguments args) {
+static MaybeObject* Runtime_DateLocalTimezone(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -6919,7 +7514,7 @@ static Object* Runtime_DateLocalTimezone(Arguments args) {
 }
 
 
-static Object* Runtime_DateLocalTimeOffset(Arguments args) {
+static MaybeObject* Runtime_DateLocalTimeOffset(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 0);
 
@@ -6927,7 +7522,7 @@ static Object* Runtime_DateLocalTimeOffset(Arguments args) {
 }
 
 
-static Object* Runtime_DateDaylightSavingsOffset(Arguments args) {
+static MaybeObject* Runtime_DateDaylightSavingsOffset(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -6936,7 +7531,7 @@ static Object* Runtime_DateDaylightSavingsOffset(Arguments args) {
 }
 
 
-static Object* Runtime_GlobalReceiver(Arguments args) {
+static MaybeObject* Runtime_GlobalReceiver(Arguments args) {
   ASSERT(args.length() == 1);
   Object* global = args[0];
   if (!global->IsJSGlobalObject()) return Heap::null_value();
@@ -6944,20 +7539,31 @@ static Object* Runtime_GlobalReceiver(Arguments args) {
 }
 
 
-static Object* Runtime_CompileString(Arguments args) {
+static MaybeObject* Runtime_ParseJson(Arguments args) {
   HandleScope scope;
-  ASSERT_EQ(2, args.length());
+  ASSERT_EQ(1, args.length());
   CONVERT_ARG_CHECKED(String, source, 0);
-  CONVERT_ARG_CHECKED(Oddball, is_json, 1)
+
+  Handle<Object> result = JsonParser::Parse(source);
+  if (result.is_null()) {
+    // Syntax error or stack overflow in scanner.
+    ASSERT(Top::has_pending_exception());
+    return Failure::Exception();
+  }
+  return *result;
+}
+
+
+static MaybeObject* Runtime_CompileString(Arguments args) {
+  HandleScope scope;
+  ASSERT_EQ(1, args.length());
+  CONVERT_ARG_CHECKED(String, source, 0);
 
   // Compile source string in the global context.
   Handle<Context> context(Top::context()->global_context());
-  Compiler::ValidationState validate = (is_json->IsTrue())
-    ? Compiler::VALIDATE_JSON : Compiler::DONT_VALIDATE_JSON;
   Handle<SharedFunctionInfo> shared = Compiler::CompileEval(source,
                                                             context,
-                                                            true,
-                                                            validate);
+                                                            true);
   if (shared.is_null()) return Failure::Exception();
   Handle<JSFunction> fun =
       Factory::NewFunctionFromSharedFunctionInfo(shared, context, NOT_TENURED);
@@ -6972,8 +7578,7 @@ static ObjectPair CompileGlobalEval(Handle<String> source,
   Handle<SharedFunctionInfo> shared = Compiler::CompileEval(
       source,
       Handle<Context>(Top::context()),
-      Top::context()->IsGlobalContext(),
-      Compiler::DONT_VALIDATE_JSON);
+      Top::context()->IsGlobalContext());
   if (shared.is_null()) return MakePair(Failure::Exception(), NULL);
   Handle<JSFunction> compiled = Factory::NewFunctionFromSharedFunctionInfo(
       shared,
@@ -7072,7 +7677,7 @@ static ObjectPair Runtime_ResolvePossiblyDirectEvalNoLookup(Arguments args) {
 }
 
 
-static Object* Runtime_SetNewFunctionAttributes(Arguments args) {
+static MaybeObject* Runtime_SetNewFunctionAttributes(Arguments args) {
   // This utility adjusts the property attributes for newly created Function
   // object ("new Function(...)") by changing the map.
   // All it does is changing the prototype property to enumerable
@@ -7089,7 +7694,7 @@ static Object* Runtime_SetNewFunctionAttributes(Arguments args) {
 }
 
 
-static Object* Runtime_AllocateInNewSpace(Arguments args) {
+static MaybeObject* Runtime_AllocateInNewSpace(Arguments args) {
   // Allocate a block of memory in NewSpace (filled with a filler).
   // Use as fallback for allocation in generated code when NewSpace
   // is full.
@@ -7101,18 +7706,20 @@ static Object* Runtime_AllocateInNewSpace(Arguments args) {
   static const int kMinFreeNewSpaceAfterGC =
       Heap::InitialSemiSpaceSize() * 3/4;
   RUNTIME_ASSERT(size <= kMinFreeNewSpaceAfterGC);
-  Object* allocation = Heap::new_space()->AllocateRaw(size);
-  if (!allocation->IsFailure()) {
-    Heap::CreateFillerObjectAt(HeapObject::cast(allocation)->address(), size);
+  Object* allocation;
+  { MaybeObject* maybe_allocation = Heap::new_space()->AllocateRaw(size);
+    if (maybe_allocation->ToObject(&allocation)) {
+      Heap::CreateFillerObjectAt(HeapObject::cast(allocation)->address(), size);
+    }
+    return maybe_allocation;
   }
-  return allocation;
 }
 
 
 // Push an array unto an array of arrays if it is not already in the
 // array.  Returns true if the element was pushed on the stack and
 // false otherwise.
-static Object* Runtime_PushIfAbsent(Arguments args) {
+static MaybeObject* Runtime_PushIfAbsent(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(JSArray, array, args[0]);
   CONVERT_CHECKED(JSArray, element, args[1]);
@@ -7122,8 +7729,10 @@ static Object* Runtime_PushIfAbsent(Arguments args) {
   for (int i = 0; i < length; i++) {
     if (elements->get(i) == element) return Heap::false_value();
   }
-  Object* obj = array->SetFastElement(length, element);
-  if (obj->IsFailure()) return obj;
+  Object* obj;
+  { MaybeObject* maybe_obj = array->SetFastElement(length, element);
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
   return Heap::true_value();
 }
 
@@ -7209,15 +7818,15 @@ static uint32_t IterateExternalArrayElements(Handle<JSObject> receiver,
             Handle<Smi> e(Smi::FromInt(static_cast<int>(val)));
             visitor->visit(j, e);
           } else {
-            Handle<Object> e(
-                Heap::AllocateHeapNumber(static_cast<ElementType>(val)));
+            Handle<Object> e =
+                Factory::NewNumber(static_cast<ElementType>(val));
             visitor->visit(j, e);
           }
         }
       }
     } else {
       for (uint32_t j = 0; j < len; j++) {
-        Handle<Object> e(Heap::AllocateHeapNumber(array->get(j)));
+        Handle<Object> e = Factory::NewNumber(array->get(j));
         visitor->visit(j, e);
       }
     }
@@ -7417,30 +8026,36 @@ static uint32_t IterateArguments(Handle<JSArray> arguments,
   uint32_t num_of_args = static_cast<uint32_t>(arguments->length()->Number());
 
   for (uint32_t i = 0; i < num_of_args; i++) {
-    Handle<Object> obj(arguments->GetElement(i));
-    if (obj->IsJSArray()) {
-      Handle<JSArray> array = Handle<JSArray>::cast(obj);
-      uint32_t len = static_cast<uint32_t>(array->length()->Number());
-      uint32_t nof_elements =
-          IterateArrayAndPrototypeElements(array, visitor);
-      // Total elements of array and its prototype chain can be more than
-      // the array length, but ArrayConcat can only concatenate at most
-      // the array length number of elements. We use the length as an estimate
-      // for the actual number of elements added.
-      uint32_t added_elements = (nof_elements > len) ? len : nof_elements;
-      if (JSArray::kMaxElementCount - visited_elements < added_elements) {
-        visited_elements = JSArray::kMaxElementCount;
+    Object *element;
+    MaybeObject* maybe_element = arguments->GetElement(i);
+    // This if() is not expected to fail, but we have the check in the
+    // interest of hardening the runtime calls.
+    if (maybe_element->ToObject(&element)) {
+      Handle<Object> obj(element);
+      if (obj->IsJSArray()) {
+        Handle<JSArray> array = Handle<JSArray>::cast(obj);
+        uint32_t len = static_cast<uint32_t>(array->length()->Number());
+        uint32_t nof_elements =
+            IterateArrayAndPrototypeElements(array, visitor);
+        // Total elements of array and its prototype chain can be more than
+        // the array length, but ArrayConcat can only concatenate at most
+        // the array length number of elements. We use the length as an estimate
+        // for the actual number of elements added.
+        uint32_t added_elements = (nof_elements > len) ? len : nof_elements;
+        if (JSArray::kMaxElementCount - visited_elements < added_elements) {
+          visited_elements = JSArray::kMaxElementCount;
+        } else {
+          visited_elements += added_elements;
+        }
+        if (visitor) visitor->increase_index_offset(len);
       } else {
-        visited_elements += added_elements;
-      }
-      if (visitor) visitor->increase_index_offset(len);
-    } else {
-      if (visitor) {
-        visitor->visit(0, obj);
-        visitor->increase_index_offset(1);
-      }
-      if (visited_elements < JSArray::kMaxElementCount) {
-        visited_elements++;
+        if (visitor) {
+          visitor->visit(0, obj);
+          visitor->increase_index_offset(1);
+        }
+        if (visited_elements < JSArray::kMaxElementCount) {
+          visited_elements++;
+        }
       }
     }
   }
@@ -7454,7 +8069,7 @@ static uint32_t IterateArguments(Handle<JSArray> arguments,
  * TODO(lrn): Fix non-compliance for very large concatenations and update to
  * following the ECMAScript 5 specification.
  */
-static Object* Runtime_ArrayConcat(Arguments args) {
+static MaybeObject* Runtime_ArrayConcat(Arguments args) {
   ASSERT(args.length() == 1);
   HandleScope handle_scope;
 
@@ -7468,19 +8083,24 @@ static Object* Runtime_ArrayConcat(Arguments args) {
 
   { AssertNoAllocation nogc;
     for (uint32_t i = 0; i < num_of_args; i++) {
-      Object* obj = arguments->GetElement(i);
-      uint32_t length_estimate;
-      if (obj->IsJSArray()) {
-        length_estimate =
-            static_cast<uint32_t>(JSArray::cast(obj)->length()->Number());
-      } else {
-        length_estimate = 1;
+      Object* obj;
+      MaybeObject* maybe_object = arguments->GetElement(i);
+      // This if() is not expected to fail, but we have the check in the
+      // interest of hardening the runtime calls.
+      if (maybe_object->ToObject(&obj)) {
+        uint32_t length_estimate;
+        if (obj->IsJSArray()) {
+          length_estimate =
+              static_cast<uint32_t>(JSArray::cast(obj)->length()->Number());
+        } else {
+          length_estimate = 1;
+        }
+        if (JSObject::kMaxElementCount - result_length < length_estimate) {
+          result_length = JSObject::kMaxElementCount;
+          break;
+        }
+        result_length += length_estimate;
       }
-      if (JSObject::kMaxElementCount - result_length < length_estimate) {
-        result_length = JSObject::kMaxElementCount;
-        break;
-      }
-      result_length += length_estimate;
     }
   }
 
@@ -7498,14 +8118,18 @@ static Object* Runtime_ArrayConcat(Arguments args) {
     // The backing storage array must have non-existing elements to
     // preserve holes across concat operations.
     storage = Factory::NewFixedArrayWithHoles(result_length);
-    result->set_map(*Factory::GetFastElementsMap(Handle<Map>(result->map())));
+    Handle<Map> fast_map =
+        Factory::GetFastElementsMap(Handle<Map>(result->map()));
+    result->set_map(*fast_map);
   } else {
     // TODO(126): move 25% pre-allocation logic into Dictionary::Allocate
     uint32_t at_least_space_for = estimate_nof_elements +
                                   (estimate_nof_elements >> 2);
     storage = Handle<FixedArray>::cast(
                   Factory::NewNumberDictionary(at_least_space_for));
-    result->set_map(*Factory::GetSlowElementsMap(Handle<Map>(result->map())));
+    Handle<Map> slow_map =
+        Factory::GetSlowElementsMap(Handle<Map>(result->map()));
+    result->set_map(*slow_map);
   }
 
   Handle<Object> len = Factory::NewNumber(static_cast<double>(result_length));
@@ -7524,7 +8148,7 @@ static Object* Runtime_ArrayConcat(Arguments args) {
 
 // This will not allocate (flatten the string), but it may run
 // very slowly for very deeply nested ConsStrings.  For debugging use only.
-static Object* Runtime_GlobalPrint(Arguments args) {
+static MaybeObject* Runtime_GlobalPrint(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -7542,7 +8166,7 @@ static Object* Runtime_GlobalPrint(Arguments args) {
 // and are followed by non-existing element. Does not change the length
 // property.
 // Returns the number of non-undefined elements collected.
-static Object* Runtime_RemoveArrayHoles(Arguments args) {
+static MaybeObject* Runtime_RemoveArrayHoles(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(JSObject, object, args[0]);
   CONVERT_NUMBER_CHECKED(uint32_t, limit, Uint32, args[1]);
@@ -7551,31 +8175,34 @@ static Object* Runtime_RemoveArrayHoles(Arguments args) {
 
 
 // Move contents of argument 0 (an array) to argument 1 (an array)
-static Object* Runtime_MoveArrayContents(Arguments args) {
+static MaybeObject* Runtime_MoveArrayContents(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(JSArray, from, args[0]);
   CONVERT_CHECKED(JSArray, to, args[1]);
   HeapObject* new_elements = from->elements();
-  Object* new_map;
+  MaybeObject* maybe_new_map;
   if (new_elements->map() == Heap::fixed_array_map() ||
       new_elements->map() == Heap::fixed_cow_array_map()) {
-    new_map = to->map()->GetFastElementsMap();
+    maybe_new_map = to->map()->GetFastElementsMap();
   } else {
-    new_map = to->map()->GetSlowElementsMap();
+    maybe_new_map = to->map()->GetSlowElementsMap();
   }
-  if (new_map->IsFailure()) return new_map;
+  Object* new_map;
+  if (!maybe_new_map->ToObject(&new_map)) return maybe_new_map;
   to->set_map(Map::cast(new_map));
   to->set_elements(new_elements);
   to->set_length(from->length());
-  Object* obj = from->ResetElements();
-  if (obj->IsFailure()) return obj;
+  Object* obj;
+  { MaybeObject* maybe_obj = from->ResetElements();
+    if (!maybe_obj->ToObject(&obj)) return maybe_obj;
+  }
   from->set_length(Smi::FromInt(0));
   return to;
 }
 
 
 // How many elements does this object/array have?
-static Object* Runtime_EstimateNumberOfElements(Arguments args) {
+static MaybeObject* Runtime_EstimateNumberOfElements(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(JSObject, object, args[0]);
   HeapObject* elements = object->elements();
@@ -7589,7 +8216,7 @@ static Object* Runtime_EstimateNumberOfElements(Arguments args) {
 }
 
 
-static Object* Runtime_SwapElements(Arguments args) {
+static MaybeObject* Runtime_SwapElements(Arguments args) {
   HandleScope handle_scope;
 
   ASSERT_EQ(3, args.length());
@@ -7620,7 +8247,7 @@ static Object* Runtime_SwapElements(Arguments args) {
 // intervals (pair of a negative integer (-start-1) followed by a
 // positive (length)) or undefined values.
 // Intervals can span over some keys that are not in the object.
-static Object* Runtime_GetArrayKeys(Arguments args) {
+static MaybeObject* Runtime_GetArrayKeys(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSObject, array, 0);
@@ -7632,7 +8259,7 @@ static Object* Runtime_GetArrayKeys(Arguments args) {
     int keys_length = keys->length();
     for (int i = 0; i < keys_length; i++) {
       Object* key = keys->get(i);
-      uint32_t index;
+      uint32_t index = 0;
       if (!key->ToArrayIndex(&index) || index >= length) {
         // Zap invalid keys.
         keys->set_undefined(i);
@@ -7660,7 +8287,7 @@ static Object* Runtime_GetArrayKeys(Arguments args) {
 // to the way accessors are implemented, it is set for both the getter
 // and setter on the first call to DefineAccessor and ignored on
 // subsequent calls.
-static Object* Runtime_DefineAccessor(Arguments args) {
+static MaybeObject* Runtime_DefineAccessor(Arguments args) {
   RUNTIME_ASSERT(args.length() == 4 || args.length() == 5);
   // Compute attributes.
   PropertyAttributes attributes = NONE;
@@ -7680,7 +8307,7 @@ static Object* Runtime_DefineAccessor(Arguments args) {
 }
 
 
-static Object* Runtime_LookupAccessor(Arguments args) {
+static MaybeObject* Runtime_LookupAccessor(Arguments args) {
   ASSERT(args.length() == 3);
   CONVERT_CHECKED(JSObject, obj, args[0]);
   CONVERT_CHECKED(String, name, args[1]);
@@ -7690,7 +8317,7 @@ static Object* Runtime_LookupAccessor(Arguments args) {
 
 
 #ifdef ENABLE_DEBUGGER_SUPPORT
-static Object* Runtime_DebugBreak(Arguments args) {
+static MaybeObject* Runtime_DebugBreak(Arguments args) {
   ASSERT(args.length() == 0);
   return Execution::DebugBreakHelper();
 }
@@ -7712,7 +8339,7 @@ static StackFrame::Id UnwrapFrameId(Smi* wrapped) {
 // args[0]: debug event listener function to set or null or undefined for
 //          clearing the event listener function
 // args[1]: object supplied during callback
-static Object* Runtime_SetDebugEventListener(Arguments args) {
+static MaybeObject* Runtime_SetDebugEventListener(Arguments args) {
   ASSERT(args.length() == 2);
   RUNTIME_ASSERT(args[0]->IsJSFunction() ||
                  args[0]->IsUndefined() ||
@@ -7725,16 +8352,16 @@ static Object* Runtime_SetDebugEventListener(Arguments args) {
 }
 
 
-static Object* Runtime_Break(Arguments args) {
+static MaybeObject* Runtime_Break(Arguments args) {
   ASSERT(args.length() == 0);
   StackGuard::DebugBreak();
   return Heap::undefined_value();
 }
 
 
-static Object* DebugLookupResultValue(Object* receiver, String* name,
-                                      LookupResult* result,
-                                      bool* caught_exception) {
+static MaybeObject* DebugLookupResultValue(Object* receiver, String* name,
+                                           LookupResult* result,
+                                           bool* caught_exception) {
   Object* value;
   switch (result->type()) {
     case NORMAL:
@@ -7756,14 +8383,17 @@ static Object* DebugLookupResultValue(Object* receiver, String* name,
     case CALLBACKS: {
       Object* structure = result->GetCallbackObject();
       if (structure->IsProxy() || structure->IsAccessorInfo()) {
-        value = receiver->GetPropertyWithCallback(
+        MaybeObject* maybe_value = receiver->GetPropertyWithCallback(
             receiver, structure, name, result->holder());
-        if (value->IsException()) {
-          value = Top::pending_exception();
+        if (!maybe_value->ToObject(&value)) {
+          if (maybe_value->IsRetryAfterGC()) return maybe_value;
+          ASSERT(maybe_value->IsException());
+          maybe_value = Top::pending_exception();
           Top::clear_pending_exception();
           if (caught_exception != NULL) {
             *caught_exception = true;
           }
+          return maybe_value;
         }
         return value;
       } else {
@@ -7795,7 +8425,7 @@ static Object* DebugLookupResultValue(Object* receiver, String* name,
 // 4: Setter function if defined
 // Items 2-4 are only filled if the property has either a getter or a setter
 // defined through __defineGetter__ and/or __defineSetter__.
-static Object* Runtime_DebugGetPropertyDetails(Arguments args) {
+static MaybeObject* Runtime_DebugGetPropertyDetails(Arguments args) {
   HandleScope scope;
 
   ASSERT(args.length() == 2);
@@ -7826,7 +8456,14 @@ static Object* Runtime_DebugGetPropertyDetails(Arguments args) {
   uint32_t index;
   if (name->AsArrayIndex(&index)) {
     Handle<FixedArray> details = Factory::NewFixedArray(2);
-    details->set(0, Runtime::GetElementOrCharAt(obj, index));
+    Object* element_or_char;
+    { MaybeObject* maybe_element_or_char =
+          Runtime::GetElementOrCharAt(obj, index);
+      if (!maybe_element_or_char->ToObject(&element_or_char)) {
+        return maybe_element_or_char;
+      }
+    }
+    details->set(0, element_or_char);
     details->set(1, PropertyDetails(NONE, NORMAL).AsSmi());
     return *Factory::NewJSArrayWithElements(details);
   }
@@ -7852,9 +8489,11 @@ static Object* Runtime_DebugGetPropertyDetails(Arguments args) {
       // DebugLookupResultValue can cause GC so details from LookupResult needs
       // to be copied to handles before this.
       bool caught_exception = false;
-      Object* raw_value = DebugLookupResultValue(*obj, *name, &result,
-                                                 &caught_exception);
-      if (raw_value->IsFailure()) return raw_value;
+      Object* raw_value;
+      { MaybeObject* maybe_raw_value =
+            DebugLookupResultValue(*obj, *name, &result, &caught_exception);
+        if (!maybe_raw_value->ToObject(&raw_value)) return maybe_raw_value;
+      }
       Handle<Object> value(raw_value);
 
       // If the callback object is a fixed array then it contains JavaScript
@@ -7884,7 +8523,7 @@ static Object* Runtime_DebugGetPropertyDetails(Arguments args) {
 }
 
 
-static Object* Runtime_DebugGetProperty(Arguments args) {
+static MaybeObject* Runtime_DebugGetProperty(Arguments args) {
   HandleScope scope;
 
   ASSERT(args.length() == 2);
@@ -7903,7 +8542,7 @@ static Object* Runtime_DebugGetProperty(Arguments args) {
 
 // Return the property type calculated from the property details.
 // args[0]: smi with property details.
-static Object* Runtime_DebugPropertyTypeFromDetails(Arguments args) {
+static MaybeObject* Runtime_DebugPropertyTypeFromDetails(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(Smi, details, args[0]);
   PropertyType type = PropertyDetails(details).type();
@@ -7913,7 +8552,7 @@ static Object* Runtime_DebugPropertyTypeFromDetails(Arguments args) {
 
 // Return the property attribute calculated from the property details.
 // args[0]: smi with property details.
-static Object* Runtime_DebugPropertyAttributesFromDetails(Arguments args) {
+static MaybeObject* Runtime_DebugPropertyAttributesFromDetails(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(Smi, details, args[0]);
   PropertyAttributes attributes = PropertyDetails(details).attributes();
@@ -7923,7 +8562,7 @@ static Object* Runtime_DebugPropertyAttributesFromDetails(Arguments args) {
 
 // Return the property insertion index calculated from the property details.
 // args[0]: smi with property details.
-static Object* Runtime_DebugPropertyIndexFromDetails(Arguments args) {
+static MaybeObject* Runtime_DebugPropertyIndexFromDetails(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(Smi, details, args[0]);
   int index = PropertyDetails(details).index();
@@ -7934,7 +8573,7 @@ static Object* Runtime_DebugPropertyIndexFromDetails(Arguments args) {
 // Return property value from named interceptor.
 // args[0]: object
 // args[1]: property name
-static Object* Runtime_DebugNamedInterceptorPropertyValue(Arguments args) {
+static MaybeObject* Runtime_DebugNamedInterceptorPropertyValue(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(JSObject, obj, 0);
@@ -7949,7 +8588,8 @@ static Object* Runtime_DebugNamedInterceptorPropertyValue(Arguments args) {
 // Return element value from indexed interceptor.
 // args[0]: object
 // args[1]: index
-static Object* Runtime_DebugIndexedInterceptorElementValue(Arguments args) {
+static MaybeObject* Runtime_DebugIndexedInterceptorElementValue(
+    Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(JSObject, obj, 0);
@@ -7960,7 +8600,7 @@ static Object* Runtime_DebugIndexedInterceptorElementValue(Arguments args) {
 }
 
 
-static Object* Runtime_CheckExecutionState(Arguments args) {
+static MaybeObject* Runtime_CheckExecutionState(Arguments args) {
   ASSERT(args.length() >= 1);
   CONVERT_NUMBER_CHECKED(int, break_id, Int32, args[0]);
   // Check that the break id is valid.
@@ -7972,13 +8612,15 @@ static Object* Runtime_CheckExecutionState(Arguments args) {
 }
 
 
-static Object* Runtime_GetFrameCount(Arguments args) {
+static MaybeObject* Runtime_GetFrameCount(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
   // Check arguments.
-  Object* result = Runtime_CheckExecutionState(args);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result = Runtime_CheckExecutionState(args);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
 
   // Count all frames which are relevant to debugging stack trace.
   int n = 0;
@@ -8020,13 +8662,15 @@ static const int kFrameDetailsFirstDynamicIndex = 9;
 // Arguments name, value
 // Locals name, value
 // Return value if any
-static Object* Runtime_GetFrameDetails(Arguments args) {
+static MaybeObject* Runtime_GetFrameDetails(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
   // Check arguments.
-  Object* check = Runtime_CheckExecutionState(args);
-  if (check->IsFailure()) return check;
+  Object* check;
+  { MaybeObject* maybe_check = Runtime_CheckExecutionState(args);
+    if (!maybe_check->ToObject(&check)) return maybe_check;
+  }
   CONVERT_NUMBER_CHECKED(int, index, Int32, args[1]);
 
   // Find the relevant frame with the requested index.
@@ -8042,6 +8686,9 @@ static Object* Runtime_GetFrameDetails(Arguments args) {
     count++;
   }
   if (it.done()) return Heap::undefined_value();
+
+  bool is_optimized_frame =
+      it.frame()->code()->kind() == Code::OPTIMIZED_FUNCTION;
 
   // Traverse the saved contexts chain to find the active context for the
   // selected frame.
@@ -8074,18 +8721,28 @@ static Object* Runtime_GetFrameDetails(Arguments args) {
   // (e.g. .result)?  For users of the debugger, they will probably be
   // confusing.
   Handle<FixedArray> locals = Factory::NewFixedArray(info.NumberOfLocals() * 2);
-  for (int i = 0; i < info.NumberOfLocals(); i++) {
-    // Name of the local.
-    locals->set(i * 2, *info.LocalName(i));
 
-    // Fetch the value of the local - either from the stack or from a
-    // heap-allocated context.
-    if (i < info.number_of_stack_slots()) {
+  // Fill in the names of the locals.
+  for (int i = 0; i < info.NumberOfLocals(); i++) {
+    locals->set(i * 2, *info.LocalName(i));
+  }
+
+  // Fill in the values of the locals.
+  for (int i = 0; i < info.NumberOfLocals(); i++) {
+    if (is_optimized_frame) {
+      // If we are inspecting an optimized frame use undefined as the
+      // value for all locals.
+      //
+      // TODO(3141533): We should be able to get the correct values
+      // for locals in optimized frames.
+      locals->set(i * 2 + 1, Heap::undefined_value());
+    } else if (i < info.number_of_stack_slots()) {
+      // Get the value from the stack.
       locals->set(i * 2 + 1, it.frame()->GetExpression(i));
     } else {
-      Handle<String> name = info.LocalName(i);
       // Traverse the context chain to the function context as all local
       // variables stored in the context will be on the function context.
+      Handle<String> name = info.LocalName(i);
       while (!context->is_function_context()) {
         context = Handle<Context>(context->previous());
       }
@@ -8095,8 +8752,12 @@ static Object* Runtime_GetFrameDetails(Arguments args) {
     }
   }
 
-  // Check whether this frame is positioned at return.
-  int at_return = (index == 0) ? Debug::IsBreakAtReturn(it.frame()) : false;
+  // Check whether this frame is positioned at return. If not top
+  // frame or if the frame is optimized it cannot be at a return.
+  bool at_return = false;
+  if (!is_optimized_frame && index == 0) {
+    at_return = Debug::IsBreakAtReturn(it.frame());
+  }
 
   // If positioned just before return find the value to be returned and add it
   // to the frame information.
@@ -8190,8 +8851,13 @@ static Object* Runtime_GetFrameDetails(Arguments args) {
       details->set(details_index++, Heap::undefined_value());
     }
 
-    // Parameter value.
-    if (i < it.frame()->GetProvidedParametersCount()) {
+    // Parameter value. If we are inspecting an optimized frame, use
+    // undefined as the value.
+    //
+    // TODO(3141533): We should be able to get the actual parameter
+    // value for optimized frames.
+    if (!is_optimized_frame &&
+        (i < it.frame()->GetProvidedParametersCount())) {
       details->set(details_index++, it.frame()->GetParameter(i));
     } else {
       details->set(details_index++, Heap::undefined_value());
@@ -8327,9 +8993,12 @@ static Handle<JSObject> MaterializeClosure(Handle<Context> context) {
     Handle<JSObject> arguments_shadow(
         JSObject::cast(context->get(arguments_shadow_index)));
     for (int i = 0; i < scope_info.number_of_parameters(); ++i) {
+      // We don't expect exception-throwing getters on the arguments shadow.
+      Object* element = arguments_shadow->GetElement(i)->ToObjectUnchecked();
       SetProperty(closure_scope,
                   scope_info.parameter_name(i),
-                  Handle<Object>(arguments_shadow->GetElement(i)), NONE);
+                  Handle<Object>(element),
+                  NONE);
     }
   }
 
@@ -8561,13 +9230,15 @@ class ScopeIterator {
 };
 
 
-static Object* Runtime_GetScopeCount(Arguments args) {
+static MaybeObject* Runtime_GetScopeCount(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
   // Check arguments.
-  Object* check = Runtime_CheckExecutionState(args);
-  if (check->IsFailure()) return check;
+  Object* check;
+  { MaybeObject* maybe_check = Runtime_CheckExecutionState(args);
+    if (!maybe_check->ToObject(&check)) return maybe_check;
+  }
   CONVERT_CHECKED(Smi, wrapped_id, args[1]);
 
   // Get the frame where the debugging is performed.
@@ -8597,13 +9268,15 @@ static const int kScopeDetailsSize = 2;
 // The array returned contains the following information:
 // 0: Scope type
 // 1: Scope object
-static Object* Runtime_GetScopeDetails(Arguments args) {
+static MaybeObject* Runtime_GetScopeDetails(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
 
   // Check arguments.
-  Object* check = Runtime_CheckExecutionState(args);
-  if (check->IsFailure()) return check;
+  Object* check;
+  { MaybeObject* maybe_check = Runtime_CheckExecutionState(args);
+    if (!maybe_check->ToObject(&check)) return maybe_check;
+  }
   CONVERT_CHECKED(Smi, wrapped_id, args[1]);
   CONVERT_NUMBER_CHECKED(int, index, Int32, args[2]);
 
@@ -8628,13 +9301,14 @@ static Object* Runtime_GetScopeDetails(Arguments args) {
 
   // Fill in scope details.
   details->set(kScopeDetailsTypeIndex, Smi::FromInt(it.Type()));
-  details->set(kScopeDetailsObjectIndex, *it.ScopeObject());
+  Handle<JSObject> scope_object = it.ScopeObject();
+  details->set(kScopeDetailsObjectIndex, *scope_object);
 
   return *Factory::NewJSArrayWithElements(details);
 }
 
 
-static Object* Runtime_DebugPrintScopes(Arguments args) {
+static MaybeObject* Runtime_DebugPrintScopes(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 0);
 
@@ -8650,60 +9324,15 @@ static Object* Runtime_DebugPrintScopes(Arguments args) {
 }
 
 
-static Object* Runtime_GetCFrames(Arguments args) {
-  HandleScope scope;
-  ASSERT(args.length() == 1);
-  Object* result = Runtime_CheckExecutionState(args);
-  if (result->IsFailure()) return result;
-
-#if V8_HOST_ARCH_64_BIT
-  UNIMPLEMENTED();
-  return Heap::undefined_value();
-#else
-
-  static const int kMaxCFramesSize = 200;
-  ScopedVector<OS::StackFrame> frames(kMaxCFramesSize);
-  int frames_count = OS::StackWalk(frames);
-  if (frames_count == OS::kStackWalkError) {
-    return Heap::undefined_value();
-  }
-
-  Handle<String> address_str = Factory::LookupAsciiSymbol("address");
-  Handle<String> text_str = Factory::LookupAsciiSymbol("text");
-  Handle<FixedArray> frames_array = Factory::NewFixedArray(frames_count);
-  for (int i = 0; i < frames_count; i++) {
-    Handle<JSObject> frame_value = Factory::NewJSObject(Top::object_function());
-    frame_value->SetProperty(
-        *address_str,
-        *Factory::NewNumberFromInt(reinterpret_cast<int>(frames[i].address)),
-        NONE);
-
-    // Get the stack walk text for this frame.
-    Handle<String> frame_text;
-    int frame_text_length = StrLength(frames[i].text);
-    if (frame_text_length > 0) {
-      Vector<const char> str(frames[i].text, frame_text_length);
-      frame_text = Factory::NewStringFromAscii(str);
-    }
-
-    if (!frame_text.is_null()) {
-      frame_value->SetProperty(*text_str, *frame_text, NONE);
-    }
-
-    frames_array->set(i, *frame_value);
-  }
-  return *Factory::NewJSArrayWithElements(frames_array);
-#endif  // V8_HOST_ARCH_64_BIT
-}
-
-
-static Object* Runtime_GetThreadCount(Arguments args) {
+static MaybeObject* Runtime_GetThreadCount(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
   // Check arguments.
-  Object* result = Runtime_CheckExecutionState(args);
-  if (result->IsFailure()) return result;
+  Object* result;
+  { MaybeObject* maybe_result = Runtime_CheckExecutionState(args);
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
 
   // Count all archived V8 threads.
   int n = 0;
@@ -8729,13 +9358,15 @@ static const int kThreadDetailsSize = 2;
 // The array returned contains the following information:
 // 0: Is current thread?
 // 1: Thread id
-static Object* Runtime_GetThreadDetails(Arguments args) {
+static MaybeObject* Runtime_GetThreadDetails(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
   // Check arguments.
-  Object* check = Runtime_CheckExecutionState(args);
-  if (check->IsFailure()) return check;
+  Object* check;
+  { MaybeObject* maybe_check = Runtime_CheckExecutionState(args);
+    if (!maybe_check->ToObject(&check)) return maybe_check;
+  }
   CONVERT_NUMBER_CHECKED(int, index, Int32, args[1]);
 
   // Allocate array for result.
@@ -8771,7 +9402,7 @@ static Object* Runtime_GetThreadDetails(Arguments args) {
 
 // Sets the disable break state
 // args[0]: disable break state
-static Object* Runtime_SetDisableBreak(Arguments args) {
+static MaybeObject* Runtime_SetDisableBreak(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   CONVERT_BOOLEAN_CHECKED(disable_break, args[0]);
@@ -8780,7 +9411,7 @@ static Object* Runtime_SetDisableBreak(Arguments args) {
 }
 
 
-static Object* Runtime_GetBreakLocations(Arguments args) {
+static MaybeObject* Runtime_GetBreakLocations(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
 
@@ -8799,7 +9430,7 @@ static Object* Runtime_GetBreakLocations(Arguments args) {
 // args[0]: function
 // args[1]: number: break source position (within the function source)
 // args[2]: number: break point object
-static Object* Runtime_SetFunctionBreakPoint(Arguments args) {
+static MaybeObject* Runtime_SetFunctionBreakPoint(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(JSFunction, fun, 0);
@@ -8820,7 +9451,7 @@ Object* Runtime::FindSharedFunctionInfoInScript(Handle<Script> script,
   // Iterate the heap looking for SharedFunctionInfo generated from the
   // script. The inner most SharedFunctionInfo containing the source position
   // for the requested break point is found.
-  // NOTE: This might reqire several heap iterations. If the SharedFunctionInfo
+  // NOTE: This might require several heap iterations. If the SharedFunctionInfo
   // which is found is not compiled it is compiled and the heap is iterated
   // again as the compilation might create inner functions from the newly
   // compiled function and the actual requested break point might be in one of
@@ -8898,7 +9529,7 @@ Object* Runtime::FindSharedFunctionInfoInScript(Handle<Script> script,
 // args[0]: script to set break point in
 // args[1]: number: break source position (within the script source)
 // args[2]: number: break point object
-static Object* Runtime_SetScriptBreakPoint(Arguments args) {
+static MaybeObject* Runtime_SetScriptBreakPoint(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   CONVERT_ARG_CHECKED(JSValue, wrapper, 0);
@@ -8932,7 +9563,7 @@ static Object* Runtime_SetScriptBreakPoint(Arguments args) {
 
 // Clear a break point
 // args[0]: number: break point object
-static Object* Runtime_ClearBreakPoint(Arguments args) {
+static MaybeObject* Runtime_ClearBreakPoint(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 1);
   Handle<Object> break_point_object_arg = args.at<Object>(0);
@@ -8944,21 +9575,36 @@ static Object* Runtime_ClearBreakPoint(Arguments args) {
 }
 
 
-// Change the state of break on exceptions
-// args[0]: boolean indicating uncaught exceptions
-// args[1]: boolean indicating on/off
-static Object* Runtime_ChangeBreakOnException(Arguments args) {
+// Change the state of break on exceptions.
+// args[0]: Enum value indicating whether to affect caught/uncaught exceptions.
+// args[1]: Boolean indicating on/off.
+static MaybeObject* Runtime_ChangeBreakOnException(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 2);
-  ASSERT(args[0]->IsNumber());
-  ASSERT(args[1]->IsBoolean());
+  RUNTIME_ASSERT(args[0]->IsNumber());
+  CONVERT_BOOLEAN_CHECKED(enable, args[1]);
 
-  // Update break point state
+  // If the number doesn't match an enum value, the ChangeBreakOnException
+  // function will default to affecting caught exceptions.
   ExceptionBreakType type =
       static_cast<ExceptionBreakType>(NumberToUint32(args[0]));
-  bool enable = args[1]->ToBoolean()->IsTrue();
+  // Update break point state.
   Debug::ChangeBreakOnException(type, enable);
   return Heap::undefined_value();
+}
+
+
+// Returns the state of break on exceptions
+// args[0]: boolean indicating uncaught exceptions
+static MaybeObject* Runtime_IsBreakOnException(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  RUNTIME_ASSERT(args[0]->IsNumber());
+
+  ExceptionBreakType type =
+      static_cast<ExceptionBreakType>(NumberToUint32(args[0]));
+  bool result = Debug::IsBreakOnException(type);
+  return Smi::FromInt(result);
 }
 
 
@@ -8967,12 +9613,14 @@ static Object* Runtime_ChangeBreakOnException(Arguments args) {
 // args[1]: step action from the enumeration StepAction
 // args[2]: number of times to perform the step, for step out it is the number
 //          of frames to step down.
-static Object* Runtime_PrepareStep(Arguments args) {
+static MaybeObject* Runtime_PrepareStep(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 3);
   // Check arguments.
-  Object* check = Runtime_CheckExecutionState(args);
-  if (check->IsFailure()) return check;
+  Object* check;
+  { MaybeObject* maybe_check = Runtime_CheckExecutionState(args);
+    if (!maybe_check->ToObject(&check)) return maybe_check;
+  }
   if (!args[1]->IsNumber() || !args[2]->IsNumber()) {
     return Top::Throw(Heap::illegal_argument_symbol());
   }
@@ -9003,7 +9651,7 @@ static Object* Runtime_PrepareStep(Arguments args) {
 
 
 // Clear all stepping set by PrepareStep.
-static Object* Runtime_ClearStepping(Arguments args) {
+static MaybeObject* Runtime_ClearStepping(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 0);
   Debug::ClearStepping();
@@ -9023,10 +9671,10 @@ static Handle<Context> CopyWithContextChain(Handle<Context> context_chain,
   // Recursively copy the with contexts.
   Handle<Context> previous(context_chain->previous());
   Handle<JSObject> extension(JSObject::cast(context_chain->extension()));
-  return Factory::NewWithContext(
-      CopyWithContextChain(function_context, previous),
-      extension,
-      context_chain->IsCatchContext());
+  Handle<Context> context = CopyWithContextChain(function_context, previous);
+  return Factory::NewWithContext(context,
+                                 extension,
+                                 context_chain->IsCatchContext());
 }
 
 
@@ -9080,14 +9728,18 @@ static Handle<Object> GetArgumentsObject(JavaScriptFrame* frame,
 // stack frame presenting the same view of the values of parameters and
 // local variables as if the piece of JavaScript was evaluated at the point
 // where the function on the stack frame is currently stopped.
-static Object* Runtime_DebugEvaluate(Arguments args) {
+static MaybeObject* Runtime_DebugEvaluate(Arguments args) {
   HandleScope scope;
 
   // Check the execution state and decode arguments frame and source to be
   // evaluated.
   ASSERT(args.length() == 4);
-  Object* check_result = Runtime_CheckExecutionState(args);
-  if (check_result->IsFailure()) return check_result;
+  Object* check_result;
+  { MaybeObject* maybe_check_result = Runtime_CheckExecutionState(args);
+    if (!maybe_check_result->ToObject(&check_result)) {
+      return maybe_check_result;
+    }
+  }
   CONVERT_CHECKED(Smi, wrapped_id, args[1]);
   CONVERT_ARG_CHECKED(String, source, 2);
   CONVERT_BOOLEAN_CHECKED(disable_break, args[3]);
@@ -9155,8 +9807,7 @@ static Object* Runtime_DebugEvaluate(Arguments args) {
   Handle<SharedFunctionInfo> shared =
       Compiler::CompileEval(function_source,
                             context,
-                            context->IsGlobalContext(),
-                            Compiler::DONT_VALIDATE_JSON);
+                            context->IsGlobalContext());
   if (shared.is_null()) return Failure::Exception();
   Handle<JSFunction> compiled_function =
       Factory::NewFunctionFromSharedFunctionInfo(shared, context);
@@ -9191,14 +9842,18 @@ static Object* Runtime_DebugEvaluate(Arguments args) {
 }
 
 
-static Object* Runtime_DebugEvaluateGlobal(Arguments args) {
+static MaybeObject* Runtime_DebugEvaluateGlobal(Arguments args) {
   HandleScope scope;
 
   // Check the execution state and decode arguments frame and source to be
   // evaluated.
   ASSERT(args.length() == 3);
-  Object* check_result = Runtime_CheckExecutionState(args);
-  if (check_result->IsFailure()) return check_result;
+  Object* check_result;
+  { MaybeObject* maybe_check_result = Runtime_CheckExecutionState(args);
+    if (!maybe_check_result->ToObject(&check_result)) {
+      return maybe_check_result;
+    }
+  }
   CONVERT_ARG_CHECKED(String, source, 1);
   CONVERT_BOOLEAN_CHECKED(disable_break, args[2]);
 
@@ -9223,8 +9878,7 @@ static Object* Runtime_DebugEvaluateGlobal(Arguments args) {
   Handle<SharedFunctionInfo> shared =
       Compiler::CompileEval(source,
                             context,
-                            true,
-                            Compiler::DONT_VALIDATE_JSON);
+                            true);
   if (shared.is_null()) return Failure::Exception();
   Handle<JSFunction> compiled_function =
       Handle<JSFunction>(Factory::NewFunctionFromSharedFunctionInfo(shared,
@@ -9241,7 +9895,7 @@ static Object* Runtime_DebugEvaluateGlobal(Arguments args) {
 }
 
 
-static Object* Runtime_DebugGetLoadedScripts(Arguments args) {
+static MaybeObject* Runtime_DebugGetLoadedScripts(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 0);
 
@@ -9341,7 +9995,7 @@ static int DebugReferencedBy(JSObject* target,
 // args[0]: the object to find references to
 // args[1]: constructor function for instances to exclude (Mirror)
 // args[2]: the the maximum number of objects to return
-static Object* Runtime_DebugReferencedBy(Arguments args) {
+static MaybeObject* Runtime_DebugReferencedBy(Arguments args) {
   ASSERT(args.length() == 3);
 
   // First perform a full GC in order to avoid references from dead objects.
@@ -9367,8 +10021,10 @@ static Object* Runtime_DebugReferencedBy(Arguments args) {
                             NULL, 0, arguments_function);
 
   // Allocate an array to hold the result.
-  Object* object = Heap::AllocateFixedArray(count);
-  if (object->IsFailure()) return object;
+  Object* object;
+  { MaybeObject* maybe_object = Heap::AllocateFixedArray(count);
+    if (!maybe_object->ToObject(&object)) return maybe_object;
+  }
   FixedArray* instances = FixedArray::cast(object);
 
   // Fill the referencing objects.
@@ -9376,10 +10032,12 @@ static Object* Runtime_DebugReferencedBy(Arguments args) {
                             instances, count, arguments_function);
 
   // Return result as JS array.
-  Object* result =
-      Heap::AllocateJSObject(
-          Top::context()->global_context()->array_function());
-  if (!result->IsFailure()) JSArray::cast(result)->SetContent(instances);
+  Object* result;
+  { MaybeObject* maybe_result = Heap::AllocateJSObject(
+        Top::context()->global_context()->array_function());
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
+  JSArray::cast(result)->SetContent(instances);
   return result;
 }
 
@@ -9417,7 +10075,7 @@ static int DebugConstructedBy(JSFunction* constructor, int max_references,
 // Scan the heap for objects constructed by a specific function.
 // args[0]: the constructor to find instances of
 // args[1]: the the maximum number of objects to return
-static Object* Runtime_DebugConstructedBy(Arguments args) {
+static MaybeObject* Runtime_DebugConstructedBy(Arguments args) {
   ASSERT(args.length() == 2);
 
   // First perform a full GC in order to avoid dead objects.
@@ -9433,25 +10091,29 @@ static Object* Runtime_DebugConstructedBy(Arguments args) {
   count = DebugConstructedBy(constructor, max_references, NULL, 0);
 
   // Allocate an array to hold the result.
-  Object* object = Heap::AllocateFixedArray(count);
-  if (object->IsFailure()) return object;
+  Object* object;
+  { MaybeObject* maybe_object = Heap::AllocateFixedArray(count);
+    if (!maybe_object->ToObject(&object)) return maybe_object;
+  }
   FixedArray* instances = FixedArray::cast(object);
 
   // Fill the referencing objects.
   count = DebugConstructedBy(constructor, max_references, instances, count);
 
   // Return result as JS array.
-  Object* result =
-      Heap::AllocateJSObject(
-          Top::context()->global_context()->array_function());
-  if (!result->IsFailure()) JSArray::cast(result)->SetContent(instances);
+  Object* result;
+  { MaybeObject* maybe_result = Heap::AllocateJSObject(
+        Top::context()->global_context()->array_function());
+    if (!maybe_result->ToObject(&result)) return maybe_result;
+  }
+  JSArray::cast(result)->SetContent(instances);
   return result;
 }
 
 
 // Find the effective prototype object as returned by __proto__.
 // args[0]: the object to find the prototype for.
-static Object* Runtime_DebugGetPrototype(Arguments args) {
+static MaybeObject* Runtime_DebugGetPrototype(Arguments args) {
   ASSERT(args.length() == 1);
 
   CONVERT_CHECKED(JSObject, obj, args[0]);
@@ -9461,14 +10123,14 @@ static Object* Runtime_DebugGetPrototype(Arguments args) {
 }
 
 
-static Object* Runtime_SystemBreak(Arguments args) {
+static MaybeObject* Runtime_SystemBreak(Arguments args) {
   ASSERT(args.length() == 0);
   CPU::DebugBreak();
   return Heap::undefined_value();
 }
 
 
-static Object* Runtime_DebugDisassembleFunction(Arguments args) {
+static MaybeObject* Runtime_DebugDisassembleFunction(Arguments args) {
 #ifdef DEBUG
   HandleScope scope;
   ASSERT(args.length() == 1);
@@ -9484,7 +10146,7 @@ static Object* Runtime_DebugDisassembleFunction(Arguments args) {
 }
 
 
-static Object* Runtime_DebugDisassembleConstructor(Arguments args) {
+static MaybeObject* Runtime_DebugDisassembleConstructor(Arguments args) {
 #ifdef DEBUG
   HandleScope scope;
   ASSERT(args.length() == 1);
@@ -9500,7 +10162,7 @@ static Object* Runtime_DebugDisassembleConstructor(Arguments args) {
 }
 
 
-static Object* Runtime_FunctionGetInferredName(Arguments args) {
+static MaybeObject* Runtime_FunctionGetInferredName(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
@@ -9536,7 +10198,7 @@ static int FindSharedFunctionInfosForScript(Script* script,
 // For a script finds all SharedFunctionInfo's in the heap that points
 // to this script. Returns JSArray of SharedFunctionInfo wrapped
 // in OpaqueReferences.
-static Object* Runtime_LiveEditFindSharedFunctionInfosForScript(
+static MaybeObject* Runtime_LiveEditFindSharedFunctionInfosForScript(
     Arguments args) {
   ASSERT(args.length() == 1);
   HandleScope scope;
@@ -9569,7 +10231,7 @@ static Object* Runtime_LiveEditFindSharedFunctionInfosForScript(
 // Returns a JSArray of compilation infos. The array is ordered so that
 // each function with all its descendant is always stored in a continues range
 // with the function itself going first. The root function is a script function.
-static Object* Runtime_LiveEditGatherCompileInfo(Arguments args) {
+static MaybeObject* Runtime_LiveEditGatherCompileInfo(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_CHECKED(JSValue, script, args[0]);
@@ -9588,7 +10250,7 @@ static Object* Runtime_LiveEditGatherCompileInfo(Arguments args) {
 // Changes the source of the script to a new_source.
 // If old_script_name is provided (i.e. is a String), also creates a copy of
 // the script with its original source and sends notification to debugger.
-static Object* Runtime_LiveEditReplaceScript(Arguments args) {
+static MaybeObject* Runtime_LiveEditReplaceScript(Arguments args) {
   ASSERT(args.length() == 3);
   HandleScope scope;
   CONVERT_CHECKED(JSValue, original_script_value, args[0]);
@@ -9611,8 +10273,17 @@ static Object* Runtime_LiveEditReplaceScript(Arguments args) {
   }
 }
 
+
+static MaybeObject* Runtime_LiveEditFunctionSourceUpdated(Arguments args) {
+  ASSERT(args.length() == 1);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSArray, shared_info, 0);
+  return LiveEdit::FunctionSourceUpdated(shared_info);
+}
+
+
 // Replaces code of SharedFunctionInfo with a new one.
-static Object* Runtime_LiveEditReplaceFunctionCode(Arguments args) {
+static MaybeObject* Runtime_LiveEditReplaceFunctionCode(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSArray, new_compile_info, 0);
@@ -9622,7 +10293,7 @@ static Object* Runtime_LiveEditReplaceFunctionCode(Arguments args) {
 }
 
 // Connects SharedFunctionInfo to another script.
-static Object* Runtime_LiveEditFunctionSetScript(Arguments args) {
+static MaybeObject* Runtime_LiveEditFunctionSetScript(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   Handle<Object> function_object(args[0]);
@@ -9647,7 +10318,7 @@ static Object* Runtime_LiveEditFunctionSetScript(Arguments args) {
 
 // In a code of a parent function replaces original function as embedded object
 // with a substitution one.
-static Object* Runtime_LiveEditReplaceRefToNestedFunction(Arguments args) {
+static MaybeObject* Runtime_LiveEditReplaceRefToNestedFunction(Arguments args) {
   ASSERT(args.length() == 3);
   HandleScope scope;
 
@@ -9667,7 +10338,7 @@ static Object* Runtime_LiveEditReplaceRefToNestedFunction(Arguments args) {
 // array of groups of 3 numbers:
 // (change_begin, change_end, change_end_new_position).
 // Each group describes a change in text; groups are sorted by change_begin.
-static Object* Runtime_LiveEditPatchFunctionPositions(Arguments args) {
+static MaybeObject* Runtime_LiveEditPatchFunctionPositions(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSArray, shared_array, 0);
@@ -9681,7 +10352,7 @@ static Object* Runtime_LiveEditPatchFunctionPositions(Arguments args) {
 // checks that none of them have activations on stacks (of any thread).
 // Returns array of the same length with corresponding results of
 // LiveEdit::FunctionPatchabilityStatus type.
-static Object* Runtime_LiveEditCheckAndDropActivations(Arguments args) {
+static MaybeObject* Runtime_LiveEditCheckAndDropActivations(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSArray, shared_array, 0);
@@ -9692,7 +10363,7 @@ static Object* Runtime_LiveEditCheckAndDropActivations(Arguments args) {
 
 // Compares 2 strings line-by-line and returns diff in form of JSArray of
 // triplets (pos1, pos1_end, pos2_end) describing list of diff chunks.
-static Object* Runtime_LiveEditCompareStringsLinewise(Arguments args) {
+static MaybeObject* Runtime_LiveEditCompareStringsLinewise(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(String, s1, 0);
@@ -9705,7 +10376,7 @@ static Object* Runtime_LiveEditCompareStringsLinewise(Arguments args) {
 
 // A testing entry. Returns statement position which is the closest to
 // source_position.
-static Object* Runtime_GetFunctionCodePositionFromSource(Arguments args) {
+static MaybeObject* Runtime_GetFunctionCodePositionFromSource(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSFunction, function, 0);
@@ -9713,7 +10384,12 @@ static Object* Runtime_GetFunctionCodePositionFromSource(Arguments args) {
 
   Handle<Code> code(function->code());
 
-  RelocIterator it(*code, 1 << RelocInfo::STATEMENT_POSITION);
+  if (code->kind() != Code::FUNCTION &&
+      code->kind() != Code::OPTIMIZED_FUNCTION) {
+    return Heap::undefined_value();
+  }
+
+  RelocIterator it(*code, RelocInfo::ModeMask(RelocInfo::STATEMENT_POSITION));
   int closest_pc = 0;
   int distance = kMaxInt;
   while (!it.done()) {
@@ -9737,7 +10413,7 @@ static Object* Runtime_GetFunctionCodePositionFromSource(Arguments args) {
 // Calls specified function with or without entering the debugger.
 // This is used in unit tests to run code as if debugger is entered or simply
 // to have a stack with C++ frame in the middle.
-static Object* Runtime_ExecuteInDebugContext(Arguments args) {
+static MaybeObject* Runtime_ExecuteInDebugContext(Arguments args) {
   ASSERT(args.length() == 2);
   HandleScope scope;
   CONVERT_ARG_CHECKED(JSFunction, function, 0);
@@ -9767,7 +10443,7 @@ static Object* Runtime_ExecuteInDebugContext(Arguments args) {
 
 #ifdef ENABLE_LOGGING_AND_PROFILING
 
-static Object* Runtime_ProfilerResume(Arguments args) {
+static MaybeObject* Runtime_ProfilerResume(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -9778,7 +10454,7 @@ static Object* Runtime_ProfilerResume(Arguments args) {
 }
 
 
-static Object* Runtime_ProfilerPause(Arguments args) {
+static MaybeObject* Runtime_ProfilerPause(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
@@ -9825,7 +10501,7 @@ static Handle<Object> Runtime_GetScriptFromScriptName(
 // Get the script object from script data. NOTE: Regarding performance
 // see the NOTE for GetScriptFromScriptData.
 // args[0]: script data for the script to find the source for
-static Object* Runtime_GetScript(Arguments args) {
+static MaybeObject* Runtime_GetScript(Arguments args) {
   HandleScope scope;
 
   ASSERT(args.length() == 1);
@@ -9867,10 +10543,10 @@ static bool ShowFrameInStackTrace(StackFrame* raw_frame, Object* caller,
 }
 
 
-// Collect the raw data for a stack trace.  Returns an array of three
-// element segments each containing a receiver, function and native
-// code offset.
-static Object* Runtime_CollectStackTrace(Arguments args) {
+// Collect the raw data for a stack trace.  Returns an array of 4
+// element segments each containing a receiver, function, code and
+// native code offset.
+static MaybeObject* Runtime_CollectStackTrace(Arguments args) {
   ASSERT_EQ(args.length(), 2);
   Handle<Object> caller = args.at<Object>(0);
   CONVERT_NUMBER_CHECKED(int32_t, limit, Int32, args[1]);
@@ -9879,7 +10555,7 @@ static Object* Runtime_CollectStackTrace(Arguments args) {
 
   limit = Max(limit, 0);  // Ensure that limit is not negative.
   int initial_size = Min(limit, 10);
-  Handle<JSArray> result = Factory::NewJSArray(initial_size * 3);
+  Handle<JSArray> result = Factory::NewJSArray(initial_size * 4);
 
   StackFrameIterator iter;
   // If the caller parameter is a function we skip frames until we're
@@ -9892,23 +10568,25 @@ static Object* Runtime_CollectStackTrace(Arguments args) {
     if (ShowFrameInStackTrace(raw_frame, *caller, &seen_caller)) {
       frames_seen++;
       JavaScriptFrame* frame = JavaScriptFrame::cast(raw_frame);
-      Object* recv = frame->receiver();
-      Object* fun = frame->function();
-      Address pc = frame->pc();
-      Address start = frame->code()->address();
-      Smi* offset = Smi::FromInt(static_cast<int>(pc - start));
-      FixedArray* elements = FixedArray::cast(result->elements());
-      if (cursor + 2 < elements->length()) {
-        elements->set(cursor++, recv);
-        elements->set(cursor++, fun);
-        elements->set(cursor++, offset);
-      } else {
-        HandleScope scope;
-        Handle<Object> recv_handle(recv);
-        Handle<Object> fun_handle(fun);
-        SetElement(result, cursor++, recv_handle);
-        SetElement(result, cursor++, fun_handle);
-        SetElement(result, cursor++, Handle<Smi>(offset));
+      List<FrameSummary> frames(3);  // Max 2 levels of inlining.
+      frame->Summarize(&frames);
+      for (int i = frames.length() - 1; i >= 0; i--) {
+        Handle<Object> recv = frames[i].receiver();
+        Handle<JSFunction> fun = frames[i].function();
+        Handle<Code> code = frames[i].code();
+        Handle<Smi> offset(Smi::FromInt(frames[i].offset()));
+        FixedArray* elements = FixedArray::cast(result->elements());
+        if (cursor + 3 < elements->length()) {
+          elements->set(cursor++, *recv);
+          elements->set(cursor++, *fun);
+          elements->set(cursor++, *code);
+          elements->set(cursor++, *offset);
+        } else {
+          SetElement(result, cursor++, recv);
+          SetElement(result, cursor++, fun);
+          SetElement(result, cursor++, code);
+          SetElement(result, cursor++, offset);
+        }
       }
     }
     iter.Advance();
@@ -9920,7 +10598,7 @@ static Object* Runtime_CollectStackTrace(Arguments args) {
 
 
 // Returns V8 version as a string.
-static Object* Runtime_GetV8Version(Arguments args) {
+static MaybeObject* Runtime_GetV8Version(Arguments args) {
   ASSERT_EQ(args.length(), 0);
 
   NoHandleAllocation ha;
@@ -9931,7 +10609,7 @@ static Object* Runtime_GetV8Version(Arguments args) {
 }
 
 
-static Object* Runtime_Abort(Arguments args) {
+static MaybeObject* Runtime_Abort(Arguments args) {
   ASSERT(args.length() == 2);
   OS::PrintError("abort: %s\n", reinterpret_cast<char*>(args[0]) +
                                     Smi::cast(args[1])->value());
@@ -9942,14 +10620,9 @@ static Object* Runtime_Abort(Arguments args) {
 }
 
 
-static Object* Runtime_DeleteHandleScopeExtensions(Arguments args) {
-  ASSERT(args.length() == 0);
-  HandleScope::DeleteExtensions();
-  return Heap::undefined_value();
-}
-
-
-static Object* CacheMiss(FixedArray* cache_obj, int index, Object* key_obj) {
+MUST_USE_RESULT static MaybeObject* CacheMiss(FixedArray* cache_obj,
+                                              int index,
+                                              Object* key_obj) {
   ASSERT(index % 2 == 0);  // index of the key
   ASSERT(index >= JSFunctionResultCache::kEntriesIndex);
   ASSERT(index < cache_obj->length());
@@ -9984,7 +10657,7 @@ static Object* CacheMiss(FixedArray* cache_obj, int index, Object* key_obj) {
 }
 
 
-static Object* Runtime_GetFromCache(Arguments args) {
+static MaybeObject* Runtime_GetFromCache(Arguments args) {
   // This is only called from codegen, so checks might be more lax.
   CONVERT_CHECKED(FixedArray, cache, args[0]);
   Object* key = args[1];
@@ -10037,7 +10710,7 @@ static Object* Runtime_GetFromCache(Arguments args) {
 #ifdef DEBUG
 // ListNatives is ONLY used by the fuzz-natives.js in debug mode
 // Exclude the code in release mode.
-static Object* Runtime_ListNatives(Arguments args) {
+static MaybeObject* Runtime_ListNatives(Arguments args) {
   ASSERT(args.length() == 0);
   HandleScope scope;
   Handle<JSArray> result = Factory::NewJSArray(0);
@@ -10071,7 +10744,7 @@ static Object* Runtime_ListNatives(Arguments args) {
 #endif
 
 
-static Object* Runtime_Log(Arguments args) {
+static MaybeObject* Runtime_Log(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(String, format, args[0]);
   CONVERT_CHECKED(JSArray, elms, args[1]);
@@ -10081,7 +10754,7 @@ static Object* Runtime_Log(Arguments args) {
 }
 
 
-static Object* Runtime_IS_VAR(Arguments args) {
+static MaybeObject* Runtime_IS_VAR(Arguments args) {
   UNREACHABLE();  // implemented as macro in the parser
   return NULL;
 }
@@ -10106,18 +10779,26 @@ Runtime::Function kIntrinsicFunctions[] = {
 };
 
 
-Object* Runtime::InitializeIntrinsicFunctionNames(Object* dictionary) {
+MaybeObject* Runtime::InitializeIntrinsicFunctionNames(Object* dictionary) {
   ASSERT(dictionary != NULL);
   ASSERT(StringDictionary::cast(dictionary)->NumberOfElements() == 0);
   for (int i = 0; i < kNumFunctions; ++i) {
-    Object* name_symbol = Heap::LookupAsciiSymbol(kIntrinsicFunctions[i].name);
-    if (name_symbol->IsFailure()) return name_symbol;
+    Object* name_symbol;
+    { MaybeObject* maybe_name_symbol =
+          Heap::LookupAsciiSymbol(kIntrinsicFunctions[i].name);
+      if (!maybe_name_symbol->ToObject(&name_symbol)) return maybe_name_symbol;
+    }
     StringDictionary* string_dictionary = StringDictionary::cast(dictionary);
-    dictionary = string_dictionary->Add(String::cast(name_symbol),
-                                        Smi::FromInt(i),
-                                        PropertyDetails(NONE, NORMAL));
-    // Non-recoverable failure.  Calling code must restart heap initialization.
-    if (dictionary->IsFailure()) return dictionary;
+    { MaybeObject* maybe_dictionary = string_dictionary->Add(
+          String::cast(name_symbol),
+          Smi::FromInt(i),
+          PropertyDetails(NONE, NORMAL));
+      if (!maybe_dictionary->ToObject(&dictionary)) {
+        // Non-recoverable failure.  Calling code must restart heap
+        // initialization.
+        return maybe_dictionary;
+      }
+    }
   }
   return dictionary;
 }
@@ -10144,7 +10825,7 @@ void Runtime::PerformGC(Object* result) {
   if (failure->IsRetryAfterGC()) {
     // Try to do a garbage collection; ignore it if it fails. The C
     // entry stub will throw an out-of-memory exception in that case.
-    Heap::CollectGarbage(failure->requested(), failure->allocation_space());
+    Heap::CollectGarbage(failure->allocation_space());
   } else {
     // Handle last resort GC and make sure to allow future allocations
     // to grow the heap without causing GCs (if possible).

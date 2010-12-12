@@ -33,7 +33,6 @@
 #include "ic-inl.h"
 #include "runtime.h"
 #include "stub-cache.h"
-#include "utils.h"
 
 namespace v8 {
 namespace internal {
@@ -384,6 +383,8 @@ static const byte kTestEaxByte = 0xA9;
 
 
 static bool PatchInlinedMapCheck(Address address, Object* map) {
+  if (V8::UseCrankshaft()) return false;
+
   // Arguments are address of start of call sequence that called
   // the IC,
   Address test_instruction_address =
@@ -730,7 +731,6 @@ void KeyedLoadIC::GenerateString(MacroAssembler* masm) {
   //  -- rsp[0] : return address
   // -----------------------------------
   Label miss;
-  Label index_out_of_range;
 
   Register receiver = rdx;
   Register index = rax;
@@ -745,17 +745,13 @@ void KeyedLoadIC::GenerateString(MacroAssembler* masm) {
                                           result,
                                           &miss,  // When not a string.
                                           &miss,  // When not a number.
-                                          &index_out_of_range,
+                                          &miss,  // When index out of range.
                                           STRING_INDEX_IS_ARRAY_INDEX);
   char_at_generator.GenerateFast(masm);
   __ ret(0);
 
-  ICRuntimeCallHelper call_helper;
+  StubRuntimeCallHelper call_helper;
   char_at_generator.GenerateSlow(masm, call_helper);
-
-  __ bind(&index_out_of_range);
-  __ LoadRoot(rax, Heap::kUndefinedValueRootIndex);
-  __ ret(0);
 
   __ bind(&miss);
   GenerateMiss(masm);
@@ -847,7 +843,7 @@ void KeyedLoadIC::GenerateExternalArray(MacroAssembler* masm,
     // For the UnsignedInt array type, we need to see whether
     // the value can be represented in a Smi. If not, we need to convert
     // it to a HeapNumber.
-    Label box_int;
+    NearLabel box_int;
 
     __ JumpIfUIntNotValidSmiValue(rcx, &box_int);
 
@@ -898,8 +894,9 @@ void KeyedLoadIC::GenerateIndexedInterceptor(MacroAssembler* masm) {
   // Check that the receiver isn't a smi.
   __ JumpIfSmi(rdx, &slow);
 
-  // Check that the key is a smi.
-  __ JumpIfNotSmi(rax, &slow);
+  // Check that the key is an array index, that is Uint32.
+  STATIC_ASSERT(kSmiValueSize <= 32);
+  __ JumpUnlessNonNegativeSmi(rax, &slow);
 
   // Get the map of the receiver.
   __ movq(rcx, FieldOperand(rdx, HeapObject::kMapOffset));
@@ -1032,7 +1029,7 @@ void KeyedStoreIC::GenerateGeneric(MacroAssembler* masm) {
   // No more bailouts to slow case on this path, so key not needed.
   __ SmiToInteger32(rdi, rax);
   {  // Clamp the value to [0..255].
-    Label done;
+    NearLabel done;
     __ testl(rdi, Immediate(0xFFFFFF00));
     __ j(zero, &done);
     __ setcc(negative, rdi);  // 1 if negative, 0 if positive.
@@ -1082,7 +1079,7 @@ void KeyedStoreIC::GenerateGeneric(MacroAssembler* masm) {
   // rax: value
   // rbx: receiver's elements array (a FixedArray)
   // rcx: index
-  Label non_smi_value;
+  NearLabel non_smi_value;
   __ movq(FieldOperand(rbx, rcx, times_pointer_size, FixedArray::kHeaderSize),
           rax);
   __ JumpIfNotSmi(rax, &non_smi_value);
@@ -1104,7 +1101,7 @@ void KeyedStoreIC::GenerateExternalArray(MacroAssembler* masm,
   //  -- rdx     : receiver
   //  -- rsp[0]  : return address
   // -----------------------------------
-  Label slow, check_heap_number;
+  Label slow;
 
   // Check that the object isn't a smi.
   __ JumpIfSmi(rdx, &slow);
@@ -1145,6 +1142,7 @@ void KeyedStoreIC::GenerateExternalArray(MacroAssembler* masm,
   // rdx: receiver (a JSObject)
   // rbx: elements array
   // rdi: untagged key
+  NearLabel check_heap_number;
   __ JumpIfNotSmi(rax, &check_heap_number);
   // No more branches to slow case on this path.  Key and receiver not needed.
   __ SmiToInteger32(rdx, rax);
@@ -1488,7 +1486,7 @@ void KeyedCallIC::GenerateMegamorphic(MacroAssembler* masm, int argc) {
   // Get the receiver of the function from the stack; 1 ~ return address.
   __ movq(rdx, Operand(rsp, (argc + 1) * kPointerSize));
 
-  Label do_call, slow_call, slow_load, slow_reload_receiver;
+  Label do_call, slow_call, slow_load;
   Label check_number_dictionary, check_string, lookup_monomorphic_cache;
   Label index_smi, index_string;
 
@@ -1703,6 +1701,8 @@ void LoadIC::GenerateStringLength(MacroAssembler* masm) {
 
 
 bool LoadIC::PatchInlinedLoad(Address address, Object* map, int offset) {
+  if (V8::UseCrankshaft()) return false;
+
   // The address of the instruction following the call.
   Address test_instruction_address =
       address + Assembler::kCallTargetAddressOffset;
@@ -1730,12 +1730,23 @@ bool LoadIC::PatchInlinedLoad(Address address, Object* map, int offset) {
 }
 
 
+bool LoadIC::PatchInlinedContextualLoad(Address address,
+                                        Object* map,
+                                        Object* cell,
+                                        bool is_dont_delete) {
+  // TODO(<bug#>): implement this.
+  return false;
+}
+
+
 // The offset from the inlined patch site to the start of the inlined
 // store instruction.
 const int StoreIC::kOffsetToStoreInstruction = 20;
 
 
 bool StoreIC::PatchInlinedStore(Address address, Object* map, int offset) {
+  if (V8::UseCrankshaft()) return false;
+
   // The address of the instruction following the call.
   Address test_instruction_address =
       address + Assembler::kCallTargetAddressOffset;
@@ -1880,7 +1891,7 @@ void StoreIC::GenerateNormal(MacroAssembler* masm) {
   //  -- rsp[0] : return address
   // -----------------------------------
 
-  Label miss, restore_miss;
+  Label miss;
 
   GenerateStringDictionaryReceiverCheck(masm, rdx, rbx, rdi, &miss);
 
@@ -1894,8 +1905,74 @@ void StoreIC::GenerateNormal(MacroAssembler* masm) {
 }
 
 
+void StoreIC::GenerateGlobalProxy(MacroAssembler* masm) {
+  // ----------- S t a t e -------------
+  //  -- rax    : value
+  //  -- rcx    : name
+  //  -- rdx    : receiver
+  //  -- rsp[0] : return address
+  // -----------------------------------
+  __ pop(rbx);
+  __ push(rdx);
+  __ push(rcx);
+  __ push(rax);
+  __ push(rbx);
+
+  // Do tail-call to runtime routine.
+  __ TailCallRuntime(Runtime::kSetProperty, 3, 1);
+}
+
+
 #undef __
 
+
+Condition CompareIC::ComputeCondition(Token::Value op) {
+  switch (op) {
+    case Token::EQ_STRICT:
+    case Token::EQ:
+      return equal;
+    case Token::LT:
+      return less;
+    case Token::GT:
+      // Reverse left and right operands to obtain ECMA-262 conversion order.
+      return less;
+    case Token::LTE:
+      // Reverse left and right operands to obtain ECMA-262 conversion order.
+      return greater_equal;
+    case Token::GTE:
+      return greater_equal;
+    default:
+      UNREACHABLE();
+      return no_condition;
+  }
+}
+
+
+void CompareIC::UpdateCaches(Handle<Object> x, Handle<Object> y) {
+  HandleScope scope;
+  Handle<Code> rewritten;
+#ifdef DEBUG
+  State previous_state = GetState();
+#endif
+  State state = TargetState(x, y);
+  if (state == GENERIC) {
+    CompareStub stub(GetCondition(), strict(), NO_COMPARE_FLAGS);
+    rewritten = stub.GetCode();
+  } else {
+    ICCompareStub stub(op_, state);
+    rewritten = stub.GetCode();
+  }
+  set_target(*rewritten);
+
+#ifdef DEBUG
+  if (FLAG_trace_ic) {
+    PrintF("[CompareIC (%s->%s)#%s]\n",
+           GetStateName(previous_state),
+           GetStateName(state),
+           Token::Name(op_));
+  }
+#endif
+}
 
 } }  // namespace v8::internal
 
