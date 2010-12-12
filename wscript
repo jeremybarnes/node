@@ -66,6 +66,19 @@ def set_options(opt):
                 , dest='without_ssl'
                 )
 
+  opt.add_option('--shared-node-v8'
+                , action='store_true'
+                , default=False
+                , help='Build and a shared node-specific version of v8 with given name (default libnode-v8.so) and install it to enable other tools to link with it'
+                , dest='shared_node_v8'
+                )
+
+  opt.add_option('--shared-node-v8-name'
+                , action='store'
+                , default=None
+                , help='library name for the --shared-node-v8 option [Default: "node-v8"]'
+                , dest='shared_node_v8_name'
+                )
 
   opt.add_option('--shared-v8'
                 , action='store_true'
@@ -172,6 +185,7 @@ def configure(conf):
   conf.env["USE_PROFILING"] = o.profile
 
   conf.env["USE_SHARED_V8"] = o.shared_v8 or o.shared_v8_includes or o.shared_v8_libpath or o.shared_v8_libname
+  conf.env["USE_SHARED_NODE_V8"] = o.shared_node_v8
   conf.env["USE_SHARED_CARES"] = o.shared_cares or o.shared_cares_includes or o.shared_cares_libpath
   conf.env["USE_SHARED_LIBEV"] = o.shared_libev or o.shared_libev_includes or o.shared_libev_libpath
 
@@ -260,6 +274,17 @@ def configure(conf):
                             includes=v8_includes,
                             libpath=v8_libpath):
         conf.fatal("Cannot find v8_g")
+
+  if conf.env['USE_SHARED_NODE_V8_NAME'] and not conf.env['USER_SHARED_NODE_V8']:
+    conf.fatal('--shared-node-v8 must be specified if --shared-node-v8-name is set')
+
+  if conf.env['USE_SHARED_NODE_V8']:
+    if conf.env['USE_SHARED_V8']:
+      conf.fatal("cannot use both node and system v8")
+    if o.shared_node_v8_name:  
+      conf.env["USE_SHARED_NODE_V8_NAME"] = o.shared_node_v8_name
+    else:
+      conf.env["USE_SHARED_NODE_V8_NAME"] = "node-v8"
 
   if conf.env['USE_SHARED_CARES']:
     cares_includes = [];
@@ -408,12 +433,16 @@ def v8_cmd(bld, variant):
   else:
     mode = "debug"
 
+  libtype = "static"
+  if bld.env["USE_SHARED_NODE_V8"]:
+    libtype = "shared"
+
   if bld.env["SNAPSHOT_V8"]:
     snapshot = "snapshot=on"
   else:
     snapshot = ""
 
-  cmd_R = 'python "%s" -j %d -C "%s" -Y "%s" visibility=default mode=%s %s library=static %s'
+  cmd_R = 'python "%s" -j %d -C "%s" -Y "%s" visibility=default mode=%s %s library=%s %s'
 
   cmd = cmd_R % ( scons
                 , Options.options.jobs
@@ -421,6 +450,7 @@ def v8_cmd(bld, variant):
                 , v8dir_src
                 , mode
                 , arch
+                , libtype
                 , snapshot
                 )
   
@@ -428,32 +458,96 @@ def v8_cmd(bld, variant):
 
 
 def build_v8(bld):
+  if bld.env["USE_SHARED_NODE_V8"]:
+    target = bld.env["shlib_PATTERN"] % "v8"
+  else:
+    target = bld.env["staticlib_PATTERN"] % "v8"
+
   v8 = bld.new_task_gen(
     source        = 'deps/v8/SConstruct '
                     + bld.path.ant_glob('v8/include/*')
                     + bld.path.ant_glob('v8/src/*'),
-    target        = bld.env["staticlib_PATTERN"] % "v8",
+    target        = target,
     rule          = v8_cmd(bld, "default"),
     before        = "cxx",
-    install_path  = None)
-  v8.uselib = "EXECINFO"
+    install_path  = None,
+    uselib        = "EXECINFO")
+
   bld.env["CPPPATH_V8"] = "deps/v8/include"
-  t = join(bld.srcnode.abspath(bld.env_of_name("default")), v8.target)
-  bld.env_of_name('default').append_value("LINKFLAGS_V8", t)
+
+  if not bld.env["USE_SHARED_NODE_V8"]:
+    t = join(bld.srcnode.abspath(bld.env_of_name("default")), v8.target)
+    bld.env_of_name('default').append_value("LINKFLAGS_V8", t)
 
 
   ### v8 debug
   if bld.env["USE_DEBUG"]:
+
+    if bld.env["USE_SHARED_NODE_V8"]:
+      target_debug = bld.env["shlib_PATTERN"] % "v8_g"
+    else:
+      target_debug = bld.env["staticlib_PATTERN"] % "v8_g"
+
     v8_debug = v8.clone("debug")
-    v8_debug.rule   = v8_cmd(bld, "debug")
-    v8_debug.target = bld.env["staticlib_PATTERN"] % "v8_g"
-    v8_debug.uselib = "EXECINFO"
+    v8_debug.target        = target_debug
+    v8_debug.rule          = v8_cmd(bld, "debug")
+
+    print "v8_debug.rule=", v8_debug.rule
+    print "v8_debug.target =", v8_debug.target
     bld.env["CPPPATH_V8_G"] = "deps/v8/include"
-    t = join(bld.srcnode.abspath(bld.env_of_name("debug")), v8_debug.target)
-    bld.env_of_name('debug').append_value("LINKFLAGS_V8_G", t)
+
+    if not bld.env["USE_SHARED_NODE_V8"]:
+      t2 = join(bld.srcnode.abspath(bld.env_of_name("debug")), v8_debug.target)
+      bld.env_of_name('debug').append_value("LINKFLAGS_V8_G", t2)
+
+  if bld.env["USE_SHARED_NODE_V8"]:
+    # We want to create another library (the name of which is in
+    # the environment under USE_SHARED_NODE_V8_NAME, by default "node-v8"
+    # so that we can make our support libraries link against the exact same
+    # V8 version that node does.
+    #
+    # Since the V8 build system doesn't allow us to choose a name for the
+    # library (it always builds libv8.{so,dll}), we add another task to
+    # copy the library into its new name here so that we can link with it.
+
+    # Create a new group.  Everything up to here will be done before anything
+    # after, which avoids us trying to compile V8 and copy the resulting
+    # library in parallel.
+    bld.add_group("copylibs")
+
+    # Create the copy rule.  We also ask for the copied file to be installed,
+    # and make sure that this is done before we try to build the node
+    # application itself.
+    copytarget = bld.env["shlib_PATTERN"] % bld.env["USE_SHARED_NODE_V8_NAME"]
+    copyv8 = bld.new_task_gen(
+      "copy",
+      source        = v8.target,
+      target        = copytarget,
+      install_path  = '${PREFIX}/lib',
+      before        = "cxx")
+
+    # Set up the environment for the uselibs for V8 to use this version of
+    # the library and link it shared.
+    t3 = '-L' + bld.srcnode.abspath(bld.env_of_name("default"))
+    bld.env_of_name('default').append_value("LINKFLAGS_V8", t3)
+    bld.env_of_name('default').append_value("LIB_V8", bld.env["USE_SHARED_NODE_V8_NAME"])
+    
+    if bld.env["USE_DEBUG"]:
+      bld.add_group("copylibs_debug")
+
+      # Same for debug version
+      copytarget_debug = bld.env["shlib_PATTERN"] \
+          % (bld.env["USE_SHARED_NODE_V8_NAME"] + "_g")
+
+      copyv8_debug = copyv8.clone("debug")
+      copyv8_debug.source        = v8_debug.target
+      copyv8_debug.target        = copytarget_debug
+    
+      t4 = '-L' + bld.srcnode.abspath(bld.env_of_name("debug"))
+      bld.env_of_name('debug').append_value("LINKFLAGS_V8_G", t4)
+      bld.env_of_name('debug').append_value("LIB_V8_G", bld.env["USE_SHARED_NODE_V8_NAME"] + "_g")
 
   bld.install_files('${PREFIX}/include/node/', 'deps/v8/include/*.h')
-
 
 def build(bld):
   ## This snippet is to show full commands as WAF executes
@@ -627,6 +721,7 @@ def build(bld):
 
   # After creating the debug clone, append the V8 dep
   node.uselib += ' V8'
+#  print bld.env
 
   bld.install_files('${PREFIX}/include/node/', """
     config.h
