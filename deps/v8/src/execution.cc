@@ -33,8 +33,10 @@
 #include "bootstrapper.h"
 #include "codegen-inl.h"
 #include "debug.h"
+#include "runtime-profiler.h"
 #include "simulator.h"
 #include "v8threads.h"
+#include "vm-state-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -104,6 +106,11 @@ static Handle<Object> Invoke(bool construct,
   ASSERT(*has_pending_exception == Top::has_pending_exception());
   if (*has_pending_exception) {
     Top::ReportPendingMessages();
+    if (Top::pending_exception() == Failure::OutOfMemoryException()) {
+      if (!HandleScopeImplementer::instance()->ignore_out_of_memory()) {
+        V8::FatalProcessOutOfMemory("JS", true);
+      }
+    }
     return Handle<Object>();
   } else {
     Top::clear_pending_message();
@@ -295,6 +302,25 @@ void StackGuard::TerminateExecution() {
 }
 
 
+bool StackGuard::IsRuntimeProfilerTick() {
+  ExecutionAccess access;
+  return thread_local_.interrupt_flags_ & RUNTIME_PROFILER_TICK;
+}
+
+
+void StackGuard::RequestRuntimeProfilerTick() {
+  // Ignore calls if we're not optimizing or if we can't get the lock.
+  if (FLAG_opt && ExecutionAccess::TryLock()) {
+    thread_local_.interrupt_flags_ |= RUNTIME_PROFILER_TICK;
+    if (thread_local_.postpone_interrupts_nesting_ == 0) {
+      thread_local_.jslimit_ = thread_local_.climit_ = kInterruptLimit;
+      Heap::SetStackLimits();
+    }
+    ExecutionAccess::Unlock();
+  }
+}
+
+
 #ifdef ENABLE_DEBUGGER_SUPPORT
 bool StackGuard::IsDebugBreak() {
   ExecutionAccess access;
@@ -382,6 +408,7 @@ void StackGuard::ThreadLocal::Initialize() {
   if (real_climit_ == kIllegalLimit) {
     // Takes the address of the limit variable in order to find out where
     // the top of stack is right now.
+    const uintptr_t kLimitSize = FLAG_stack_size * KB;
     uintptr_t limit = reinterpret_cast<uintptr_t>(&limit) - kLimitSize;
     ASSERT(reinterpret_cast<uintptr_t>(&limit) > kLimitSize);
     real_jslimit_ = SimulatorStack::JsLimitFromCLimit(limit);
@@ -682,6 +709,12 @@ void Execution::ProcessDebugMesssages(bool debug_command_only) {
 #endif
 
 MaybeObject* Execution::HandleStackGuardInterrupt() {
+  Counters::stack_interrupts.Increment();
+  if (StackGuard::IsRuntimeProfilerTick()) {
+    Counters::runtime_profiler_ticks.Increment();
+    StackGuard::Continue(RUNTIME_PROFILER_TICK);
+    RuntimeProfiler::OptimizeNow();
+  }
 #ifdef ENABLE_DEBUGGER_SUPPORT
   if (StackGuard::IsDebugBreak() || StackGuard::IsDebugCommand()) {
     DebugBreakHelper();
@@ -693,142 +726,10 @@ MaybeObject* Execution::HandleStackGuardInterrupt() {
     return Top::TerminateExecution();
   }
   if (StackGuard::IsInterrupted()) {
-    // interrupt
     StackGuard::Continue(INTERRUPT);
     return Top::StackOverflow();
   }
   return Heap::undefined_value();
 }
-
-// --- G C   E x t e n s i o n ---
-
-const char* const GCExtension::kSource = "native function gc();";
-
-
-v8::Handle<v8::FunctionTemplate> GCExtension::GetNativeFunction(
-    v8::Handle<v8::String> str) {
-  return v8::FunctionTemplate::New(GCExtension::GC);
-}
-
-
-v8::Handle<v8::Value> GCExtension::GC(const v8::Arguments& args) {
-  // All allocation spaces other than NEW_SPACE have the same effect.
-  Heap::CollectAllGarbage(false);
-  return v8::Undefined();
-}
-
-
-static GCExtension gc_extension;
-static v8::DeclareExtension gc_extension_declaration(&gc_extension);
-
-
-// --- E x t e r n a l i z e S t r i n g   E x t e n s i o n ---
-
-
-template <typename Char, typename Base>
-class SimpleStringResource : public Base {
- public:
-  // Takes ownership of |data|.
-  SimpleStringResource(Char* data, size_t length)
-      : data_(data),
-        length_(length) {}
-
-  virtual ~SimpleStringResource() { delete[] data_; }
-
-  virtual const Char* data() const { return data_; }
-
-  virtual size_t length() const { return length_; }
-
- private:
-  Char* const data_;
-  const size_t length_;
-};
-
-
-typedef SimpleStringResource<char, v8::String::ExternalAsciiStringResource>
-    SimpleAsciiStringResource;
-typedef SimpleStringResource<uc16, v8::String::ExternalStringResource>
-    SimpleTwoByteStringResource;
-
-
-const char* const ExternalizeStringExtension::kSource =
-    "native function externalizeString();"
-    "native function isAsciiString();";
-
-
-v8::Handle<v8::FunctionTemplate> ExternalizeStringExtension::GetNativeFunction(
-    v8::Handle<v8::String> str) {
-  if (strcmp(*v8::String::AsciiValue(str), "externalizeString") == 0) {
-    return v8::FunctionTemplate::New(ExternalizeStringExtension::Externalize);
-  } else {
-    ASSERT(strcmp(*v8::String::AsciiValue(str), "isAsciiString") == 0);
-    return v8::FunctionTemplate::New(ExternalizeStringExtension::IsAscii);
-  }
-}
-
-
-v8::Handle<v8::Value> ExternalizeStringExtension::Externalize(
-    const v8::Arguments& args) {
-  if (args.Length() < 1 || !args[0]->IsString()) {
-    return v8::ThrowException(v8::String::New(
-        "First parameter to externalizeString() must be a string."));
-  }
-  bool force_two_byte = false;
-  if (args.Length() >= 2) {
-    if (args[1]->IsBoolean()) {
-      force_two_byte = args[1]->BooleanValue();
-    } else {
-      return v8::ThrowException(v8::String::New(
-          "Second parameter to externalizeString() must be a boolean."));
-    }
-  }
-  bool result = false;
-  Handle<String> string = Utils::OpenHandle(*args[0].As<v8::String>());
-  if (string->IsExternalString()) {
-    return v8::ThrowException(v8::String::New(
-        "externalizeString() can't externalize twice."));
-  }
-  if (string->IsAsciiRepresentation() && !force_two_byte) {
-    char* data = new char[string->length()];
-    String::WriteToFlat(*string, data, 0, string->length());
-    SimpleAsciiStringResource* resource = new SimpleAsciiStringResource(
-        data, string->length());
-    result = string->MakeExternal(resource);
-    if (result && !string->IsSymbol()) {
-      i::ExternalStringTable::AddString(*string);
-    }
-    if (!result) delete resource;
-  } else {
-    uc16* data = new uc16[string->length()];
-    String::WriteToFlat(*string, data, 0, string->length());
-    SimpleTwoByteStringResource* resource = new SimpleTwoByteStringResource(
-        data, string->length());
-    result = string->MakeExternal(resource);
-    if (result && !string->IsSymbol()) {
-      i::ExternalStringTable::AddString(*string);
-    }
-    if (!result) delete resource;
-  }
-  if (!result) {
-    return v8::ThrowException(v8::String::New("externalizeString() failed."));
-  }
-  return v8::Undefined();
-}
-
-
-v8::Handle<v8::Value> ExternalizeStringExtension::IsAscii(
-    const v8::Arguments& args) {
-  if (args.Length() != 1 || !args[0]->IsString()) {
-    return v8::ThrowException(v8::String::New(
-        "isAsciiString() requires a single string argument."));
-  }
-  return Utils::OpenHandle(*args[0].As<v8::String>())->IsAsciiRepresentation() ?
-      v8::True() : v8::False();
-}
-
-
-static ExternalizeStringExtension externalize_extension;
-static v8::DeclareExtension externalize_extension_declaration(
-    &externalize_extension);
 
 } }  // namespace v8::internal
