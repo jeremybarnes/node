@@ -138,6 +138,10 @@ Buffer* Buffer::New(size_t length) {
   Local<Object> b = constructor_template->GetFunction()->NewInstance(1, &arg);
   if (b.IsEmpty()) return NULL;
 
+  // If the constructor threw an exception, we can't use the returned value
+  if (b.IsEmpty())
+      return 0;
+
   return ObjectWrap::Unwrap<Buffer>(b);
 }
 
@@ -147,6 +151,10 @@ Buffer* Buffer::New(char* data, size_t length) {
 
   Local<Value> arg = Integer::NewFromUnsigned(0);
   Local<Object> obj = constructor_template->GetFunction()->NewInstance(1, &arg);
+
+  // If the constructor threw an exception, we can't use the returned value
+  if (obj.IsEmpty())
+      return 0;
 
   Buffer *buffer = ObjectWrap::Unwrap<Buffer>(obj);
   buffer->Replace(data, length, NULL, NULL);
@@ -161,6 +169,10 @@ Buffer* Buffer::New(char *data, size_t length,
 
   Local<Value> arg = Integer::NewFromUnsigned(0);
   Local<Object> obj = constructor_template->GetFunction()->NewInstance(1, &arg);
+
+  // If the constructor threw an exception, we can't use the returned value
+  if (obj.IsEmpty())
+      return 0;
 
   Buffer *buffer = ObjectWrap::Unwrap<Buffer>(obj);
   buffer->Replace(data, length, callback, hint);
