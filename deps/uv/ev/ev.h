@@ -180,8 +180,13 @@ struct ev_loop;
 
 /* EV_INLINE is used for functions in header files */
 #if __STDC_VERSION__ >= 199901L && __GNUC__ >= 3
-# define EV_INLINE inline
+# define EV_INLINE static inline
 #else
+# define EV_INLINE static inline
+#endif
+
+#ifdef __cplusplus
+# undef EV_INLINE
 # define EV_INLINE inline
 #endif
 
