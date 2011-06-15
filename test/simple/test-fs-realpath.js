@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 var fs = require('fs');
@@ -363,6 +384,31 @@ function test_abs_with_kids(cb) {
   });
 }
 
+function test_lying_cache_liar(cb) {
+  // this should not require *any* stat calls, since everything
+  // checked by realpath will be found in the cache.
+  console.log('test_lying_cache_liar');
+  var cache = { '/foo/bar/baz/bluff' : '/foo/bar/bluff',
+                '/1/2/3/4/5/6/7' : '/1',
+                '/a' : '/a',
+                '/a/b' : '/a/b',
+                '/a/b/c' : '/a/b',
+                '/a/b/d' : '/a/b/d' };
+  var rps = fs.realpathSync('/foo/bar/baz/bluff', cache);
+  assert.equal(cache['/foo/bar/baz/bluff'], rps);
+  fs.realpath('/1/2/3/4/5/6/7', cache, function(er, rp) {
+    assert.equal(cache['/1/2/3/4/5/6/7'], rp);
+  });
+
+  var test = '/a/b/c/d',
+      expect = '/a/b/d';
+  var actual = fs.realpathSync(test, cache);
+  assert.equal(expect, actual);
+  fs.realpath(test, cache, function(er, actual) {
+    assert.equal(expect, actual);
+  });
+}
+
 // ----------------------------------------------------------------------------
 
 var tests = [
@@ -376,7 +422,8 @@ var tests = [
   test_deep_symlink_mix,
   test_non_symlinks,
   test_escape_cwd,
-  test_abs_with_kids
+  test_abs_with_kids,
+  test_lying_cache_liar
 ];
 var numtests = tests.length;
 function runNextTest(err) {

@@ -16,7 +16,7 @@ output `string` immediately to `stderr`.
 
 Output with timestamp on `stdout`.
 
-    require('util').log('Timestmaped message.');
+    require('util').log('Timestamped message.');
 
 
 ### util.inspect(object, showHidden=false, depth=2)
@@ -39,12 +39,12 @@ Example of inspecting all properties of the `util` object:
     console.log(util.inspect(util, true, null));
 
 
-### util.pump(readableStream, writeableStream, [callback])
+### util.pump(readableStream, writableStream, [callback])
 
 Experimental
 
 Read the data from `readableStream` and send it to the `writableStream`.
-When `writeableStream.write(data)` returns `false` `readableStream` will be
+When `writableStream.write(data)` returns `false` `readableStream` will be
 paused until the `drain` event occurs on the `writableStream`. `callback` gets
 an error as its only argument and is called when `writableStream` is closed or
 when an error occurs.

@@ -1,14 +1,43 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+#include <node.h>
 #include <node_buffer.h>
+
+#include <v8.h>
 
 #include <assert.h>
 #include <stdlib.h> // malloc, free
-#include <v8.h>
-
 #include <string.h> // memcpy
 
-#include <arpa/inet.h>  // htons, htonl
+#ifdef __MINGW32__
+# include <platform.h>
+# include <platform_win32_winsock.h> // htons, htonl
+#endif
 
-#include <node.h>
+#ifdef __POSIX__
+# include <arpa/inet.h> // htons, htonl
+#endif
+
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
@@ -76,6 +105,10 @@ static size_t ByteLength (Handle<String> string, enum encoding enc) {
   } else if (enc == BASE64) {
     String::Utf8Value v(string);
     return base64_decoded_size(*v, v.length());
+  } else if (enc == UCS2) {
+    return string->Length() * 2;
+  } else if (enc == HEX) {
+    return string->Length() / 2;
   } else {
     return string->Length();
   }
@@ -103,6 +136,7 @@ Buffer* Buffer::New(size_t length) {
 
   Local<Value> arg = Integer::NewFromUnsigned(length);
   Local<Object> b = constructor_template->GetFunction()->NewInstance(1, &arg);
+  if (b.IsEmpty()) return NULL;
 
   return ObjectWrap::Unwrap<Buffer>(b);
 }
@@ -237,6 +271,15 @@ Handle<Value> Buffer::Utf8Slice(const Arguments &args) {
   return scope.Close(string);
 }
 
+Handle<Value> Buffer::Ucs2Slice(const Arguments &args) {
+  HandleScope scope;
+  Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
+  SLICE_ARGS(args[0], args[1])
+  uint16_t *data = (uint16_t*)(parent->data_ + start);
+  Local<String> string = String::New(data, (end - start) / 2);
+  return scope.Close(string);
+}
+
 static const char *base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                   "abcdefghijklmnopqrstuvwxyz"
                                   "0123456789+/";
@@ -330,6 +373,27 @@ Handle<Value> Buffer::Base64Slice(const Arguments &args) {
   Local<String> string = String::New(out, out_len);
   delete [] out;
   return scope.Close(string);
+}
+
+
+// buffer.fill(value, start, end);
+Handle<Value> Buffer::Fill(const Arguments &args) {
+  HandleScope scope;
+
+  if (!args[0]->IsInt32()) {
+    return ThrowException(Exception::Error(String::New(
+            "value is not a number")));
+  }
+  int value = (char)args[0]->Int32Value();
+
+  Buffer *parent = ObjectWrap::Unwrap<Buffer>(args.This());
+  SLICE_ARGS(args[1], args[2])
+
+  memset( (void*)(parent->data_ + start),
+          value,
+          end - start);
+
+  return Undefined();
 }
 
 
@@ -430,6 +494,43 @@ Handle<Value> Buffer::Utf8Write(const Arguments &args) {
   if (written > 0 && p[written-1] == '\0') written--;
 
   return scope.Close(Integer::New(written));
+}
+
+
+// var charsWritten = buffer.ucs2Write(string, offset, [maxLength]);
+Handle<Value> Buffer::Ucs2Write(const Arguments &args) {
+  HandleScope scope;
+  Buffer *buffer = ObjectWrap::Unwrap<Buffer>(args.This());
+
+  if (!args[0]->IsString()) {
+    return ThrowException(Exception::TypeError(String::New(
+            "Argument must be a string")));
+  }
+
+  Local<String> s = args[0]->ToString();
+
+  size_t offset = args[1]->Uint32Value();
+
+  if (s->Length() > 0 && offset >= buffer->length_) {
+    return ThrowException(Exception::TypeError(String::New(
+            "Offset is out of bounds")));
+  }
+
+  size_t max_length = args[2]->IsUndefined() ? buffer->length_ - offset
+                                             : args[2]->Uint32Value();
+  max_length = MIN(buffer->length_ - offset, max_length) / 2;
+
+  uint16_t* p = (uint16_t*)(buffer->data_ + offset);
+
+  int written = s->Write(p,
+                         0,
+                         max_length,
+                         String::HINT_MANY_WRITES_EXPECTED);
+
+  constructor_template->GetFunction()->Set(chars_written_sym,
+                                           Integer::New(written));
+
+  return scope.Close(Integer::New(written * 2));
 }
 
 
@@ -601,6 +702,11 @@ Handle<Value> Buffer::ByteLength(const Arguments &args) {
 Handle<Value> Buffer::MakeFastBuffer(const Arguments &args) {
   HandleScope scope;
 
+  if (!Buffer::HasInstance(args[0])) {
+    return ThrowException(Exception::TypeError(String::New(
+            "First argument must be a Buffer")));
+  }
+
   Buffer *buffer = ObjectWrap::Unwrap<Buffer>(args[0]->ToObject());
   Local<Object> fast_buffer = args[1]->ToObject();;
   uint32_t offset = args[2]->Uint32Value();
@@ -644,6 +750,7 @@ void Buffer::Initialize(Handle<Object> target) {
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "binarySlice", Buffer::BinarySlice);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "asciiSlice", Buffer::AsciiSlice);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "base64Slice", Buffer::Base64Slice);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "ucs2Slice", Buffer::Ucs2Slice);
   // TODO NODE_SET_PROTOTYPE_METHOD(t, "utf16Slice", Utf16Slice);
   // copy
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "utf8Slice", Buffer::Utf8Slice);
@@ -652,6 +759,8 @@ void Buffer::Initialize(Handle<Object> target) {
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "asciiWrite", Buffer::AsciiWrite);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "binaryWrite", Buffer::BinaryWrite);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "base64Write", Buffer::Base64Write);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "ucs2Write", Buffer::Ucs2Write);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "fill", Buffer::Fill);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "copy", Buffer::Copy);
 
   NODE_SET_METHOD(constructor_template->GetFunction(),

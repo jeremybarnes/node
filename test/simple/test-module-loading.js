@@ -1,9 +1,38 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 var path = require('path');
 var fs = require('fs');
 
 common.debug('load test-module-loading.js');
+
+// assert that this is the main module.
+assert.equal(require.main.id, '.', 'main module should have id of \'.\'');
+assert.equal(require.main, module, 'require.main should === module');
+assert.equal(process.mainModule, module,
+             'process.mainModule should === module');
+// assert that it's *not* the main module in the required module.
+require('../fixtures/not-main-module.js');
 
 // require a file with a request that includes the extension
 var a_js = require('../fixtures/a.js');
@@ -52,11 +81,29 @@ var one = require('../fixtures/nested-index/one'),
     two = require('../fixtures/nested-index/two');
 assert.notEqual(one.hello, two.hello);
 
+common.debug('test index.js in a folder with a trailing slash');
+var three = require('../fixtures/nested-index/three'),
+    threeFolder = require('../fixtures/nested-index/three/'),
+    threeIndex = require('../fixtures/nested-index/three/index.js');
+assert.equal(threeFolder, threeIndex);
+assert.notEqual(threeFolder, three);
+
+common.debug('test package.json require() loading');
+assert.equal(require('../fixtures/packages/main').ok, 'ok',
+             'Failed loading package');
+assert.equal(require('../fixtures/packages/main-index').ok, 'ok',
+             'Failed loading package with index.js in main subdir');
+
 common.debug('test cycles containing a .. path');
 var root = require('../fixtures/cycles/root'),
     foo = require('../fixtures/cycles/folder/foo');
 assert.equal(root.foo, foo);
 assert.equal(root.sayHello(), root.hello);
+
+common.debug('test node_modules folders');
+// asserts are in the fixtures files themselves,
+// since they depend on the folder structure.
+require('../fixtures/node_modules/foo');
 
 common.debug('test name clashes');
 // this one exists and should import the local module
@@ -100,7 +147,7 @@ common.debug('load modules by absolute id, then change require.paths, ' +
              'and load another module with the same absolute id.');
 // this will throw if it fails.
 var foo = require('../fixtures/require-path/p1/foo');
-process.assert(foo.bar.expect === foo.bar.actual);
+assert.ok(foo.bar.expect === foo.bar.actual);
 
 assert.equal(require('../fixtures/foo').foo, 'ok',
              'require module with no extension');
@@ -139,6 +186,26 @@ try {
 }
 assert.equal(require(loadOrder + 'file8').file8, 'file8/index.reg', msg);
 assert.equal(require(loadOrder + 'file9').file9, 'file9/index.reg2', msg);
+
+
+// test the async module definition pattern modules
+var amdFolder = '../fixtures/amd-modules';
+var amdreg = require(amdFolder + '/regular.js');
+assert.deepEqual(amdreg.ok, {ok: true}, 'regular amd module failed');
+
+// make sure they all get the same 'ok' object.
+var amdModuleExports = require(amdFolder + '/module-exports.js');
+assert.equal(amdModuleExports.ok, amdreg.ok, 'amd module.exports failed');
+
+var amdReturn = require(amdFolder + '/return.js');
+assert.equal(amdReturn.ok, amdreg.ok, 'amd return failed');
+
+var amdObj = require(amdFolder + '/object.js');
+assert.equal(amdObj.ok, amdreg.ok, 'amd object literal failed');
+
+var amdExtraArgs = require(amdFolder + '/extra-args.js');
+assert.equal(amdExtraArgs.ok, amdreg.ok, 'amd extra args failed');
+
 
 process.addListener('exit', function() {
   assert.ok(common.indirectInstanceOf(a.A, Function));

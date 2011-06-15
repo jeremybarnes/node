@@ -28,7 +28,9 @@
 #ifndef V8_V8_COUNTERS_H_
 #define V8_V8_COUNTERS_H_
 
+#include "allocation.h"
 #include "counters.h"
+#include "v8globals.h"
 
 namespace v8 {
 namespace internal {
@@ -126,6 +128,7 @@ namespace internal {
   SC(gc_last_resort_from_handles, V8.GCLastResortFromHandles)         \
   SC(map_slow_to_fast_elements, V8.MapSlowToFastElements)             \
   SC(map_fast_to_slow_elements, V8.MapFastToSlowElements)             \
+  SC(map_to_pixel_array_elements, V8.MapToPixelArrayElements)         \
   /* How is the generic keyed-load stub used? */                      \
   SC(keyed_load_generic_smi, V8.KeyedLoadGenericSmi)                  \
   SC(keyed_load_generic_symbol, V8.KeyedLoadGenericSymbol)            \

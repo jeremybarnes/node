@@ -2,6 +2,14 @@ WAF=python tools/waf-light
 
 web_root = ryan@nodejs.org:~/web/nodejs.org/
 
+#
+# Because we recursively call make from waf we need to make sure that we are
+# using the correct make. Not all makes are GNU Make, but this likely only
+# works with gnu make. To deal with this we remember how the user invoked us
+# via a make builtin variable and use that in all subsequent operations
+#
+export NODE_MAKE := $(MAKE)
+
 all: program
 
 all-progress:
@@ -25,8 +33,14 @@ uninstall:
 test: all
 	python tools/test.py --mode=release simple message
 
+test-valgrind: all
+	python tools/test.py --mode=release --valgrind simple message
+
 test-all: all
 	python tools/test.py --mode=debug,release
+
+test-all-valgrind: all
+	python tools/test.py --mode=debug,release --valgrind
 
 test-release: all
 	python tools/test.py --mode=release
@@ -57,15 +71,17 @@ apiassets = $(subst api_assets,api/assets,$(addprefix build/,$(wildcard doc/api_
 
 website_files = \
 	build/doc/index.html    \
+	build/doc/v0.4_announcement.html   \
 	build/doc/cla.html      \
 	build/doc/sh_main.js    \
 	build/doc/sh_javascript.min.js \
 	build/doc/sh_vim-dark.css \
 	build/doc/logo.png      \
 	build/doc/sponsored.png \
+  build/doc/favicon.ico   \
 	build/doc/pipe.css
 
-doc: build/default/node $(apidoc_dirs) $(website_files) $(apiassets) $(apidocs) build/doc/changelog.html
+doc: build/default/node $(apidoc_dirs) $(website_files) $(apiassets) $(apidocs)
 
 $(apidoc_dirs):
 	mkdir -p $@
@@ -79,13 +95,6 @@ build/doc/%: doc/%
 build/doc/api/%.html: doc/api/%.markdown build/default/node $(apidoc_dirs) $(apiassets) tools/doctool/doctool.js
 	build/default/node tools/doctool/doctool.js doc/template.html $< > $@
 
-build/doc/changelog.html: ChangeLog build/default/node build/doc/ $(apidoc_dirs) $(apiassets) tools/doctool/doctool.js
-	build/default/node tools/doctool/doctool.js doc/template.html $< \
-	| sed 's|assets/|api/assets/|g' \
-	| sed 's|<body>|<body id="changelog">|g' > $@
-	@echo $(apiassets)
-
-
 build/doc/%:
 
 website-upload: doc
@@ -98,12 +107,12 @@ docclean:
 	-rm -rf build/doc
 
 clean:
-	@$(WAF) clean
-	@-find tools -name "*.pyc" | xargs rm -f
+	$(WAF) clean
+	-find tools -name "*.pyc" | xargs rm -f
 
 distclean: docclean
-	@-find tools -name "*.pyc" | xargs rm -f
-	@-rm -rf build/ node node_g
+	-find tools -name "*.pyc" | xargs rm -f
+	-rm -rf build/ node node_g
 
 check:
 	@tools/waf-light check

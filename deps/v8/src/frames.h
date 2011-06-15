@@ -28,6 +28,8 @@
 #ifndef V8_FRAMES_H_
 #define V8_FRAMES_H_
 
+#include "safepoint-table.h"
+
 namespace v8 {
 namespace internal {
 
@@ -51,7 +53,7 @@ class PcToCodeCache : AllStatic {
   struct PcToCodeCacheEntry {
     Address pc;
     Code* code;
-    uint8_t* safepoint_entry;
+    SafepointEntry safepoint_entry;
   };
 
   static PcToCodeCacheEntry* cache(int index) {
@@ -208,7 +210,7 @@ class StackFrame BASE_EMBEDDED {
   // safepoint entry and the number of stack slots. The pc must be at
   // a safepoint.
   static Code* GetSafepointData(Address pc,
-                                uint8_t** safepoint_entry,
+                                SafepointEntry* safepoint_entry,
                                 unsigned* stack_slots);
 
   virtual void Iterate(ObjectVisitor* v) const = 0;
@@ -447,14 +449,11 @@ class JavaScriptFrame: public StandardFrame {
   inline void set_receiver(Object* value);
 
   // Access the parameters.
-  Object* GetParameter(int index) const;
-  int ComputeParametersCount() const;
-
-  // Temporary way of getting access to the number of parameters
-  // passed on the stack by the caller. Once argument adaptor frames
-  // has been introduced on ARM, this number will always match the
-  // computed parameters count.
-  int GetProvidedParametersCount() const;
+  inline Address GetParameterSlot(int index) const;
+  inline Object* GetParameter(int index) const;
+  inline int ComputeParametersCount() const {
+    return GetNumberOfIncomingArguments();
+  }
 
   // Check if this frame is a constructor frame invoked through 'new'.
   bool IsConstructor() const;
@@ -491,6 +490,8 @@ class JavaScriptFrame: public StandardFrame {
       : StandardFrame(iterator) { }
 
   virtual Address GetCallerStackPointer() const;
+
+  virtual int GetNumberOfIncomingArguments() const;
 
   // Garbage collection support. Iterates over incoming arguments,
   // receiver, and any callee-saved registers.
@@ -551,6 +552,10 @@ class ArgumentsAdaptorFrame: public JavaScriptFrame {
  protected:
   explicit ArgumentsAdaptorFrame(StackFrameIterator* iterator)
       : JavaScriptFrame(iterator) { }
+
+  virtual int GetNumberOfIncomingArguments() const {
+    return Smi::cast(GetExpression(0))->value();
+  }
 
   virtual Address GetCallerStackPointer() const;
 

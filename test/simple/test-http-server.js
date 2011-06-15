@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 var net = require('net');
@@ -48,6 +69,8 @@ var server = http.createServer(function(req, res) {
 });
 server.listen(common.PORT);
 
+server.httpAllowHalfOpen = true;
+
 server.addListener('listening', function() {
   var c = net.createConnection(common.PORT);
 
@@ -69,6 +92,12 @@ server.addListener('listening', function() {
     if (requests_sent == 2) {
       c.write('GET / HTTP/1.1\r\nX-X: foo\r\n\r\n' +
               'GET / HTTP/1.1\r\nX-X: bar\r\n\r\n');
+      // Note: we are making the connection half-closed here
+      // before we've gotten the response from the server. This
+      // is a pretty bad thing to do and not really supported
+      // by many http servers. Node supports it optionally if
+      // you set server.httpAllowHalfOpen=true, which we've done
+      // above.
       c.end();
       assert.equal(c.readyState, 'readOnly');
       requests_sent += 2;

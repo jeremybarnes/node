@@ -27,6 +27,7 @@
 
 #include <v8.h>
 #include <v8-testing.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
@@ -45,7 +46,6 @@ v8::Handle<v8::Value> Quit(const v8::Arguments& args);
 v8::Handle<v8::Value> Version(const v8::Arguments& args);
 v8::Handle<v8::String> ReadFile(const char* name);
 void ReportException(v8::TryCatch* handler);
-void SetFlagsFromString(const char* flags);
 
 
 int RunMain(int argc, char* argv[]) {
@@ -291,11 +291,13 @@ bool ExecuteString(v8::Handle<v8::String> source,
   } else {
     v8::Handle<v8::Value> result = script->Run();
     if (result.IsEmpty()) {
+      assert(try_catch.HasCaught());
       // Print errors that happened during execution.
       if (report_exceptions)
         ReportException(&try_catch);
       return false;
     } else {
+      assert(!try_catch.HasCaught());
       if (print_result && !result->IsUndefined()) {
         // If all went well and the result wasn't undefined then print
         // the returned value.
@@ -344,9 +346,4 @@ void ReportException(v8::TryCatch* try_catch) {
       printf("%s\n", stack_trace_string);
     }
   }
-}
-
-
-void SetFlagsFromString(const char* flags) {
-  v8::V8::SetFlagsFromString(flags, strlen(flags));
 }

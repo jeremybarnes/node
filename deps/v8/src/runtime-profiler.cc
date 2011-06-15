@@ -35,6 +35,7 @@
 #include "deoptimizer.h"
 #include "execution.h"
 #include "global-handles.h"
+#include "mark-compact.h"
 #include "scopeinfo.h"
 #include "top.h"
 
@@ -68,12 +69,18 @@ class PendingListNode : public Malloced {
 };
 
 
+enum SamplerState {
+  IN_NON_JS_STATE = 0,
+  IN_JS_STATE = 1
+};
+
+
 // Optimization sampler constants.
 static const int kSamplerFrameCount = 2;
 static const int kSamplerFrameWeight[kSamplerFrameCount] = { 2, 1 };
 static const int kSamplerWindowSize = 16;
 
-static const int kSamplerTicksDelta = 32;
+static const int kSamplerTicksBetweenThresholdAdjustment = 32;
 
 static const int kSamplerThresholdInit = 3;
 static const int kSamplerThresholdMin = 1;
@@ -88,12 +95,12 @@ static const int kSizeLimit = 1500;
 static int sampler_threshold = kSamplerThresholdInit;
 static int sampler_threshold_size_factor = kSamplerThresholdSizeFactorInit;
 
+static int sampler_ticks_until_threshold_adjustment =
+    kSamplerTicksBetweenThresholdAdjustment;
 
-// The JSFunctions in the sampler window are not GC safe. Old-space
-// pointers are not cleared during mark-sweep collection and therefore
-// the window might contain stale pointers. The window is updated on
-// scavenges and (parts of it) cleared on mark-sweep and
-// mark-sweep-compact.
+// The ratio of ticks spent in JS code in percent.
+static Atomic32 js_ratio;
+
 static Object* sampler_window[kSamplerWindowSize] = { NULL, };
 static int sampler_window_position = 0;
 static int sampler_window_weight[kSamplerWindowSize] = { 0, };
@@ -154,8 +161,10 @@ static void AttemptOnStackReplacement(JSFunction* function) {
   }
 
   SharedFunctionInfo* shared = function->shared();
-  // If the code is not optimizable, don't try OSR.
-  if (!shared->code()->optimizable()) return;
+  // If the code is not optimizable or references context slots, don't try OSR.
+  if (!shared->code()->optimizable() || !shared->allows_lazy_compilation()) {
+    return;
+  }
 
   // We are not prepared to do OSR for a function that already has an
   // allocated arguments object.  The optimized code would bypass it for
@@ -179,22 +188,9 @@ static void AttemptOnStackReplacement(JSFunction* function) {
   if (maybe_check_code->ToObject(&check_code)) {
     Code* replacement_code = Builtins::builtin(Builtins::OnStackReplacement);
     Code* unoptimized_code = shared->code();
-    // Iterate the unoptimized code and patch every stack check except at
-    // the function entry.  This code assumes the function entry stack
-    // check appears first i.e., is not deferred or otherwise reordered.
-    bool first = true;
-    for (RelocIterator it(unoptimized_code, RelocInfo::kCodeTargetMask);
-         !it.done();
-         it.next()) {
-      RelocInfo* rinfo = it.rinfo();
-      if (rinfo->target_address() == Code::cast(check_code)->entry()) {
-        if (first) {
-          first = false;
-        } else {
-          Deoptimizer::PatchStackCheckCode(rinfo, replacement_code);
-        }
-      }
-    }
+    Deoptimizer::PatchStackCheckCode(unoptimized_code,
+                                     Code::cast(check_code),
+                                     replacement_code);
   }
 }
 
@@ -203,16 +199,6 @@ static void ClearSampleBuffer() {
   for (int i = 0; i < kSamplerWindowSize; i++) {
     sampler_window[i] = NULL;
     sampler_window_weight[i] = 0;
-  }
-}
-
-
-static void ClearSampleBufferNewSpaceEntries() {
-  for (int i = 0; i < kSamplerWindowSize; i++) {
-    if (Heap::InNewSpace(sampler_window[i])) {
-      sampler_window[i] = NULL;
-      sampler_window_weight[i] = 0;
-    }
   }
 }
 
@@ -261,40 +247,71 @@ void RuntimeProfiler::OptimizeNow() {
   // have a sample of the function, we mark it for optimizations
   // (eagerly or lazily).
   JSFunction* samples[kSamplerFrameCount];
-  int count = 0;
+  int sample_count = 0;
+  int frame_count = 0;
   for (JavaScriptFrameIterator it;
-       count < kSamplerFrameCount && !it.done();
+       frame_count++ < kSamplerFrameCount && !it.done();
        it.Advance()) {
     JavaScriptFrame* frame = it.frame();
     JSFunction* function = JSFunction::cast(frame->function());
-    int function_size = function->shared()->SourceSize();
-    int threshold_size_factor;
-    if (function_size > kSizeLimit) {
-      threshold_size_factor = sampler_threshold_size_factor;
-    } else {
-      threshold_size_factor = 1;
+
+    // Adjust threshold each time we have processed
+    // a certain number of ticks.
+    if (sampler_ticks_until_threshold_adjustment > 0) {
+      sampler_ticks_until_threshold_adjustment--;
+      if (sampler_ticks_until_threshold_adjustment <= 0) {
+        // If the threshold is not already at the minimum
+        // modify and reset the ticks until next adjustment.
+        if (sampler_threshold > kSamplerThresholdMin) {
+          sampler_threshold -= kSamplerThresholdDelta;
+          sampler_ticks_until_threshold_adjustment =
+              kSamplerTicksBetweenThresholdAdjustment;
+        }
+      }
     }
 
-    int threshold = sampler_threshold * threshold_size_factor;
-    samples[count++] = function;
     if (function->IsMarkedForLazyRecompilation()) {
       Code* unoptimized = function->shared()->code();
       int nesting = unoptimized->allow_osr_at_loop_nesting_level();
       if (nesting == 0) AttemptOnStackReplacement(function);
       int new_nesting = Min(nesting + 1, Code::kMaxLoopNestingMarker);
       unoptimized->set_allow_osr_at_loop_nesting_level(new_nesting);
-    } else if (LookupSample(function) >= threshold) {
-      if (IsOptimizable(function)) {
-        Optimize(function, false, 0);
-        CompilationCache::MarkForEagerOptimizing(Handle<JSFunction>(function));
-      }
+    }
+
+    // Do not record non-optimizable functions.
+    if (!IsOptimizable(function)) continue;
+    samples[sample_count++] = function;
+
+    int function_size = function->shared()->SourceSize();
+    int threshold_size_factor = (function_size > kSizeLimit)
+        ? sampler_threshold_size_factor
+        : 1;
+
+    int threshold = sampler_threshold * threshold_size_factor;
+    int current_js_ratio = NoBarrier_Load(&js_ratio);
+
+    // Adjust threshold depending on the ratio of time spent
+    // in JS code.
+    if (current_js_ratio < 20) {
+      // If we spend less than 20% of the time in JS code,
+      // do not optimize.
+      continue;
+    } else if (current_js_ratio < 75) {
+      // Below 75% of time spent in JS code, only optimize very
+      // frequently used functions.
+      threshold *= 3;
+    }
+
+    if (LookupSample(function) >= threshold) {
+      Optimize(function, false, 0);
+      CompilationCache::MarkForEagerOptimizing(Handle<JSFunction>(function));
     }
   }
 
   // Add the collected functions as samples. It's important not to do
   // this as part of collecting them because this will interfere with
   // the sample lookup in case of recursive functions.
-  for (int i = 0; i < count; i++) {
+  for (int i = 0; i < sample_count; i++) {
     AddSample(samples[i], kSamplerFrameWeight[i]);
   }
 }
@@ -308,26 +325,35 @@ void RuntimeProfiler::OptimizeSoon(JSFunction* function) {
 }
 
 
+#ifdef ENABLE_LOGGING_AND_PROFILING
+static void UpdateStateRatio(SamplerState current_state) {
+  static const int kStateWindowSize = 128;
+  static SamplerState state_window[kStateWindowSize];
+  static int state_window_position = 0;
+  static int state_counts[2] = { kStateWindowSize, 0 };
+
+  SamplerState old_state = state_window[state_window_position];
+  state_counts[old_state]--;
+  state_window[state_window_position] = current_state;
+  state_counts[current_state]++;
+  ASSERT(IsPowerOf2(kStateWindowSize));
+  state_window_position = (state_window_position + 1) &
+      (kStateWindowSize - 1);
+  NoBarrier_Store(&js_ratio, state_counts[IN_JS_STATE] * 100 /
+                  kStateWindowSize);
+}
+#endif
+
+
 void RuntimeProfiler::NotifyTick() {
+#ifdef ENABLE_LOGGING_AND_PROFILING
+  // Record state sample.
+  SamplerState state = Top::IsInJSState()
+      ? IN_JS_STATE
+      : IN_NON_JS_STATE;
+  UpdateStateRatio(state);
   StackGuard::RequestRuntimeProfilerTick();
-}
-
-
-void RuntimeProfiler::MarkCompactPrologue(bool is_compacting) {
-  if (is_compacting) {
-    // Clear all samples before mark-sweep-compact because every
-    // function might move.
-    ClearSampleBuffer();
-  } else {
-    // Clear only new space entries on mark-sweep since none of the
-    // old-space functions will move.
-    ClearSampleBufferNewSpaceEntries();
-  }
-}
-
-
-bool IsEqual(void* first, void* second) {
-  return first == second;
+#endif
 }
 
 
@@ -341,6 +367,8 @@ void RuntimeProfiler::Setup() {
 
 void RuntimeProfiler::Reset() {
   sampler_threshold = kSamplerThresholdInit;
+  sampler_ticks_until_threshold_adjustment =
+      kSamplerTicksBetweenThresholdAdjustment;
   sampler_threshold_size_factor = kSamplerThresholdSizeFactorInit;
 }
 
@@ -350,17 +378,46 @@ void RuntimeProfiler::TearDown() {
 }
 
 
-Object** RuntimeProfiler::SamplerWindowAddress() {
-  return sampler_window;
-}
-
-
 int RuntimeProfiler::SamplerWindowSize() {
   return kSamplerWindowSize;
 }
 
 
+// Update the pointers in the sampler window after a GC.
+void RuntimeProfiler::UpdateSamplesAfterScavenge() {
+  for (int i = 0; i < kSamplerWindowSize; i++) {
+    Object* function = sampler_window[i];
+    if (function != NULL && Heap::InNewSpace(function)) {
+      MapWord map_word = HeapObject::cast(function)->map_word();
+      if (map_word.IsForwardingAddress()) {
+        sampler_window[i] = map_word.ToForwardingAddress();
+      } else {
+        sampler_window[i] = NULL;
+      }
+    }
+  }
+}
+
+
+void RuntimeProfiler::RemoveDeadSamples() {
+  for (int i = 0; i < kSamplerWindowSize; i++) {
+    Object* function = sampler_window[i];
+    if (function != NULL && !HeapObject::cast(function)->IsMarked()) {
+      sampler_window[i] = NULL;
+    }
+  }
+}
+
+
+void RuntimeProfiler::UpdateSamplesAfterCompact(ObjectVisitor* visitor) {
+  for (int i = 0; i < kSamplerWindowSize; i++) {
+    visitor->VisitPointer(&sampler_window[i]);
+  }
+}
+
+
 bool RuntimeProfilerRateLimiter::SuspendIfNecessary() {
+#ifdef ENABLE_LOGGING_AND_PROFILING
   static const int kNonJSTicksThreshold = 100;
   // We suspend the runtime profiler thread when not running
   // JavaScript. If the CPU profiler is active we must not do this
@@ -378,6 +435,7 @@ bool RuntimeProfilerRateLimiter::SuspendIfNecessary() {
       }
     }
   }
+#endif
   return false;
 }
 

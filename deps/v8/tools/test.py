@@ -729,6 +729,9 @@ class Variable(Expression):
     if self.name in env: return ListSet([env[self.name]])
     else: return Nothing()
 
+  def Evaluate(self, env, defs):
+    return env[self.name]
+
 
 class Outcome(Expression):
 
@@ -1175,6 +1178,17 @@ def BuildOptions():
   result.add_option("--nostress",
                     help="Don't run crankshaft --always-opt --stress-op test",
                     default=False, action="store_true")
+  result.add_option("--crankshaft",
+                    help="Run with the --crankshaft flag",
+                    default=False, action="store_true")
+  result.add_option("--shard-count",
+                    help="Split testsuites into this number of shards",
+                    default=1, type="int")
+  result.add_option("--shard-run",
+                    help="Run this shard from the split up tests.",
+                    default=1, type="int")
+  result.add_option("--noprof", help="Disable profiling support",
+                    default=False)
   return result
 
 
@@ -1209,6 +1223,14 @@ def ProcessOptions(options):
     VARIANT_FLAGS = [['--stress-opt', '--always-opt']]
   if options.nostress:
     VARIANT_FLAGS = [[],['--nocrankshaft']]
+  if options.crankshaft:
+    if options.special_command:
+      options.special_command += " --crankshaft"
+    else:
+      options.special_command = "@--crankshaft"
+  if options.noprof:
+    options.scons_flags.append("prof=off")
+    options.scons_flags.append("profilingsupport=off")
   return True
 
 
@@ -1286,6 +1308,20 @@ def FormatTime(d):
   millis = round(d * 1000) % 1000
   return time.strftime("%M:%S.", time.gmtime(d)) + ("%03i" % millis)
 
+def ShardTests(tests, options):
+  if options.shard_count < 2:
+    return tests
+  if options.shard_run < 1 or options.shard_run > options.shard_count:
+    print "shard-run not a valid number, should be in [1:shard-count]"
+    print "defaulting back to running all tests"
+    return tests
+  count = 0;
+  shard = []
+  for test in tests:
+    if count % options.shard_count == options.shard_run - 1:
+      shard.append(test);
+    count += 1
+  return shard
 
 def Main():
   parser = BuildOptions()
@@ -1359,7 +1395,8 @@ def Main():
         'mode': mode,
         'system': utils.GuessOS(),
         'arch': options.arch,
-        'simulator': options.simulator
+        'simulator': options.simulator,
+        'crankshaft': options.crankshaft
       }
       test_list = root.ListTests([], path, context, mode)
       unclassified_tests += test_list
@@ -1368,7 +1405,7 @@ def Main():
         globally_unused_rules = set(unused_rules)
       else:
         globally_unused_rules = globally_unused_rules.intersection(unused_rules)
-      all_cases += cases
+      all_cases += ShardTests(cases, options)
       all_unused.append(unused_rules)
 
   if options.cat:

@@ -51,6 +51,19 @@ signed by one of the specified CAs. If `s.authorized === false` then the error
 can be found in `s.authorizationError`.
 
 
+### STARTTLS
+
+In the v0.4 branch no function exists for starting a TLS session on an
+already existing TCP connection.  This is possible it just requires a bit of
+work. The technique is to use `tls.createSecurePair()` which returns two
+streams: an encrypted stream and a plaintext stream. The encrypted stream is then
+piped to the socket, the plaintext stream is what the user interacts with thereafter.
+
+[Here is some code that does it.](http://gist.github.com/848444)
+
+
+
+
 ### tls.Server
 
 This class is a subclass of `net.Server` and has the same methods on it.
@@ -112,7 +125,7 @@ handshaked. The argument is a duplex instance of `stream.Stream`. It has all
 the common stream methods and events.
 
 `cleartextStream.authorized` is a boolean value which indicates if the
-client has verified by one of the supplied cerificate authorities for the
+client has verified by one of the supplied certificate authorities for the
 server. If `cleartextStream.authorized` is false, then
 `cleartextStream.authorizationError` is set to describe how authorization
 failed. Implied but worth mentioning: depending on the settings of the TLS

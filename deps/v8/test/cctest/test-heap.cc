@@ -212,13 +212,14 @@ TEST(GarbageCollection) {
     Handle<Map> initial_map =
         Factory::NewMap(JS_OBJECT_TYPE, JSObject::kHeaderSize);
     function->set_initial_map(*initial_map);
-    Top::context()->global()->SetProperty(*name,
-                                          *function,
-                                          NONE)->ToObjectChecked();
+    Top::context()->global()->SetProperty(
+        *name, *function, NONE, kNonStrictMode)->ToObjectChecked();
     // Allocate an object.  Unrooted after leaving the scope.
     Handle<JSObject> obj = Factory::NewJSObject(function);
-    obj->SetProperty(*prop_name, Smi::FromInt(23), NONE)->ToObjectChecked();
-    obj->SetProperty(*prop_namex, Smi::FromInt(24), NONE)->ToObjectChecked();
+    obj->SetProperty(
+        *prop_name, Smi::FromInt(23), NONE, kNonStrictMode)->ToObjectChecked();
+    obj->SetProperty(
+        *prop_namex, Smi::FromInt(24), NONE, kNonStrictMode)->ToObjectChecked();
 
     CHECK_EQ(Smi::FromInt(23), obj->GetProperty(*prop_name));
     CHECK_EQ(Smi::FromInt(24), obj->GetProperty(*prop_namex));
@@ -238,10 +239,10 @@ TEST(GarbageCollection) {
     HandleScope inner_scope;
     // Allocate another object, make it reachable from global.
     Handle<JSObject> obj = Factory::NewJSObject(function);
-    Top::context()->global()->SetProperty(*obj_name,
-                                          *obj,
-                                          NONE)->ToObjectChecked();
-    obj->SetProperty(*prop_name, Smi::FromInt(23), NONE)->ToObjectChecked();
+    Top::context()->global()->SetProperty(
+        *obj_name, *obj, NONE, kNonStrictMode)->ToObjectChecked();
+    obj->SetProperty(
+        *prop_name, Smi::FromInt(23), NONE, kNonStrictMode)->ToObjectChecked();
   }
 
   // After gc, it should survive.
@@ -540,12 +541,12 @@ TEST(FunctionAllocation) {
 
   Handle<String> prop_name = Factory::LookupAsciiSymbol("theSlot");
   Handle<JSObject> obj = Factory::NewJSObject(function);
-  obj->SetProperty(*prop_name, Smi::FromInt(23), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *prop_name, Smi::FromInt(23), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK_EQ(Smi::FromInt(23), obj->GetProperty(*prop_name));
   // Check that we can add properties to function objects.
-  function->SetProperty(*prop_name,
-                        Smi::FromInt(24),
-                        NONE)->ToObjectChecked();
+  function->SetProperty(
+      *prop_name, Smi::FromInt(24), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK_EQ(Smi::FromInt(24), function->GetProperty(*prop_name));
 }
 
@@ -567,7 +568,8 @@ TEST(ObjectProperties) {
   CHECK(!obj->HasLocalProperty(*first));
 
   // add first
-  obj->SetProperty(*first, Smi::FromInt(1), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *first, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK(obj->HasLocalProperty(*first));
 
   // delete first
@@ -575,8 +577,10 @@ TEST(ObjectProperties) {
   CHECK(!obj->HasLocalProperty(*first));
 
   // add first and then second
-  obj->SetProperty(*first, Smi::FromInt(1), NONE)->ToObjectChecked();
-  obj->SetProperty(*second, Smi::FromInt(2), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *first, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
+  obj->SetProperty(
+      *second, Smi::FromInt(2), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK(obj->HasLocalProperty(*first));
   CHECK(obj->HasLocalProperty(*second));
 
@@ -588,8 +592,10 @@ TEST(ObjectProperties) {
   CHECK(!obj->HasLocalProperty(*second));
 
   // add first and then second
-  obj->SetProperty(*first, Smi::FromInt(1), NONE)->ToObjectChecked();
-  obj->SetProperty(*second, Smi::FromInt(2), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *first, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
+  obj->SetProperty(
+      *second, Smi::FromInt(2), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK(obj->HasLocalProperty(*first));
   CHECK(obj->HasLocalProperty(*second));
 
@@ -603,14 +609,16 @@ TEST(ObjectProperties) {
   // check string and symbol match
   static const char* string1 = "fisk";
   Handle<String> s1 = Factory::NewStringFromAscii(CStrVector(string1));
-  obj->SetProperty(*s1, Smi::FromInt(1), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *s1, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
   Handle<String> s1_symbol = Factory::LookupAsciiSymbol(string1);
   CHECK(obj->HasLocalProperty(*s1_symbol));
 
   // check symbol and string match
   static const char* string2 = "fugl";
   Handle<String> s2_symbol = Factory::LookupAsciiSymbol(string2);
-  obj->SetProperty(*s2_symbol, Smi::FromInt(1), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *s2_symbol, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
   Handle<String> s2 = Factory::NewStringFromAscii(CStrVector(string2));
   CHECK(obj->HasLocalProperty(*s2));
 }
@@ -631,7 +639,8 @@ TEST(JSObjectMaps) {
   Handle<JSObject> obj = Factory::NewJSObject(function);
 
   // Set a propery
-  obj->SetProperty(*prop_name, Smi::FromInt(23), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *prop_name, Smi::FromInt(23), NONE, kNonStrictMode)->ToObjectChecked();
   CHECK_EQ(Smi::FromInt(23), obj->GetProperty(*prop_name));
 
   // Check the map has changed
@@ -698,8 +707,10 @@ TEST(JSObjectCopy) {
   Handle<String> first = Factory::LookupAsciiSymbol("first");
   Handle<String> second = Factory::LookupAsciiSymbol("second");
 
-  obj->SetProperty(*first, Smi::FromInt(1), NONE)->ToObjectChecked();
-  obj->SetProperty(*second, Smi::FromInt(2), NONE)->ToObjectChecked();
+  obj->SetProperty(
+      *first, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
+  obj->SetProperty(
+      *second, Smi::FromInt(2), NONE, kNonStrictMode)->ToObjectChecked();
 
   Object* ok = obj->SetElement(0, *first)->ToObjectChecked();
 
@@ -716,8 +727,10 @@ TEST(JSObjectCopy) {
   CHECK_EQ(obj->GetProperty(*second), clone->GetProperty(*second));
 
   // Flip the values.
-  clone->SetProperty(*first, Smi::FromInt(2), NONE)->ToObjectChecked();
-  clone->SetProperty(*second, Smi::FromInt(1), NONE)->ToObjectChecked();
+  clone->SetProperty(
+      *first, Smi::FromInt(2), NONE, kNonStrictMode)->ToObjectChecked();
+  clone->SetProperty(
+      *second, Smi::FromInt(1), NONE, kNonStrictMode)->ToObjectChecked();
 
   ok = clone->SetElement(0, *second)->ToObjectChecked();
   ok = clone->SetElement(1, *first)->ToObjectChecked();
@@ -1216,7 +1229,7 @@ TEST(TestInternalWeakListsTraverseWithGC) {
 TEST(TestSizeOfObjectsVsHeapIteratorPrecision) {
   InitializeVM();
   intptr_t size_of_objects_1 = Heap::SizeOfObjects();
-  HeapIterator iterator(HeapIterator::kPreciseFiltering);
+  HeapIterator iterator(HeapIterator::kFilterFreeListNodes);
   intptr_t size_of_objects_2 = 0;
   for (HeapObject* obj = iterator.next();
        obj != NULL;
@@ -1238,5 +1251,67 @@ TEST(TestSizeOfObjectsVsHeapIteratorPrecision) {
            "delta: %" V8_PTR_PREFIX "d\n",
            size_of_objects_1, size_of_objects_2, delta);
     CHECK_GT(size_of_objects_2 / 100, delta);
+  }
+}
+
+
+class HeapIteratorTestHelper {
+ public:
+  HeapIteratorTestHelper(Object* a, Object* b)
+      : a_(a), b_(b), a_found_(false), b_found_(false) {}
+  bool a_found() { return a_found_; }
+  bool b_found() { return b_found_; }
+  void IterateHeap(HeapIterator::HeapObjectsFiltering mode) {
+    HeapIterator iterator(mode);
+    for (HeapObject* obj = iterator.next();
+         obj != NULL;
+         obj = iterator.next()) {
+      if (obj == a_)
+        a_found_ = true;
+      else if (obj == b_)
+        b_found_ = true;
+    }
+  }
+ private:
+  Object* a_;
+  Object* b_;
+  bool a_found_;
+  bool b_found_;
+};
+
+TEST(HeapIteratorFilterUnreachable) {
+  InitializeVM();
+  v8::HandleScope scope;
+  CompileRun("a = {}; b = {};");
+  v8::Handle<Object> a(Top::context()->global()->GetProperty(
+      *Factory::LookupAsciiSymbol("a"))->ToObjectChecked());
+  v8::Handle<Object> b(Top::context()->global()->GetProperty(
+      *Factory::LookupAsciiSymbol("b"))->ToObjectChecked());
+  CHECK_NE(*a, *b);
+  {
+    HeapIteratorTestHelper helper(*a, *b);
+    helper.IterateHeap(HeapIterator::kFilterUnreachable);
+    CHECK(helper.a_found());
+    CHECK(helper.b_found());
+  }
+  CHECK(Top::context()->global()->DeleteProperty(
+      *Factory::LookupAsciiSymbol("a"), JSObject::FORCE_DELETION));
+  // We ensure that GC will not happen, so our raw pointer stays valid.
+  AssertNoAllocation no_alloc;
+  Object* a_saved = *a;
+  a.Clear();
+  // Verify that "a" object still resides in the heap...
+  {
+    HeapIteratorTestHelper helper(a_saved, *b);
+    helper.IterateHeap(HeapIterator::kNoFiltering);
+    CHECK(helper.a_found());
+    CHECK(helper.b_found());
+  }
+  // ...but is now unreachable.
+  {
+    HeapIteratorTestHelper helper(a_saved, *b);
+    helper.IterateHeap(HeapIterator::kFilterUnreachable);
+    CHECK(!helper.a_found());
+    CHECK(helper.b_found());
   }
 }

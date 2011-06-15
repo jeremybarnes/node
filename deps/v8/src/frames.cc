@@ -329,21 +329,20 @@ void SafeStackTraceFrameIterator::Advance() {
 
 
 Code* StackFrame::GetSafepointData(Address pc,
-                                   uint8_t** safepoint_entry,
+                                   SafepointEntry* safepoint_entry,
                                    unsigned* stack_slots) {
   PcToCodeCache::PcToCodeCacheEntry* entry = PcToCodeCache::GetCacheEntry(pc);
-  uint8_t* cached_safepoint_entry = entry->safepoint_entry;
-  if (cached_safepoint_entry == NULL) {
-    cached_safepoint_entry = entry->code->GetSafepointEntry(pc);
-    ASSERT(cached_safepoint_entry != NULL);  // No safepoint found.
-    entry->safepoint_entry = cached_safepoint_entry;
+  SafepointEntry cached_safepoint_entry = entry->safepoint_entry;
+  if (!entry->safepoint_entry.is_valid()) {
+    entry->safepoint_entry = entry->code->GetSafepointEntry(pc);
+    ASSERT(entry->safepoint_entry.is_valid());
   } else {
-    ASSERT(cached_safepoint_entry == entry->code->GetSafepointEntry(pc));
+    ASSERT(entry->safepoint_entry.Equals(entry->code->GetSafepointEntry(pc)));
   }
 
   // Fill in the results and return the code.
   Code* code = entry->code;
-  *safepoint_entry = cached_safepoint_entry;
+  *safepoint_entry = entry->safepoint_entry;
   *stack_slots = code->stack_slots();
   return code;
 }
@@ -536,22 +535,33 @@ void OptimizedFrame::Iterate(ObjectVisitor* v) const {
 
   // Compute the safepoint information.
   unsigned stack_slots = 0;
-  uint8_t* safepoint_entry = NULL;
+  SafepointEntry safepoint_entry;
   Code* code = StackFrame::GetSafepointData(
       pc(), &safepoint_entry, &stack_slots);
   unsigned slot_space = stack_slots * kPointerSize;
 
-  // Visit the outgoing parameters. This is usually dealt with by the
-  // callee, but while GC'ing we artificially lower the number of
-  // arguments to zero and let the caller deal with it.
+  // Visit the outgoing parameters.
   Object** parameters_base = &Memory::Object_at(sp());
   Object** parameters_limit = &Memory::Object_at(
       fp() + JavaScriptFrameConstants::kFunctionOffset - slot_space);
 
+  // Visit the parameters that may be on top of the saved registers.
+  if (safepoint_entry.argument_count() > 0) {
+    v->VisitPointers(parameters_base,
+                     parameters_base + safepoint_entry.argument_count());
+    parameters_base += safepoint_entry.argument_count();
+  }
+
+  // Skip saved double registers.
+  if (safepoint_entry.has_doubles()) {
+    parameters_base += DoubleRegister::kNumAllocatableRegisters *
+        kDoubleSize / kPointerSize;
+  }
+
   // Visit the registers that contain pointers if any.
-  if (SafepointTable::HasRegisters(safepoint_entry)) {
+  if (safepoint_entry.HasRegisters()) {
     for (int i = kNumSafepointRegisters - 1; i >=0; i--) {
-      if (SafepointTable::HasRegisterAt(safepoint_entry, i)) {
+      if (safepoint_entry.HasRegisterAt(i)) {
         int reg_stack_index = MacroAssembler::SafepointRegisterStackIndex(i);
         v->VisitPointer(parameters_base + reg_stack_index);
       }
@@ -561,7 +571,8 @@ void OptimizedFrame::Iterate(ObjectVisitor* v) const {
   }
 
   // We're done dealing with the register bits.
-  safepoint_entry += kNumSafepointRegisters >> kBitsPerByteLog2;
+  uint8_t* safepoint_bits = safepoint_entry.bits();
+  safepoint_bits += kNumSafepointRegisters >> kBitsPerByteLog2;
 
   // Visit the rest of the parameters.
   v->VisitPointers(parameters_base, parameters_limit);
@@ -570,7 +581,7 @@ void OptimizedFrame::Iterate(ObjectVisitor* v) const {
   for (unsigned index = 0; index < stack_slots; index++) {
     int byte_index = index >> kBitsPerByteLog2;
     int bit_index = index & (kBitsPerByte - 1);
-    if ((safepoint_entry[byte_index] & (1U << bit_index)) != 0) {
+    if ((safepoint_bits[byte_index] & (1U << bit_index)) != 0) {
       v->VisitPointer(parameters_limit + index);
     }
   }
@@ -583,21 +594,6 @@ void OptimizedFrame::Iterate(ObjectVisitor* v) const {
 
   // Visit the return address in the callee and incoming arguments.
   IteratePc(v, pc_address(), code);
-  IterateArguments(v);
-}
-
-
-Object* JavaScriptFrame::GetParameter(int index) const {
-  ASSERT(index >= 0 && index < ComputeParametersCount());
-  const int offset = JavaScriptFrameConstants::kParam0Offset;
-  return Memory::Object_at(caller_sp() + offset - (index * kPointerSize));
-}
-
-
-int JavaScriptFrame::ComputeParametersCount() const {
-  Address base  = caller_sp() + JavaScriptFrameConstants::kReceiverOffset;
-  Address limit = fp() + JavaScriptFrameConstants::kSavedRegistersOffset;
-  return static_cast<int>((base - limit) / kPointerSize);
 }
 
 
@@ -617,32 +613,17 @@ Code* JavaScriptFrame::unchecked_code() const {
 }
 
 
-int JavaScriptFrame::GetProvidedParametersCount() const {
-  return ComputeParametersCount();
+int JavaScriptFrame::GetNumberOfIncomingArguments() const {
+  ASSERT(!SafeStackFrameIterator::is_active() &&
+         Heap::gc_state() == Heap::NOT_IN_GC);
+
+  JSFunction* function = JSFunction::cast(this->function());
+  return function->shared()->formal_parameter_count();
 }
 
 
 Address JavaScriptFrame::GetCallerStackPointer() const {
-  int arguments;
-  if (Heap::gc_state() != Heap::NOT_IN_GC ||
-      SafeStackFrameIterator::is_active()) {
-    // If the we are currently iterating the safe stack the
-    // arguments for frames are traversed as if they were
-    // expression stack elements of the calling frame. The reason for
-    // this rather strange decision is that we cannot access the
-    // function during mark-compact GCs when objects may have been marked.
-    // In fact accessing heap objects (like function->shared() below)
-    // at all during GC is problematic.
-    arguments = 0;
-  } else {
-    // Compute the number of arguments by getting the number of formal
-    // parameters of the function. We must remember to take the
-    // receiver into account (+1).
-    JSFunction* function = JSFunction::cast(this->function());
-    arguments = function->shared()->formal_parameter_count() + 1;
-  }
-  const int offset = StandardFrameConstants::kCallerSPOffset;
-  return fp() + offset + (arguments * kPointerSize);
+  return fp() + StandardFrameConstants::kCallerSPOffset;
 }
 
 
@@ -682,7 +663,7 @@ void OptimizedFrame::Summarize(List<FrameSummary>* frames) {
   ASSERT(frames->length() == 0);
   ASSERT(is_optimized());
 
-  int deopt_index = AstNode::kNoNumber;
+  int deopt_index = Safepoint::kNoDeoptimizationIndex;
   DeoptimizationInputData* data = GetDeoptimizationData(&deopt_index);
 
   // BUG(3243555): Since we don't have a lazy-deopt registered at
@@ -778,15 +759,9 @@ DeoptimizationInputData* OptimizedFrame::GetDeoptimizationData(
   ASSERT(code != NULL);
   ASSERT(code->kind() == Code::OPTIMIZED_FUNCTION);
 
-  SafepointTable table(code);
-  unsigned pc_offset = static_cast<unsigned>(pc() - code->instruction_start());
-  for (unsigned i = 0; i < table.length(); i++) {
-    if (table.GetPcOffset(i) == pc_offset) {
-      *deopt_index = table.GetDeoptimizationIndex(i);
-      break;
-    }
-  }
-  ASSERT(*deopt_index != AstNode::kNoNumber);
+  SafepointEntry safepoint_entry = code->GetSafepointEntry(pc());
+  *deopt_index = safepoint_entry.deoptimization_index();
+  ASSERT(*deopt_index != Safepoint::kNoDeoptimizationIndex);
 
   return DeoptimizationInputData::cast(code->deoptimization_data());
 }
@@ -796,7 +771,7 @@ void OptimizedFrame::GetFunctions(List<JSFunction*>* functions) {
   ASSERT(functions->length() == 0);
   ASSERT(is_optimized());
 
-  int deopt_index = AstNode::kNoNumber;
+  int deopt_index = Safepoint::kNoDeoptimizationIndex;
   DeoptimizationInputData* data = GetDeoptimizationData(&deopt_index);
 
   TranslationIterator it(data->TranslationByteArray(),
@@ -826,9 +801,7 @@ void OptimizedFrame::GetFunctions(List<JSFunction*>* functions) {
 
 
 Address ArgumentsAdaptorFrame::GetCallerStackPointer() const {
-  const int arguments = Smi::cast(GetExpression(0))->value();
-  const int offset = StandardFrameConstants::kCallerSPOffset;
-  return fp() + offset + (arguments + 1) * kPointerSize;
+  return fp() + StandardFrameConstants::kCallerSPOffset;
 }
 
 
@@ -1067,17 +1040,6 @@ void StandardFrame::IterateExpressions(ObjectVisitor* v) const {
 void JavaScriptFrame::Iterate(ObjectVisitor* v) const {
   IterateExpressions(v);
   IteratePc(v, pc_address(), code());
-  IterateArguments(v);
-}
-
-
-void JavaScriptFrame::IterateArguments(ObjectVisitor* v) const {
-  // Traverse callee-saved registers, receiver, and parameters.
-  const int kBaseOffset = JavaScriptFrameConstants::kSavedRegistersOffset;
-  const int kLimitOffset = JavaScriptFrameConstants::kReceiverOffset;
-  Object** base = &Memory::Object_at(fp() + kBaseOffset);
-  Object** limit = &Memory::Object_at(caller_sp() + kLimitOffset) + 1;
-  v->VisitPointers(base, limit);
 }
 
 
@@ -1150,7 +1112,7 @@ PcToCodeCache::PcToCodeCacheEntry* PcToCodeCache::GetCacheEntry(Address pc) {
     // been set. Otherwise, we risk trying to use a cache entry before
     // the code has been computed.
     entry->code = GcSafeFindCodeForPc(pc);
-    entry->safepoint_entry = NULL;
+    entry->safepoint_entry.Reset();
     entry->pc = pc;
   }
   return entry;

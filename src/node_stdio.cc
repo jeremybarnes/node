@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <node_stdio.h>
 #include <node_events.h>
 
@@ -5,8 +26,10 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__OpenBSD__)
 # include <util.h>
+#elif __FreeBSD__
+# include <libutil.h>
 #elif defined(__sun)
 # include <stropts.h> // for openpty ioctls
 #else
@@ -41,8 +64,8 @@ static int EnableRawMode(int fd) {
   /* input modes: no break, no CR to NL, no parity check, no strip char,
    * no start/stop output control. */
   raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-  /* output modes - disable post processing */
-  raw.c_oflag &= ~(OPOST);
+  /* output modes */
+  raw.c_oflag |= (ONLCR);
   /* control modes - set 8 bit chars */
   raw.c_cflag |= (CS8);
   /* local modes - choing off, canonical off, no extended functions,
@@ -86,30 +109,47 @@ static Handle<Value> SetRawMode (const Arguments& args) {
 }
 
 
-// process.binding('stdio').getColumns();
-static Handle<Value> GetColumns (const Arguments& args) {
+// process.binding('stdio').getWindowSize(fd);
+// returns [row, col]
+static Handle<Value> GetWindowSize (const Arguments& args) {
   HandleScope scope;
+
+  int fd = args[0]->IntegerValue();
 
   struct winsize ws;
 
-  if (ioctl(1, TIOCGWINSZ, &ws) == -1) {
-    return scope.Close(Integer::New(80));
+  if (ioctl(fd, TIOCGWINSZ, &ws) < 0) {
+    return ThrowException(ErrnoException(errno, "ioctl"));
   }
 
-  return scope.Close(Integer::NewFromUnsigned(ws.ws_col));
+  Local<Array> ret = Array::New(2);
+  ret->Set(0, Integer::NewFromUnsigned(ws.ws_row));
+  ret->Set(1, Integer::NewFromUnsigned(ws.ws_col));
+
+  return scope.Close(ret);
 }
 
-// process.binding('stdio').getRows();
-static Handle<Value> GetRows (const Arguments& args) {
+
+// process.binding('stdio').setWindowSize(fd, row, col);
+static Handle<Value> SetWindowSize (const Arguments& args) {
   HandleScope scope;
+
+  int fd = args[0]->IntegerValue();
+  int row = args[1]->IntegerValue();
+  int col = args[2]->IntegerValue();
 
   struct winsize ws;
 
-  if (ioctl(1, TIOCGWINSZ, &ws) == -1) {
-    return scope.Close(Integer::New(132));
+  ws.ws_row = row;
+  ws.ws_col = col;
+  ws.ws_xpixel = 0;
+  ws.ws_ypixel = 0;
+
+  if (ioctl(fd, TIOCSWINSZ, &ws) < 0) {
+    return ThrowException(ErrnoException(errno, "ioctl"));
   }
 
-  return scope.Close(Integer::NewFromUnsigned(ws.ws_row));
+  return True();
 }
 
 
@@ -125,13 +165,12 @@ static Handle<Value> IsATTY (const Arguments& args) {
 
 
 /* STDERR IS ALWAY SYNC ALWAYS UTF8 */
-static Handle<Value>
-WriteError (const Arguments& args)
-{
+static Handle<Value> WriteError (const Arguments& args) {
   HandleScope scope;
 
-  if (args.Length() < 1)
+  if (args.Length() < 1) {
     return Undefined();
+  }
 
   String::Utf8Value msg(args[0]->ToString());
 
@@ -149,7 +188,7 @@ WriteError (const Arguments& args)
     written += (size_t)r;
   }
 
-  return Undefined();
+  return True();
 }
 
 
@@ -275,8 +314,8 @@ void Stdio::Initialize(v8::Handle<v8::Object> target) {
   NODE_SET_METHOD(target, "isStdoutBlocking", IsStdoutBlocking);
   NODE_SET_METHOD(target, "isStdinBlocking", IsStdinBlocking);
   NODE_SET_METHOD(target, "setRawMode", SetRawMode);
-  NODE_SET_METHOD(target, "getColumns", GetColumns);
-  NODE_SET_METHOD(target, "getRows", GetRows);
+  NODE_SET_METHOD(target, "getWindowSize", GetWindowSize);
+  NODE_SET_METHOD(target, "setWindowSize", SetWindowSize);
   NODE_SET_METHOD(target, "isatty", IsATTY);
   NODE_SET_METHOD(target, "openpty", OpenPTY);
 

@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 
@@ -8,8 +29,10 @@ var b = Buffer(1024); // safe constructor
 console.log('b.length == ' + b.length);
 assert.strictEqual(1024, b.length);
 
+b[0] = -1;
+assert.equal(b[0], 255);
+
 for (var i = 0; i < 1024; i++) {
-  assert.ok(b[i] >= 0);
   b[i] = i % 256;
 }
 
@@ -214,6 +237,7 @@ assert.equal(d.length, 3);
 assert.equal(d[0], 23);
 assert.equal(d[1], 42);
 assert.equal(d[2], 255);
+assert.deepEqual(d, new Buffer(d));
 
 var e = new Buffer('über');
 console.error('uber: \'%s\'', e.toString());
@@ -222,6 +246,32 @@ assert.deepEqual(e, new Buffer([195, 188, 98, 101, 114]));
 var f = new Buffer('über', 'ascii');
 console.error('f.length: %d     (should be 4)', f.length);
 assert.deepEqual(f, new Buffer([252, 98, 101, 114]));
+
+var f = new Buffer('über', 'ucs2');
+console.error('f.length: %d     (should be 8)', f.length);
+assert.deepEqual(f, new Buffer([252, 0, 98, 0, 101, 0, 114, 0]));
+
+var f = new Buffer('привет', 'ucs2');
+console.error('f.length: %d     (should be 12)', f.length);
+assert.deepEqual(f, new Buffer([63, 4, 64, 4, 56, 4, 50, 4, 53, 4, 66, 4]));
+assert.equal(f.toString('ucs2'), 'привет');
+
+var f = new Buffer([0, 0, 0, 0, 0]);
+assert.equal(f.length, 5);
+var size = f.write('あいうえお', 'ucs2');
+console.error('bytes written to buffer: %d     (should be 4)', size);
+console.error('chars written to buffer: %d     (should be 2)', Buffer._charsWritten);
+assert.equal(size, 4);
+assert.equal(Buffer._charsWritten, 2);
+assert.deepEqual(f, new Buffer([0x42, 0x30, 0x44, 0x30, 0x00]));
+
+
+var arrayIsh = {0: 0, 1: 1, 2: 2, 3: 3, length: 4};
+var g = new Buffer(arrayIsh);
+assert.deepEqual(g, new Buffer([0, 1, 2, 3]));
+var strArrayIsh = {0: '0', 1: '1', 2: '2', 3: '3', length: 4};
+g = new Buffer(strArrayIsh);
+assert.deepEqual(g, new Buffer([0, 1, 2, 3]));
 
 
 //
@@ -384,9 +434,152 @@ assert.equal('bcde', b.slice(1).toString());
 // byte length
 assert.equal(14, Buffer.byteLength('Il était tué'));
 assert.equal(14, Buffer.byteLength('Il était tué', 'utf8'));
+assert.equal(24, Buffer.byteLength('Il était tué', 'ucs2'));
 assert.equal(12, Buffer.byteLength('Il était tué', 'ascii'));
 assert.equal(12, Buffer.byteLength('Il était tué', 'binary'));
 
-
 // slice(0,0).length === 0
 assert.equal(0, Buffer('hello').slice(0, 0).length);
+
+// test hex toString
+console.log('Create hex string from buffer');
+var hexb = new Buffer(256);
+for (var i = 0; i < 256; i ++) {
+  hexb[i] = i;
+}
+var hexStr = hexb.toString('hex');
+assert.equal(hexStr,
+             '000102030405060708090a0b0c0d0e0f'+
+             '101112131415161718191a1b1c1d1e1f'+
+             '202122232425262728292a2b2c2d2e2f'+
+             '303132333435363738393a3b3c3d3e3f'+
+             '404142434445464748494a4b4c4d4e4f'+
+             '505152535455565758595a5b5c5d5e5f'+
+             '606162636465666768696a6b6c6d6e6f'+
+             '707172737475767778797a7b7c7d7e7f'+
+             '808182838485868788898a8b8c8d8e8f'+
+             '909192939495969798999a9b9c9d9e9f'+
+             'a0a1a2a3a4a5a6a7a8a9aaabacadaeaf'+
+             'b0b1b2b3b4b5b6b7b8b9babbbcbdbebf'+
+             'c0c1c2c3c4c5c6c7c8c9cacbcccdcecf'+
+             'd0d1d2d3d4d5d6d7d8d9dadbdcdddedf'+
+             'e0e1e2e3e4e5e6e7e8e9eaebecedeeef'+
+             'f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff');
+
+console.log('Create buffer from hex string');
+var hexb2 = new Buffer(hexStr, 'hex');
+for (var i = 0; i < 256; i ++) {
+  assert.equal(hexb2[i], hexb[i]);
+}
+
+// test an invalid slice end.
+console.log('Try to slice off the end of the buffer');
+var b = new Buffer([1,2,3,4,5]);
+var b2 = b.toString('hex', 1, 10000);
+var b3 = b.toString('hex', 1, 5);
+var b4 = b.toString('hex', 1);
+assert.equal(b2, b3);
+assert.equal(b2, b4);
+
+
+// Test slice on SlowBuffer GH-843
+var SlowBuffer = process.binding('buffer').SlowBuffer;
+
+function buildSlowBuffer (data) {
+  if (Array.isArray(data)) {
+    var buffer = new SlowBuffer(data.length);
+    data.forEach(function(v,k) {
+      buffer[k] = v;
+    });
+    return buffer;
+  };
+  return null;
+}
+
+var x = buildSlowBuffer([0x81,0xa3,0x66,0x6f,0x6f,0xa3,0x62,0x61,0x72]);
+
+console.log(x.inspect())
+assert.equal('<SlowBuffer 81 a3 66 6f 6f a3 62 61 72>', x.inspect());
+
+var z = x.slice(4);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(5, z.length);
+assert.equal(0x6f, z[0]);
+assert.equal(0xa3, z[1]);
+assert.equal(0x62, z[2]);
+assert.equal(0x61, z[3]);
+assert.equal(0x72, z[4]);
+
+var z = x.slice(0);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(z.length, x.length);
+
+var z = x.slice(0, 4);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(4, z.length);
+assert.equal(0x81, z[0]);
+assert.equal(0xa3, z[1]);
+
+var z = x.slice(0, 9);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(9, z.length);
+
+var z = x.slice(1, 4);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(3, z.length);
+assert.equal(0xa3, z[0]);
+
+var z = x.slice(2, 4);
+console.log(z.inspect())
+console.log(z.length)
+assert.equal(2, z.length);
+assert.equal(0x66, z[0]);
+assert.equal(0x6f, z[1]);
+
+assert.equal(0, Buffer('hello').slice(0, 0).length)
+
+b = new Buffer(50);
+b.fill("h");
+for (var i = 0; i < b.length; i++) {
+  assert.equal("h".charCodeAt(0), b[i]);
+}
+
+b.fill(0);
+for (var i = 0; i < b.length; i++) {
+  assert.equal(0, b[i]);
+}
+
+b.fill(1, 16, 32);
+for (var i = 0; i < 16; i++) assert.equal(0, b[i]);
+for (; i < 32; i++) assert.equal(1, b[i]);
+for (; i < b.length; i++) assert.equal(0, b[i]);
+
+var b = new SlowBuffer(10);
+b.write('あいうえお', 'ucs2');
+assert.equal(b.toString('ucs2'), 'あいうえお');
+
+// Binary encoding should write only one byte per character.
+var b = Buffer([0xde, 0xad, 0xbe, 0xef]);
+var s = String.fromCharCode(0xffff);
+b.write(s, 0, 'binary')
+assert.equal(0xff, b[0]);
+assert.equal(0xad, b[1]);
+assert.equal(0xbe, b[2]);
+assert.equal(0xef, b[3]);
+s = String.fromCharCode(0xaaee);
+b.write(s, 0, 'binary')
+assert.equal(0xee, b[0]);
+assert.equal(0xad, b[1]);
+assert.equal(0xbe, b[2]);
+assert.equal(0xef, b[3]);
+
+
+// This should not segfault the program.
+assert.throws(function() {
+  new Buffer('"pong"', 0, 6, 8031, '127.0.0.1')
+});

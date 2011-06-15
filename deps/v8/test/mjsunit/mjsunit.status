@@ -34,7 +34,8 @@ bugs: FAIL
 ##############################################################################
 # Too slow in debug mode with --stress-opt
 compiler/regress-stacktrace-methods: PASS, SKIP if $mode == debug
-
+compiler/regress-funcaller: PASS, SKIP if $mode == debug
+regress/regress-create-exception: PASS, SKIP if $mode == debug
 
 ##############################################################################
 # This one uses a built-in that's only present in debug mode. It takes
@@ -104,6 +105,10 @@ regress/regress-create-exception: SKIP
 regress/regress-3218915: SKIP
 regress/regress-3247124: SKIP
 
+# Requires bigger stack size in the Genesis and if stack size is increased,
+# the test requires too much time to run.  However, the problem test covers
+# should be platform-independent.
+regress/regress-1132: SKIP
 
 ##############################################################################
 [ $arch == mips ]

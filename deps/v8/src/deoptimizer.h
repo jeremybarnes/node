@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -42,38 +42,17 @@ class TranslationIterator;
 class DeoptimizingCodeListNode;
 
 
-class ValueDescription BASE_EMBEDDED {
+class HeapNumberMaterializationDescriptor BASE_EMBEDDED {
  public:
-  explicit ValueDescription(int index) : stack_index_(index) { }
-  int stack_index() const { return stack_index_; }
+  HeapNumberMaterializationDescriptor(Address slot_address, double val)
+      : slot_address_(slot_address), val_(val) { }
+
+  Address slot_address() const { return slot_address_; }
+  double value() const { return val_; }
 
  private:
-  // Offset relative to the top of the stack.
-  int stack_index_;
-};
-
-
-class ValueDescriptionInteger32: public ValueDescription {
- public:
-  ValueDescriptionInteger32(int index, int32_t value)
-      : ValueDescription(index), int32_value_(value) { }
-  int32_t int32_value() const { return int32_value_; }
-
- private:
-  // Raw value.
-  int32_t int32_value_;
-};
-
-
-class ValueDescriptionDouble: public ValueDescription {
- public:
-  ValueDescriptionDouble(int index, double value)
-      : ValueDescription(index), double_value_(value) { }
-  double double_value() const { return double_value_; }
-
- private:
-  // Raw value.
-  double double_value_;
+  Address slot_address_;
+  double val_;
 };
 
 
@@ -110,6 +89,13 @@ class Deoptimizer : public Malloced {
                           int fp_to_sp_delta);
   static Deoptimizer* Grab();
 
+  // Makes sure that there is enough room in the relocation
+  // information of a code object to perform lazy deoptimization
+  // patching. If there is not enough room a new relocation
+  // information object is allocated and comments are added until it
+  // is big enough.
+  static void EnsureRelocSpaceForLazyDeoptimization(Handle<Code> code);
+
   // Deoptimize the function now. Its current optimized code will never be run
   // again and any activations of the optimized code will get deoptimized when
   // execution returns.
@@ -128,26 +114,44 @@ class Deoptimizer : public Malloced {
 
   static void VisitAllOptimizedFunctions(OptimizedFunctionVisitor* visitor);
 
-  // Given the relocation info of a call to the stack check stub, patch the
-  // code so as to go unconditionally to the on-stack replacement builtin
-  // instead.
-  static void PatchStackCheckCode(RelocInfo* rinfo, Code* replacement_code);
+  // The size in bytes of the code required at a lazy deopt patch site.
+  static int patch_size();
 
-  // Given the relocation info of a call to the on-stack replacement
-  // builtin, patch the code back to the original stack check code.
-  static void RevertStackCheckCode(RelocInfo* rinfo, Code* check_code);
+  // Patch all stack guard checks in the unoptimized code to
+  // unconditionally call replacement_code.
+  static void PatchStackCheckCode(Code* unoptimized_code,
+                                  Code* check_code,
+                                  Code* replacement_code);
+
+  // Patch stack guard check at instruction before pc_after in
+  // the unoptimized code to unconditionally call replacement_code.
+  static void PatchStackCheckCodeAt(Address pc_after,
+                                    Code* check_code,
+                                    Code* replacement_code);
+
+  // Change all patched stack guard checks in the unoptimized code
+  // back to a normal stack guard check.
+  static void RevertStackCheckCode(Code* unoptimized_code,
+                                   Code* check_code,
+                                   Code* replacement_code);
+
+  // Change all patched stack guard checks in the unoptimized code
+  // back to a normal stack guard check.
+  static void RevertStackCheckCodeAt(Address pc_after,
+                                     Code* check_code,
+                                     Code* replacement_code);
 
   ~Deoptimizer();
 
-  void InsertHeapNumberValues(int index, JavaScriptFrame* frame);
+  void MaterializeHeapNumbers();
 
   static void ComputeOutputFrames(Deoptimizer* deoptimizer);
 
   static Address GetDeoptimizationEntry(int id, BailoutType type);
   static int GetDeoptimizationId(Address addr, BailoutType type);
-  static unsigned GetOutputInfo(DeoptimizationOutputData* data,
-                                unsigned node_id,
-                                SharedFunctionInfo* shared);
+  static int GetOutputInfo(DeoptimizationOutputData* data,
+                           unsigned node_id,
+                           SharedFunctionInfo* shared);
 
   static void Setup();
   static void TearDown();
@@ -228,13 +232,7 @@ class Deoptimizer : public Malloced {
 
   Object* ComputeLiteral(int index) const;
 
-  void InsertHeapNumberValue(JavaScriptFrame* frame,
-                             int stack_index,
-                             double val,
-                             int extra_slot_count);
-
-  void AddInteger32Value(int frame_index, int slot_index, int32_t value);
-  void AddDoubleValue(int frame_index, int slot_index, double value);
+  void AddDoubleValue(intptr_t slot_address, double value);
 
   static LargeObjectChunk* CreateCode(BailoutType type);
   static void GenerateDeoptimizationEntries(
@@ -270,8 +268,7 @@ class Deoptimizer : public Malloced {
   // Array of output frame descriptions.
   FrameDescription** output_;
 
-  List<ValueDescriptionInteger32>* integer32_values_;
-  List<ValueDescriptionDouble>* double_values_;
+  List<HeapNumberMaterializationDescriptor> deferred_heap_numbers_;
 
   static int table_entry_size_;
 
@@ -476,7 +473,7 @@ class Translation BASE_EMBEDDED {
 
   static int NumberOfOperandsFor(Opcode opcode);
 
-#ifdef DEBUG
+#ifdef OBJECT_PRINT
   static const char* StringFor(Opcode opcode);
 #endif
 

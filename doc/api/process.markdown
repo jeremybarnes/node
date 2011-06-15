@@ -59,7 +59,8 @@ standard POSIX signal names such as SIGINT, SIGUSR1, etc.
 
 Example of listening for `SIGINT`:
 
-    var stdin = process.openStdin();
+    // Start reading from stdin so we don't exit.
+    process.stdin.resume();
 
     process.on('SIGINT', function () {
       console.log('Got SIGINT.  Press Control-D to exit.');
@@ -80,21 +81,26 @@ Example: the definition of `console.log`
     };
 
 
-### process.openStdin()
+### process.stderr
 
-Opens the standard input stream, returns a `Readable Stream`.
+A writable stream to stderr. Writes on this stream are blocking.
+
+
+### process.stdin
+
+A `Readable Stream` for stdin. The stdin stream is paused by default, so one
+must call `process.stdin.resume()` to read from it.
 
 Example of opening standard input and listening for both events:
 
-    var stdin = process.openStdin();
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
 
-    stdin.setEncoding('utf8');
-
-    stdin.on('data', function (chunk) {
+    process.stdin.on('data', function (chunk) {
       process.stdout.write('data: ' + chunk);
     });
 
-    stdin.on('end', function () {
+    process.stdin.on('end', function () {
       process.stdout.write('end');
     });
 
@@ -229,11 +235,11 @@ A compiled-in property that exposes `NODE_PREFIX`.
     console.log('Prefix: ' + process.installPrefix);
 
 
-### process.kill(pid, signal='SIGINT')
+### process.kill(pid, signal='SIGTERM')
 
 Send a signal to a process. `pid` is the process id and `signal` is the
 string describing the signal to send.  Signal names are strings like
-'SIGINT' or 'SIGUSR1'.  If omitted, the signal will be 'SIGINT'.
+'SIGINT' or 'SIGUSR1'.  If omitted, the signal will be 'SIGTERM'.
 See kill(2) for more information.
 
 Note that just because the name of this function is `process.kill`, it is
@@ -263,6 +269,13 @@ The PID of the process.
 ### process.title
 
 Getter/setter to set what is displayed in 'ps'.
+
+
+### process.arch
+
+What processor architecture you're running on: `'arm'`, `'ia32'`, or `'x64'`.
+
+    console.log('This processor architecture is ' + process.arch);
 
 
 ### process.platform
@@ -313,3 +326,7 @@ given, otherwise returns the current mask.
     console.log('Changed umask from: ' + oldmask.toString(8) +
                 ' to ' + newmask.toString(8));
 
+
+### process.uptime()
+
+Number of seconds Node has been running.

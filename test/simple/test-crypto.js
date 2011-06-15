@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 
@@ -15,6 +36,8 @@ var path = require('path');
 var caPem = fs.readFileSync(common.fixturesDir + '/test_ca.pem', 'ascii');
 var certPem = fs.readFileSync(common.fixturesDir + '/test_cert.pem', 'ascii');
 var keyPem = fs.readFileSync(common.fixturesDir + '/test_key.pem', 'ascii');
+var rsaPubPem = fs.readFileSync(common.fixturesDir + '/test_rsa_pubkey.pem', 'ascii');
+var rsaKeyPem = fs.readFileSync(common.fixturesDir + '/test_rsa_privkey.pem', 'ascii');
 
 try {
   var credentials = crypto.createCredentials(
@@ -119,3 +142,50 @@ txt += decipher.final('utf8');
 
 assert.equal(txt, plaintext, 'encryption and decryption with key and iv');
 
+// update() should only take buffers / strings
+assert.throws(function() {
+  crypto.createHash('sha1').update({foo: 'bar'});
+}, /string or buffer/);
+
+
+// Test Diffie-Hellman with two parties sharing a secret,
+// using various encodings as we go along
+var dh1 = crypto.createDiffieHellman(256);
+var p1 = dh1.getPrime('base64');
+var dh2 = crypto.createDiffieHellman(p1, 'base64');
+var key1 = dh1.generateKeys();
+var key2 = dh2.generateKeys('hex');
+var secret1 = dh1.computeSecret(key2, 'hex', 'base64');
+var secret2 = dh2.computeSecret(key1, 'binary', 'base64');
+
+assert.equal(secret1, secret2);
+
+// Create "another dh1" using generated keys from dh1,
+// and compute secret again
+var dh3 = crypto.createDiffieHellman(p1, 'base64');
+var privkey1 = dh1.getPrivateKey();
+dh3.setPublicKey(key1);
+dh3.setPrivateKey(privkey1);
+
+assert.equal(dh1.getPrime(), dh3.getPrime());
+assert.equal(dh1.getGenerator(), dh3.getGenerator());
+assert.equal(dh1.getPublicKey(), dh3.getPublicKey());
+assert.equal(dh1.getPrivateKey(), dh3.getPrivateKey());
+
+var secret3 = dh3.computeSecret(key2, 'hex', 'base64');
+
+assert.equal(secret1, secret3);
+
+
+// Test RSA key signing/verification
+var rsaSign = crypto.createSign('RSA-SHA1');
+var rsaVerify = crypto.createVerify('RSA-SHA1');
+assert.ok(rsaSign);
+assert.ok(rsaVerify);
+
+rsaSign.update(rsaPubPem);
+var rsaSignature = rsaSign.sign(rsaKeyPem, 'hex');
+assert.equal(rsaSignature, '5c50e3145c4e2497aadb0eabc83b342d0b0021ece0d4c4a064b7c8f020d7e2688b122bfb54c724ac9ee169f83f66d2fe90abeb95e8e1290e7e177152a4de3d944cf7d4883114a20ed0f78e70e25ef0f60f06b858e6af42a2f276ede95bbc6bc9a9bbdda15bd663186a6f40819a7af19e577bb2efa5e579a1f5ce8a0d4ca8b8f6');
+
+rsaVerify.update(rsaPubPem);
+assert.equal(rsaVerify.verify(rsaPubPem, rsaSignature, 'hex'), 1);

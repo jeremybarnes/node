@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 var common = require('../common');
 var assert = require('assert');
 
@@ -8,6 +29,7 @@ var tests_run = 0;
 function pingPongTest(port, host) {
   var N = 1000;
   var count = 0;
+  var sentPongs = 0;
   var sent_final_ping = false;
 
   var server = net.createServer({ allowHalfOpen: true }, function(socket) {
@@ -20,12 +42,20 @@ function pingPongTest(port, host) {
 
     socket.setEncoding('utf8');
     socket.addListener('data', function(data) {
+      // Since we never queue data (we're always waiting for the PING
+      // before sending a pong) the writeQueueSize should always be less
+      // than one message.
+      assert.ok(0 <= socket.bufferSize && socket.bufferSize <= 4);
+
       console.log('server got: ' + data);
       assert.equal(true, socket.writable);
       assert.equal(true, socket.readable);
       assert.equal(true, count <= N);
       if (/PING/.exec(data)) {
-        socket.write('PONG');
+        socket.write('PONG', function () {
+          sentPongs++;
+          console.error('sent PONG');
+        });
       }
     });
 
@@ -85,8 +115,9 @@ function pingPongTest(port, host) {
     });
 
     client.addListener('close', function() {
-      console.log('client.endd');
+      console.log('client.end');
       assert.equal(N + 1, count);
+      assert.equal(N + 1, sentPongs);
       assert.equal(true, sent_final_ping);
       tests_run += 1;
     });

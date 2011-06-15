@@ -435,7 +435,6 @@ class IterationStatement: public BreakableStatement {
   virtual IterationStatement* AsIterationStatement() { return this; }
 
   Statement* body() const { return body_; }
-  void set_body(Statement* stmt) { body_ = stmt; }
 
   // Bailout support.
   int OsrEntryId() const { return osr_entry_id_; }
@@ -477,12 +476,14 @@ class DoWhileStatement: public IterationStatement {
   void set_condition_position(int pos) { condition_position_ = pos; }
 
   // Bailout support.
-  virtual int ContinueId() const { return next_id_; }
+  virtual int ContinueId() const { return continue_id_; }
+  int BackEdgeId() const { return back_edge_id_; }
 
  private:
   Expression* cond_;
   int condition_position_;
-  int next_id_;
+  int continue_id_;
+  int back_edge_id_;
 };
 
 
@@ -507,11 +508,13 @@ class WhileStatement: public IterationStatement {
 
   // Bailout support.
   virtual int ContinueId() const { return EntryId(); }
+  int BodyId() const { return body_id_; }
 
  private:
   Expression* cond_;
   // True if there is a function literal subexpression in the condition.
   bool may_have_function_literal_;
+  int body_id_;
 };
 
 
@@ -532,11 +535,8 @@ class ForStatement: public IterationStatement {
   }
 
   Statement* init() const { return init_; }
-  void set_init(Statement* stmt) { init_ = stmt; }
   Expression* cond() const { return cond_; }
-  void set_cond(Expression* expr) { cond_ = expr; }
   Statement* next() const { return next_; }
-  void set_next(Statement* stmt) { next_ = stmt; }
 
   bool may_have_function_literal() const {
     return may_have_function_literal_;
@@ -546,7 +546,8 @@ class ForStatement: public IterationStatement {
   }
 
   // Bailout support.
-  virtual int ContinueId() const { return next_id_; }
+  virtual int ContinueId() const { return continue_id_; }
+  int BodyId() const { return body_id_; }
 
   bool is_fast_smi_loop() { return loop_variable_ != NULL; }
   Variable* loop_variable() { return loop_variable_; }
@@ -559,7 +560,8 @@ class ForStatement: public IterationStatement {
   // True if there is a function literal subexpression in the condition.
   bool may_have_function_literal_;
   Variable* loop_variable_;
-  int next_id_;
+  int continue_id_;
+  int body_id_;
 };
 
 
@@ -579,11 +581,13 @@ class ForInStatement: public IterationStatement {
   Expression* enumerable() const { return enumerable_; }
 
   // Bailout support.
+  int AssignmentId() const { return assignment_id_; }
   virtual int ContinueId() const { return EntryId(); }
 
  private:
   Expression* each_;
   Expression* enumerable_;
+  int assignment_id_;
 };
 
 
@@ -737,7 +741,10 @@ class IfStatement: public Statement {
               Statement* else_statement)
       : condition_(condition),
         then_statement_(then_statement),
-        else_statement_(else_statement) { }
+        else_statement_(else_statement),
+        then_id_(GetNextId()),
+        else_id_(GetNextId()) {
+  }
 
   DECLARE_NODE_TYPE(IfStatement)
 
@@ -748,14 +755,17 @@ class IfStatement: public Statement {
 
   Expression* condition() const { return condition_; }
   Statement* then_statement() const { return then_statement_; }
-  void set_then_statement(Statement* stmt) { then_statement_ = stmt; }
   Statement* else_statement() const { return else_statement_; }
-  void set_else_statement(Statement* stmt) { else_statement_ = stmt; }
+
+  int ThenId() const { return then_id_; }
+  int ElseId() const { return else_id_; }
 
  private:
   Expression* condition_;
   Statement* then_statement_;
   Statement* else_statement_;
+  int then_id_;
+  int else_id_;
 };
 
 
@@ -1195,9 +1205,11 @@ class Property: public Expression {
         key_(key),
         pos_(pos),
         type_(type),
-        is_monomorphic_(false),
         receiver_types_(NULL),
+        is_monomorphic_(false),
         is_array_length_(false),
+        is_string_length_(false),
+        is_function_prototype_(false),
         is_arguments_access_(false) { }
 
   DECLARE_NODE_TYPE(Property)
@@ -1209,6 +1221,9 @@ class Property: public Expression {
   Expression* key() const { return key_; }
   int position() const { return pos_; }
   bool is_synthetic() const { return type_ == SYNTHETIC; }
+
+  bool IsStringLength() const { return is_string_length_; }
+  bool IsFunctionPrototype() const { return is_function_prototype_; }
 
   // Marks that this is actually an argument rewritten to a keyed property
   // accessing the argument through the arguments shadow object.
@@ -1236,10 +1251,12 @@ class Property: public Expression {
   int pos_;
   Type type_;
 
-  bool is_monomorphic_;
   ZoneMapList* receiver_types_;
-  bool is_array_length_;
-  bool is_arguments_access_;
+  bool is_monomorphic_ : 1;
+  bool is_array_length_ : 1;
+  bool is_string_length_ : 1;
+  bool is_function_prototype_ : 1;
+  bool is_arguments_access_ : 1;
   Handle<Map> monomorphic_receiver_type_;
 
   // Dummy property used during preparsing.
@@ -1254,6 +1271,7 @@ class Call: public Expression {
         arguments_(arguments),
         pos_(pos),
         is_monomorphic_(false),
+        check_type_(RECEIVER_MAP_CHECK),
         receiver_types_(NULL),
         return_id_(GetNextId()) {
   }
@@ -1269,6 +1287,7 @@ class Call: public Expression {
   void RecordTypeFeedback(TypeFeedbackOracle* oracle);
   virtual ZoneMapList* GetReceiverTypes() { return receiver_types_; }
   virtual bool IsMonomorphic() { return is_monomorphic_; }
+  CheckType check_type() const { return check_type_; }
   Handle<JSFunction> target() { return target_; }
   Handle<JSObject> holder() { return holder_; }
   Handle<JSGlobalPropertyCell> cell() { return cell_; }
@@ -1292,6 +1311,7 @@ class Call: public Expression {
   int pos_;
 
   bool is_monomorphic_;
+  CheckType check_type_;
   ZoneMapList* receiver_types_;
   Handle<JSFunction> target_;
   Handle<JSObject> holder_;
@@ -1378,8 +1398,11 @@ class BinaryOperation: public Expression {
                   Expression* left,
                   Expression* right,
                   int pos)
-      : op_(op), left_(left), right_(right), pos_(pos), is_smi_only_(false) {
+      : op_(op), left_(left), right_(right), pos_(pos) {
     ASSERT(Token::IsBinaryOp(op));
+    right_id_ = (op == Token::AND || op == Token::OR)
+        ? static_cast<int>(GetNextId())
+        : AstNode::kNoNumber;
   }
 
   // Create the binary operation corresponding to a compound assignment.
@@ -1396,16 +1419,17 @@ class BinaryOperation: public Expression {
   Expression* right() const { return right_; }
   int position() const { return pos_; }
 
-  // Type feedback information.
-  void RecordTypeFeedback(TypeFeedbackOracle* oracle);
-  bool IsSmiOnly() const { return is_smi_only_; }
+  // Bailout support.
+  int RightId() const { return right_id_; }
 
  private:
   Token::Value op_;
   Expression* left_;
   Expression* right_;
   int pos_;
-  bool is_smi_only_;
+  // The short-circuit logical operations have an AST ID for their
+  // right-hand subexpression.
+  int right_id_;
 };
 
 
@@ -1432,7 +1456,9 @@ class IncrementOperation: public Expression {
 class CountOperation: public Expression {
  public:
   CountOperation(bool is_prefix, IncrementOperation* increment, int pos)
-      : is_prefix_(is_prefix), increment_(increment), pos_(pos) { }
+      : is_prefix_(is_prefix), increment_(increment), pos_(pos),
+        assignment_id_(GetNextId()) {
+  }
 
   DECLARE_NODE_TYPE(CountOperation)
 
@@ -1452,10 +1478,14 @@ class CountOperation: public Expression {
 
   virtual bool IsInlineable() const;
 
+  // Bailout support.
+  int AssignmentId() const { return assignment_id_; }
+
  private:
   bool is_prefix_;
   IncrementOperation* increment_;
   int pos_;
+  int assignment_id_;
 };
 
 
@@ -1524,7 +1554,10 @@ class Conditional: public Expression {
         then_expression_(then_expression),
         else_expression_(else_expression),
         then_expression_position_(then_expression_position),
-        else_expression_position_(else_expression_position) { }
+        else_expression_position_(else_expression_position),
+        then_id_(GetNextId()),
+        else_id_(GetNextId()) {
+  }
 
   DECLARE_NODE_TYPE(Conditional)
 
@@ -1534,8 +1567,11 @@ class Conditional: public Expression {
   Expression* then_expression() const { return then_expression_; }
   Expression* else_expression() const { return else_expression_; }
 
-  int then_expression_position() { return then_expression_position_; }
-  int else_expression_position() { return else_expression_position_; }
+  int then_expression_position() const { return then_expression_position_; }
+  int else_expression_position() const { return else_expression_position_; }
+
+  int ThenId() const { return then_id_; }
+  int ElseId() const { return else_id_; }
 
  private:
   Expression* condition_;
@@ -1543,6 +1579,8 @@ class Conditional: public Expression {
   Expression* else_expression_;
   int then_expression_position_;
   int else_expression_position_;
+  int then_id_;
+  int else_id_;
 };
 
 
@@ -1585,7 +1623,8 @@ class Assignment: public Expression {
   }
 
   // Bailout support.
-  int compound_bailout_id() const { return compound_bailout_id_; }
+  int CompoundLoadId() const { return compound_load_id_; }
+  int AssignmentId() const { return assignment_id_; }
 
  private:
   Token::Value op_;
@@ -1593,7 +1632,8 @@ class Assignment: public Expression {
   Expression* value_;
   int pos_;
   BinaryOperation* binary_operation_;
-  int compound_bailout_id_;
+  int compound_load_id_;
+  int assignment_id_;
 
   bool block_start_;
   bool block_end_;
@@ -1633,7 +1673,8 @@ class FunctionLiteral: public Expression {
                   int start_position,
                   int end_position,
                   bool is_expression,
-                  bool contains_loops)
+                  bool contains_loops,
+                  bool strict_mode)
       : name_(name),
         scope_(scope),
         body_(body),
@@ -1647,6 +1688,7 @@ class FunctionLiteral: public Expression {
         end_position_(end_position),
         is_expression_(is_expression),
         contains_loops_(contains_loops),
+        strict_mode_(strict_mode),
         function_token_position_(RelocInfo::kNoPosition),
         inferred_name_(Heap::empty_string()),
         try_full_codegen_(false),
@@ -1663,6 +1705,7 @@ class FunctionLiteral: public Expression {
   int end_position() const { return end_position_; }
   bool is_expression() const { return is_expression_; }
   bool contains_loops() const { return contains_loops_; }
+  bool strict_mode() const { return strict_mode_; }
 
   int materialized_literal_count() { return materialized_literal_count_; }
   int expected_property_count() { return expected_property_count_; }
@@ -1675,7 +1718,6 @@ class FunctionLiteral: public Expression {
   int num_parameters() { return num_parameters_; }
 
   bool AllowsLazyCompilation();
-  bool AllowOptimize();
 
   Handle<String> debug_name() const {
     if (name_->length() > 0) return name_;
@@ -1706,6 +1748,7 @@ class FunctionLiteral: public Expression {
   int end_position_;
   bool is_expression_;
   bool contains_loops_;
+  bool strict_mode_;
   int function_token_position_;
   Handle<String> inferred_name_;
   bool try_full_codegen_;
